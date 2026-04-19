@@ -1,0 +1,129 @@
+package internal
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
+	"github.com/sarchlab/akita/v4/sim"
+)
+
+// MSHREntry is an entry in MSHR
+type MSHREntry struct {
+	PID         vm.PID
+	Address     uint64
+	Requests    []interface{}
+	Block       *CohEntry
+	BlockIdx    int
+	RegionLen   uint64
+	RegionID    int
+	ReadReq     *mem.ReadReq
+	DataReady   *mem.DataReadyRsp
+	Data        []byte
+	IsPromotion bool
+}
+
+// NewMSHREntry returns a new MSHR entry object
+func NewMSHREntry() *MSHREntry {
+	e := new(MSHREntry)
+	e.Requests = make([]interface{}, 0)
+
+	return e
+}
+
+// MSHR is an interface that controls MSHR entries
+type MSHR interface {
+	Query(pid vm.PID, addr uint64) *MSHREntry
+	QueryWithMask(pid vm.PID, addr uint64, mask uint64) (list []*MSHREntry)
+	Add(pid vm.PID, addr uint64, regionLen uint64, regionID int) *MSHREntry
+	Remove(pid vm.PID, addr uint64) *MSHREntry
+	AllEntries() []*MSHREntry
+	IsFull() bool
+	Reset()
+}
+
+// NewMSHR returns a new MSHR object
+func NewMSHR(capacity int) MSHR {
+	m := new(mshrImpl)
+	m.capacity = capacity
+
+	return m
+}
+
+type mshrImpl struct {
+	*sim.ComponentBase
+
+	capacity int
+	entries  []*MSHREntry
+}
+
+func (m *mshrImpl) Add(pid vm.PID, addr uint64, regionLen uint64, regionID int) *MSHREntry {
+	for _, e := range m.entries {
+		mask := e.RegionLen
+		if e.PID == pid && e.Address>>mask == addr>>mask {
+			panic(fmt.Sprintf("entry already in mshr: Addr %x, PID %d, Mask %d", addr, pid, mask))
+		}
+	}
+
+	if len(m.entries) >= m.capacity {
+		log.Panic("MSHR is full")
+	}
+
+	entry := NewMSHREntry()
+	entry.PID = pid
+	entry.Address = addr
+	entry.RegionLen = regionLen
+	entry.RegionID = regionID
+	m.entries = append(m.entries, entry)
+
+	return entry
+}
+
+func (m *mshrImpl) Query(pid vm.PID, addr uint64) *MSHREntry {
+	for _, e := range m.entries {
+		mask := e.RegionLen
+		if e.PID == pid && e.Address>>mask == addr>>mask {
+			return e
+		}
+	}
+
+	return nil
+}
+
+func (m *mshrImpl) QueryWithMask(pid vm.PID, addr uint64, mask uint64) (list []*MSHREntry) {
+	for _, e := range m.entries {
+		m := max(e.RegionLen, mask)
+		if e.PID == pid && e.Address>>m == addr>>m {
+			list = append(list, e)
+		}
+	}
+
+	return list
+}
+
+func (m *mshrImpl) Remove(pid vm.PID, addr uint64) *MSHREntry {
+	for i, e := range m.entries {
+		mask := e.RegionLen
+		if e.PID == pid && e.Address>>mask == addr>>mask {
+			m.entries = append(m.entries[:i], m.entries[i+1:]...)
+			return e
+		}
+	}
+
+	panic("trying to remove an non-exist entry")
+}
+
+// AllEntries returns all the MSHREntries that are currently in the MSHR
+func (m *mshrImpl) AllEntries() []*MSHREntry {
+	return m.entries
+}
+
+// IsFull returns true if no more MSHR entries can be added
+func (m *mshrImpl) IsFull() bool {
+	return len(m.entries) >= m.capacity
+}
+
+func (m *mshrImpl) Reset() {
+	m.entries = nil
+}

@@ -12,8 +12,9 @@ import (
 type FlushReq struct {
 	sim.MsgMeta
 
-	VAddr []uint64
-	PID   vm.PID
+	VAddr              []uint64
+	PID                vm.PID
+	InvalidateAllLines bool
 }
 
 // Meta returns the meta data associated with the message.

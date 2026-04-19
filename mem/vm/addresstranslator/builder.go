@@ -2,7 +2,9 @@ package addresstranslator
 
 import (
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
+	"github.com/sarchlab/akita/v4/tracing"
 )
 
 // A Builder can create address translators
@@ -21,6 +23,10 @@ type Builder struct {
 	translationPortMapper     mem.AddressToPortMapper
 	translationPortMapperType string
 	translationRemotePorts    []sim.RemotePort
+
+	accessCounter *map[vm.PID]map[uint64]uint8
+
+	visTracer tracing.Tracer
 }
 
 // MakeBuilder creates a new builder
@@ -151,9 +157,22 @@ func (b Builder) WithTranslationProviders(ports ...sim.RemotePort) Builder {
 	return b
 }
 
+func (b Builder) WithAccessCounter(
+	counter *map[vm.PID]map[uint64]uint8,
+) Builder {
+	b.accessCounter = counter
+	return b
+}
+
+func (b Builder) WithVisTracer(tracer tracing.Tracer) Builder {
+	b.visTracer = tracer
+	return b
+}
+
 // Build returns a new AddressTranslator
 func (b Builder) Build(name string) *Comp {
 	t := &Comp{}
+	t.name = name
 	t.TickingComponent = sim.NewTickingComponent(
 		name, b.engine, b.freq, t)
 
@@ -167,6 +186,11 @@ func (b Builder) Build(name string) *Comp {
 
 	middleware := &middleware{Comp: t}
 	t.AddMiddleware(middleware)
+	t.accessCounter = b.accessCounter
+
+	if b.visTracer != nil {
+		tracing.CollectTrace(t, b.visTracer)
+	}
 
 	return t
 }

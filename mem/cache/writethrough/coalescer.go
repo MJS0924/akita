@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -33,6 +34,10 @@ func (c *coalescer) processReq(
 	if len(c.cache.transactions) >= c.cache.maxNumConcurrentTrans {
 		return false
 	}
+
+	// read or write mask를 cache line 단위로 기록
+	trans := c.createTransaction(req)
+	c.recordRWMask(trans)
 
 	if c.isReqLastInWave(req) {
 		if len(c.toCoalesce) == 0 || c.canReqCoalesce(req) {
@@ -190,6 +195,7 @@ func (c *coalescer) coalesceRead() *transaction {
 	cachelineID := c.toCoalesce[0].Address() / blockSize * blockSize
 	coalescedRead := mem.ReadReqBuilder{}.
 		WithAddress(cachelineID).
+		WithVAddr(c.toCoalesce[0].read.GetVAddr()).
 		WithByteSize(blockSize).
 		WithPID(c.toCoalesce[0].PID()).
 		Build()
@@ -206,6 +212,7 @@ func (c *coalescer) coalesceWrite() *transaction {
 	cachelineID := c.toCoalesce[0].Address() / blockSize * blockSize
 	write := mem.WriteReqBuilder{}.
 		WithAddress(cachelineID).
+		WithVAddr(c.toCoalesce[0].write.GetVAddr()).
 		WithPID(c.toCoalesce[0].PID()).
 		WithData(make([]byte, blockSize)).
 		WithDirtyMask(make([]bool, blockSize)).
@@ -227,5 +234,80 @@ func (c *coalescer) coalesceWrite() *transaction {
 		id:                      sim.GetIDGenerator().Generate(),
 		write:                   write,
 		preCoalesceTransactions: c.toCoalesce,
+	}
+}
+
+func (c *coalescer) recordRWMask(trans *transaction) {
+	if trans.read != nil {
+		startPage := trans.read.GetVAddr() / (1 << c.cache.log2PageSize)
+		startIndex := trans.read.GetVAddr() % (1 << c.cache.log2PageSize) / uint64(1<<c.cache.log2BlockSize)
+		endPage := (trans.read.GetVAddr() + trans.read.AccessByteSize - 1) / (1 << c.cache.log2PageSize)
+		endIndex := trans.read.GetVAddr() + trans.read.AccessByteSize - 1
+		endIndex = endIndex % (1 << c.cache.log2PageSize) / uint64(1<<c.cache.log2BlockSize)
+
+		for page := startPage; page <= endPage; page++ {
+			if (*(c.cache.readMask))[c.cache.deviceID-1] == nil {
+				(*(c.cache.readMask))[c.cache.deviceID-1] = make(map[vm.PID]map[uint64][]uint8)
+				(*(c.cache.dirtyMask))[c.cache.deviceID-1] = make(map[vm.PID]map[uint64][]uint8)
+			}
+			if (*(c.cache.readMask))[c.cache.deviceID-1][trans.read.GetPID()] == nil {
+				(*(c.cache.readMask))[c.cache.deviceID-1][trans.read.GetPID()] = make(map[uint64][]uint8)
+				(*(c.cache.dirtyMask))[c.cache.deviceID-1][trans.read.GetPID()] = make(map[uint64][]uint8)
+			}
+			if (*(c.cache.readMask))[c.cache.deviceID-1][trans.read.GetPID()][page] == nil {
+				(*(c.cache.readMask))[c.cache.deviceID-1][trans.read.GetPID()][page] = make([]uint8, (1<<c.cache.log2PageSize)/(1<<c.cache.log2BlockSize))
+				(*(c.cache.dirtyMask))[c.cache.deviceID-1][trans.read.GetPID()][page] = make([]uint8, (1<<c.cache.log2PageSize)/(1<<c.cache.log2BlockSize))
+			}
+
+			mask := (*(c.cache.readMask))[c.cache.deviceID-1][trans.read.GetPID()][page]
+
+			var start, end uint64
+			if page == startPage {
+				start = startIndex
+			} else {
+				start = 0
+			}
+
+			if page == endPage {
+				end = endIndex
+			} else {
+				end = (1<<c.cache.log2PageSize)/(1<<c.cache.log2BlockSize) - 1
+			}
+
+			for i := start; i <= end; i++ {
+				mask[i] = 1
+			}
+		}
+
+		// fmt.Printf("[%s]\tUpdate ReadMask for Read Req VA %x, ReadMask: %v\n", c.cache.Name(), trans.read.GetVAddr()/(1<<c.cache.log2PageSize),
+		// 	(*(c.cache.readMask))[c.cache.deviceID-1][trans.read.GetPID()][trans.read.GetVAddr()/(1<<c.cache.log2PageSize)])
+	} else {
+		startPage := trans.write.GetVAddr() / (1 << c.cache.log2PageSize)
+		startIndex := trans.write.GetVAddr() % (1 << c.cache.log2PageSize) / uint64(1<<c.cache.log2BlockSize)
+		numBlocks := len(trans.write.Data) / (1 << c.cache.log2BlockSize)
+
+		for i := 0; i < numBlocks; i++ {
+			page := startPage + (startIndex+uint64(i))/(1<<(c.cache.log2PageSize-c.cache.log2BlockSize))
+			index := (startIndex + uint64(i)) % (1 << (c.cache.log2PageSize - c.cache.log2BlockSize))
+
+			if (*(c.cache.dirtyMask))[c.cache.deviceID-1] == nil {
+				(*(c.cache.readMask))[c.cache.deviceID-1] = make(map[vm.PID]map[uint64][]uint8)
+				(*(c.cache.dirtyMask))[c.cache.deviceID-1] = make(map[vm.PID]map[uint64][]uint8)
+			}
+			if (*(c.cache.dirtyMask))[c.cache.deviceID-1][trans.write.GetPID()] == nil {
+				(*(c.cache.readMask))[c.cache.deviceID-1][trans.write.GetPID()] = make(map[uint64][]uint8)
+				(*(c.cache.dirtyMask))[c.cache.deviceID-1][trans.write.GetPID()] = make(map[uint64][]uint8)
+			}
+			if (*(c.cache.dirtyMask))[c.cache.deviceID-1][trans.write.GetPID()][page] == nil {
+				(*(c.cache.readMask))[c.cache.deviceID-1][trans.write.GetPID()][page] = make([]uint8, (1<<c.cache.log2PageSize)/(1<<c.cache.log2BlockSize))
+				(*(c.cache.dirtyMask))[c.cache.deviceID-1][trans.write.GetPID()][page] = make([]uint8, (1<<c.cache.log2PageSize)/(1<<c.cache.log2BlockSize))
+			}
+
+			mask := (*(c.cache.dirtyMask))[c.cache.deviceID-1][trans.write.GetPID()][page]
+			mask[index] = 1
+		}
+
+		// fmt.Printf("[%s]\tUpdate DirtyMask for Write Req VA %x, DirtyMask: %v\n", c.cache.Name(), trans.write.GetVAddr()/(1<<c.cache.log2PageSize),
+		// 	(*(c.cache.dirtyMask))[c.cache.deviceID-1][trans.write.GetPID()][trans.write.GetVAddr()/(1<<c.cache.log2PageSize)])
 	}
 }

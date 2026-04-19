@@ -16,14 +16,30 @@ var controlMsgByteOverhead = 4
 type AccessReq interface {
 	sim.Msg
 	GetAddress() uint64
+	SetAddress(addr uint64)
+	GetVAddr() uint64
 	GetByteSize() uint64
 	GetPID() vm.PID
+
+	GetReqFrom() string
+	SetReqFrom(string)
+
+	GetSrcRDMA() sim.RemotePort
+	SetSrcRDMA(port sim.RemotePort)
+
+	GetNoNeedToReply() bool
+	SetNoNeedToReply(b bool)
+
+	GetNiceness() bool
+	SetNiceness(b bool)
 }
 
 // A AccessRsp is a respond in the memory system.
 type AccessRsp interface {
 	sim.Msg
 	sim.Rsp
+	GetOrigin() AccessReq
+	GetWaitFor() uint64
 }
 
 // A ReadReq is a request sent to a memory controller to fetch data
@@ -31,10 +47,18 @@ type ReadReq struct {
 	sim.MsgMeta
 
 	Address            uint64
+	VAddr              uint64
 	AccessByteSize     uint64
 	PID                vm.PID
 	CanWaitForCoalesce bool
 	Info               interface{}
+
+	ReqFrom string
+	SrcRDMA sim.RemotePort
+
+	NoNeedToReply     bool // 응답이 필요없는 request인 경우 (prefetch?)
+	Niceness          bool // 우선순위가 낮아져도 되는 request
+	FetchForWriteMiss bool
 }
 
 // Meta returns the message meta.
@@ -72,9 +96,50 @@ func (r *ReadReq) GetAddress() uint64 {
 	return r.Address
 }
 
+func (r *ReadReq) SetAddress(addr uint64) {
+	r.Address = addr
+}
+
+// GetAddress returns the address that the request is accessing
+func (r *ReadReq) GetVAddr() uint64 {
+	return r.VAddr
+}
+
 // GetPID returns the process ID that the request is working on.
 func (r *ReadReq) GetPID() vm.PID {
 	return r.PID
+}
+
+func (r *ReadReq) GetReqFrom() string {
+	return r.ReqFrom
+}
+
+func (r *ReadReq) SetReqFrom(reqFrom string) {
+	r.ReqFrom = reqFrom
+}
+
+func (r *ReadReq) GetSrcRDMA() sim.RemotePort {
+	return r.SrcRDMA
+}
+
+func (r *ReadReq) SetSrcRDMA(port sim.RemotePort) {
+	r.SrcRDMA = port
+}
+
+func (r *ReadReq) GetNoNeedToReply() bool {
+	return r.NoNeedToReply
+}
+
+func (r *ReadReq) SetNoNeedToReply(b bool) {
+	r.NoNeedToReply = b
+}
+
+func (r *ReadReq) GetNiceness() bool {
+	return r.Niceness
+}
+
+func (r *ReadReq) SetNiceness(b bool) {
+	r.Niceness = b
 }
 
 // ReadReqBuilder can build read requests.
@@ -82,8 +147,12 @@ type ReadReqBuilder struct {
 	src, dst           sim.RemotePort
 	pid                vm.PID
 	address, byteSize  uint64
+	VAddr              uint64
 	canWaitForCoalesce bool
 	info               interface{}
+	ReqFrom            string
+	SrcRDMA            sim.RemotePort
+	FetchForWriteMiss  bool
 }
 
 // WithSrc sets the source of the request to build.
@@ -116,6 +185,12 @@ func (b ReadReqBuilder) WithAddress(address uint64) ReadReqBuilder {
 	return b
 }
 
+// WithAddress sets the address of the request to build.
+func (b ReadReqBuilder) WithVAddr(address uint64) ReadReqBuilder {
+	b.VAddr = address
+	return b
+}
+
 // WithByteSize sets the byte size of the request to build.
 func (b ReadReqBuilder) WithByteSize(byteSize uint64) ReadReqBuilder {
 	b.byteSize = byteSize
@@ -128,6 +203,22 @@ func (b ReadReqBuilder) CanWaitForCoalesce() ReadReqBuilder {
 	return b
 }
 
+// CanWaitForCoalesce allow the request to build to wait for coalesce.
+func (b ReadReqBuilder) WithReqFrom(ReqFrom string) ReadReqBuilder {
+	b.ReqFrom = ReqFrom
+	return b
+}
+
+func (b ReadReqBuilder) WithSrcRDMA(port sim.RemotePort) ReadReqBuilder {
+	b.SrcRDMA = port
+	return b
+}
+
+func (b ReadReqBuilder) WithFetchForWriteMiss(bo bool) ReadReqBuilder {
+	b.FetchForWriteMiss = bo
+	return b
+}
+
 // Build creates a new ReadReq
 func (b ReadReqBuilder) Build() *ReadReq {
 	r := &ReadReq{}
@@ -136,11 +227,15 @@ func (b ReadReqBuilder) Build() *ReadReq {
 	r.Dst = b.dst
 	r.TrafficBytes = accessReqByteOverhead
 	r.Address = b.address
+	r.VAddr = b.VAddr
 	r.PID = b.pid
 	r.Info = b.info
 	r.AccessByteSize = b.byteSize
 	r.CanWaitForCoalesce = b.canWaitForCoalesce
 	r.TrafficClass = reflect.TypeOf(ReadReq{}).String()
+	r.ReqFrom = b.ReqFrom
+	r.SrcRDMA = b.SrcRDMA
+	r.FetchForWriteMiss = b.FetchForWriteMiss
 
 	return r
 }
@@ -150,11 +245,18 @@ type WriteReq struct {
 	sim.MsgMeta
 
 	Address            uint64
+	VAddr              uint64
 	Data               []byte
 	DirtyMask          []bool
 	PID                vm.PID
 	CanWaitForCoalesce bool
 	Info               interface{}
+
+	ReqFrom string
+	SrcRDMA sim.RemotePort
+
+	NoNeedToReply bool
+	Niceness      bool
 }
 
 // Meta returns the meta data attached to a request.
@@ -191,9 +293,50 @@ func (r *WriteReq) GetAddress() uint64 {
 	return r.Address
 }
 
+func (r *WriteReq) SetAddress(addr uint64) {
+	r.Address = addr
+}
+
+// GetAddress returns the address that the request is accessing
+func (r *WriteReq) GetVAddr() uint64 {
+	return r.VAddr
+}
+
 // GetPID returns the PID of the read address
 func (r *WriteReq) GetPID() vm.PID {
 	return r.PID
+}
+
+func (r *WriteReq) GetReqFrom() string {
+	return r.ReqFrom
+}
+
+func (r *WriteReq) SetReqFrom(reqFrom string) {
+	r.ReqFrom = reqFrom
+}
+
+func (r *WriteReq) GetSrcRDMA() sim.RemotePort {
+	return r.SrcRDMA
+}
+
+func (r *WriteReq) SetSrcRDMA(port sim.RemotePort) {
+	r.SrcRDMA = port
+}
+
+func (r *WriteReq) GetNoNeedToReply() bool {
+	return r.NoNeedToReply
+}
+
+func (r *WriteReq) SetNoNeedToReply(b bool) {
+	r.NoNeedToReply = b
+}
+
+func (r *WriteReq) GetNiceness() bool {
+	return r.Niceness
+}
+
+func (r *WriteReq) SetNiceness(b bool) {
+	r.Niceness = b
 }
 
 // WriteReqBuilder can build read requests.
@@ -202,9 +345,12 @@ type WriteReqBuilder struct {
 	pid                vm.PID
 	info               interface{}
 	address            uint64
+	VAddr              uint64
 	data               []byte
 	dirtyMask          []bool
 	canWaitForCoalesce bool
+	ReqFrom            string
+	SrcRDMA            sim.RemotePort
 }
 
 // WithSrc sets the source of the request to build.
@@ -237,6 +383,12 @@ func (b WriteReqBuilder) WithAddress(address uint64) WriteReqBuilder {
 	return b
 }
 
+// WithAddress sets the address of the request to build.
+func (b WriteReqBuilder) WithVAddr(address uint64) WriteReqBuilder {
+	b.VAddr = address
+	return b
+}
+
 // WithData sets the data of the request to build.
 func (b WriteReqBuilder) WithData(data []byte) WriteReqBuilder {
 	b.data = data
@@ -255,6 +407,17 @@ func (b WriteReqBuilder) CanWaitForCoalesce() WriteReqBuilder {
 	return b
 }
 
+// CanWaitForCoalesce allow the request to build to wait for coalesce.
+func (b WriteReqBuilder) WithReqFrom(ReqFrom string) WriteReqBuilder {
+	b.ReqFrom = ReqFrom
+	return b
+}
+
+func (b WriteReqBuilder) WithSrcRDMA(port sim.RemotePort) WriteReqBuilder {
+	b.SrcRDMA = port
+	return b
+}
+
 // Build creates a new WriteReq
 func (b WriteReqBuilder) Build() *WriteReq {
 	r := &WriteReq{}
@@ -264,11 +427,14 @@ func (b WriteReqBuilder) Build() *WriteReq {
 	r.PID = b.pid
 	r.Info = b.info
 	r.Address = b.address
+	r.VAddr = b.VAddr
 	r.Data = b.data
 	r.TrafficBytes = len(r.Data) + accessReqByteOverhead
 	r.DirtyMask = b.dirtyMask
 	r.CanWaitForCoalesce = b.canWaitForCoalesce
 	r.TrafficClass = reflect.TypeOf(WriteReq{}).String()
+	r.ReqFrom = b.ReqFrom
+	r.SrcRDMA = b.SrcRDMA
 
 	return r
 }
@@ -280,6 +446,8 @@ type DataReadyRsp struct {
 
 	RespondTo string // The ID of the request it replies
 	Data      []byte
+	Origin    AccessReq
+	WaitFor   uint64
 }
 
 // Meta returns the meta data attached to each message.
@@ -300,11 +468,21 @@ func (r *DataReadyRsp) GetRspTo() string {
 	return r.RespondTo
 }
 
+func (r *DataReadyRsp) GetOrigin() AccessReq {
+	return r.Origin
+}
+
+func (r *DataReadyRsp) GetWaitFor() uint64 {
+	return r.WaitFor
+}
+
 // DataReadyRspBuilder can build data ready responds.
 type DataReadyRspBuilder struct {
 	src, dst sim.RemotePort
 	rspTo    string
 	data     []byte
+	origin   AccessReq
+	waitFor  uint64
 }
 
 // WithSrc sets the source of the request to build.
@@ -331,6 +509,11 @@ func (b DataReadyRspBuilder) WithData(data []byte) DataReadyRspBuilder {
 	return b
 }
 
+func (b DataReadyRspBuilder) WithOrigin(origin AccessReq) DataReadyRspBuilder {
+	b.origin = origin
+	return b
+}
+
 // Build creates a new DataReadyRsp
 func (b DataReadyRspBuilder) Build() *DataReadyRsp {
 	r := &DataReadyRsp{}
@@ -341,6 +524,8 @@ func (b DataReadyRspBuilder) Build() *DataReadyRsp {
 	r.RespondTo = b.rspTo
 	r.Data = b.data
 	r.TrafficClass = reflect.TypeOf(ReadReq{}).String()
+	r.Origin = b.origin
+	r.WaitFor = b.waitFor
 
 	return r
 }
@@ -351,6 +536,8 @@ type WriteDoneRsp struct {
 	sim.MsgMeta
 
 	RespondTo string
+	Origin    AccessReq
+	WaitFor   uint64
 }
 
 // Meta returns the meta data associated with the message.
@@ -371,10 +558,21 @@ func (r *WriteDoneRsp) GetRspTo() string {
 	return r.RespondTo
 }
 
+func (r *WriteDoneRsp) GetOrigin() AccessReq {
+	return r.Origin
+}
+
+func (r *WriteDoneRsp) GetWaitFor() uint64 {
+	return r.WaitFor
+}
+
 // WriteDoneRspBuilder can build data ready responds.
 type WriteDoneRspBuilder struct {
 	src, dst sim.RemotePort
 	rspTo    string
+	addr     uint64
+	origin   AccessReq
+	waitFor  uint64
 }
 
 // WithSrc sets the source of the request to build.
@@ -395,6 +593,11 @@ func (b WriteDoneRspBuilder) WithRspTo(id string) WriteDoneRspBuilder {
 	return b
 }
 
+func (b WriteDoneRspBuilder) WithOrigin(origin AccessReq) WriteDoneRspBuilder {
+	b.origin = origin
+	return b
+}
+
 // Build creates a new WriteDoneRsp
 func (b WriteDoneRspBuilder) Build() *WriteDoneRsp {
 	r := &WriteDoneRsp{}
@@ -404,6 +607,8 @@ func (b WriteDoneRspBuilder) Build() *WriteDoneRsp {
 	r.TrafficBytes = accessRspByteOverhead
 	r.RespondTo = b.rspTo
 	r.TrafficClass = reflect.TypeOf(WriteReq{}).String()
+	r.Origin = b.origin
+	r.WaitFor = b.waitFor
 
 	return r
 }
@@ -532,4 +737,190 @@ func (b ControlMsgBuilder) Build() *ControlMsg {
 	m.TrafficClass = reflect.TypeOf(ControlMsg{}).String()
 
 	return m
+}
+
+// A ReadReq is a request sent to a memory controller to fetch data
+type InvReq struct {
+	sim.MsgMeta
+
+	PID      vm.PID
+	Address  uint64
+	ReqFrom  string
+	DstRDMA  sim.RemotePort
+	RegionID int
+}
+
+// Meta returns the message meta.
+func (r *InvReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+// Clone returns cloned InvReq with different ID
+func (r *InvReq) Clone() sim.Msg {
+	cloneMsg := *r
+	cloneMsg.ID = sim.GetIDGenerator().Generate()
+
+	return &cloneMsg
+}
+
+// GetAddress returns the address that the request is accessing
+func (r *InvReq) GetAddress() uint64 {
+	return r.Address
+}
+
+// GetPID returns the process ID that the request is working on.
+func (r *InvReq) GetPID() vm.PID {
+	return r.PID
+}
+
+// InvReqBuilder can build read requests.
+type InvReqBuilder struct {
+	src, dst sim.RemotePort
+	pid      vm.PID
+	address  uint64
+	reqFrom  string
+	dstRDMA  sim.RemotePort
+	RegionID int
+}
+
+// WithSrc sets the source of the request to build.
+func (b InvReqBuilder) WithSrc(src sim.RemotePort) InvReqBuilder {
+	b.src = src
+	return b
+}
+
+// WithDst sets the destination of the request to build.
+func (b InvReqBuilder) WithDst(dst sim.RemotePort) InvReqBuilder {
+	b.dst = dst
+	return b
+}
+
+// WithPID sets the PID of the request to build.
+func (b InvReqBuilder) WithPID(pid vm.PID) InvReqBuilder {
+	b.pid = pid
+	return b
+}
+
+// WithAddress sets the address of the request to build.
+func (b InvReqBuilder) WithAddress(address uint64) InvReqBuilder {
+	b.address = address
+	return b
+}
+
+// WithAddress sets the address of the request to build.
+func (b InvReqBuilder) WithReqFrom(ID string) InvReqBuilder {
+	b.reqFrom = ID
+	return b
+}
+
+// WithAddress sets the address of the request to build.
+func (b InvReqBuilder) WithDstRDMA(port sim.RemotePort) InvReqBuilder {
+	b.dstRDMA = port
+	return b
+}
+
+func (b InvReqBuilder) WithRegionID(len int) InvReqBuilder {
+	b.RegionID = len
+	return b
+}
+
+// Build creates a new InvReq
+func (b InvReqBuilder) Build() *InvReq {
+	r := &InvReq{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+	r.TrafficBytes = accessReqByteOverhead
+	r.Address = b.address
+	r.PID = b.pid
+	r.TrafficClass = reflect.TypeOf(InvReq{}).String()
+	r.ReqFrom = b.reqFrom
+	r.DstRDMA = b.dstRDMA
+	r.RegionID = b.RegionID
+
+	return r
+}
+
+// A ReadReq is a request sent to a memory controller to fetch data
+type InvRsp struct {
+	sim.MsgMeta
+	RespondTo string
+	SrcRDMA   sim.RemotePort
+	Accessed  uint64
+	NumInv    uint64
+}
+
+// Meta returns the message meta.
+func (r *InvRsp) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+// Clone returns cloned InvRsp with different ID
+func (r *InvRsp) Clone() sim.Msg {
+	cloneMsg := *r
+	cloneMsg.ID = sim.GetIDGenerator().Generate()
+
+	return &cloneMsg
+}
+
+func (r *InvRsp) GetRspTo() string {
+	return r.RespondTo
+}
+
+// InvRspBuilder can build read requests.
+type InvRspBuilder struct {
+	src, dst  sim.RemotePort
+	respondTo string
+	srcRDMA   sim.RemotePort
+	accessed  uint64
+	numInv    uint64
+}
+
+// WithSrc sets the source of the request to build.
+func (b InvRspBuilder) WithSrc(src sim.RemotePort) InvRspBuilder {
+	b.src = src
+	return b
+}
+
+// WithDst sets the destination of the request to build.
+func (b InvRspBuilder) WithDst(dst sim.RemotePort) InvRspBuilder {
+	b.dst = dst
+	return b
+}
+
+// WithAddress sets the address of the request to build.
+func (b InvRspBuilder) WithRspTo(ID string) InvRspBuilder {
+	b.respondTo = ID
+	return b
+}
+
+func (b InvRspBuilder) WithSrcRDMA(port sim.RemotePort) InvRspBuilder {
+	b.srcRDMA = port
+	return b
+}
+
+func (b InvRspBuilder) WithAccessed(a uint64) InvRspBuilder {
+	b.accessed = a
+	return b
+}
+
+func (b InvRspBuilder) WithNumInv(a uint64) InvRspBuilder {
+	b.numInv = a
+	return b
+}
+
+// Build creates a new InvRsp
+func (b InvRspBuilder) Build() *InvRsp {
+	r := &InvRsp{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+	r.TrafficBytes = controlMsgByteOverhead
+	r.TrafficClass = reflect.TypeOf(InvRsp{}).String()
+	r.RespondTo = b.respondTo
+	r.SrcRDMA = b.srcRDMA
+	r.Accessed = b.accessed
+	r.NumInv = b.numInv
+
+	return r
 }

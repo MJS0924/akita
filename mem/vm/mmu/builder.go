@@ -1,6 +1,8 @@
 package mmu
 
 import (
+	"fmt"
+
 	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
 )
@@ -10,11 +12,12 @@ type Builder struct {
 	engine                   sim.Engine
 	freq                     sim.Freq
 	log2PageSize             uint64
-	pageTable                vm.PageTable
+	pageTable                vm.LevelPageTable
 	migrationServiceProvider sim.RemotePort
 	maxNumReqInFlight        int
 	pageWalkingLatency       int
 	autoPageAllocation       bool
+	pageMigrationPolicy      uint64
 }
 
 // MakeBuilder creates a new builder
@@ -45,7 +48,7 @@ func (b Builder) WithLog2PageSize(log2PageSize uint64) Builder {
 }
 
 // WithPageTable sets the page table that the MMU uses.
-func (b Builder) WithPageTable(pageTable vm.PageTable) Builder {
+func (b Builder) WithPageTable(pageTable vm.LevelPageTable) Builder {
 	b.pageTable = pageTable
 	return b
 }
@@ -79,6 +82,11 @@ func (b Builder) WithAutoPageAllocation(enabled bool) Builder {
 	return b
 }
 
+func (b Builder) WithPageMigrationPolicy(policy uint64) Builder {
+	b.pageMigrationPolicy = policy
+	return b
+}
+
 // Build returns a newly created MMU component
 func (b Builder) Build(name string) *Comp {
 	mmu := new(Comp)
@@ -92,18 +100,26 @@ func (b Builder) Build(name string) *Comp {
 	middleware := &middleware{Comp: mmu}
 	mmu.AddMiddleware(middleware)
 
+	mmu.pageTableCache.Sets = make(map[string]*vm.Set)
+	mmu.pageTableCache.CapOfBlks = 8
+	mmu.pageTableCache.Latency = 5
+
 	return mmu
 }
 
 func (b Builder) configureInternalStates(mmu *Comp) {
 	mmu.MigrationServiceProvider = b.migrationServiceProvider
 	mmu.migrationQueueSize = 4096
+	mmu.invalidationQueueSize = 4096
+	mmu.duplicationQueueSize = 4096
 	mmu.maxRequestsInFlight = b.maxNumReqInFlight
 	mmu.latency = b.pageWalkingLatency
 	mmu.autoPageAllocation = b.autoPageAllocation
 	mmu.log2PageSize = b.log2PageSize
 	mmu.PageAccessedByDeviceID = make(map[uint64][]uint64)
-	
+	mmu.pageMigrationPolicy = b.pageMigrationPolicy
+	fmt.Printf("[MMU Builder]\tMMU built with PageMigrationPolicy=%d\n", b.pageMigrationPolicy)
+
 	if mmu.autoPageAllocation {
 		mmu.nextPhysicalPage = 0
 	}
@@ -115,7 +131,7 @@ func (b Builder) createPageTable(mmu *Comp) {
 		b.validatePageTablePageSize()
 		mmu.pageTable = b.pageTable
 	} else {
-		mmu.pageTable = vm.NewPageTable(b.log2PageSize)
+		mmu.pageTable = vm.NewLevelPageTable(b.log2PageSize, 6, fmt.Sprintf("MMU.PT"))
 	}
 }
 

@@ -42,6 +42,7 @@ func (s *respondStage) respondReadTrans(
 		WithDst(read.Src).
 		WithRspTo(read.ID).
 		WithData(trans.data).
+		WithOrigin(read).
 		Build()
 
 	err := s.cache.topPort.Send(dr)
@@ -68,6 +69,7 @@ func (s *respondStage) respondWriteTrans(
 		WithSrc(s.cache.topPort.AsRemote()).
 		WithDst(write.Src).
 		WithRspTo(write.ID).
+		WithOrigin(write).
 		Build()
 
 	err := s.cache.topPort.Send(done)

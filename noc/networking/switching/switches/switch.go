@@ -248,8 +248,8 @@ func (m *middleware) sendOut() (madeProgress bool) {
 func (m *middleware) assignFlitOutputBuf(f *messaging.Flit) {
 	outPort := m.routingTable.FindPort(f.Msg.Meta().Dst)
 	if outPort == "" {
-		panic(fmt.Sprintf("%s: no output port for %s",
-			m.Comp.Name(), f.Msg.Meta().Dst))
+		panic(fmt.Sprintf("%s: no output port for Dst %s, ID %s, Src %s",
+			m.Comp.Name(), f.Msg.Meta().Dst, f.MsgMeta.ID, f.MsgMeta.Src))
 	}
 
 	pc := m.portToComplexMapping[outPort]

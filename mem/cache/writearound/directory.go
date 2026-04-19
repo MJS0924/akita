@@ -5,7 +5,6 @@ import (
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/pipelining"
 	"github.com/sarchlab/akita/v4/sim"
-	"github.com/sarchlab/akita/v4/tracing"
 )
 
 type dirPipelineItem struct {
@@ -88,11 +87,17 @@ func (d *directory) processMSHRHit(
 ) bool {
 	mshrEntry.Requests = append(mshrEntry.Requests, trans)
 
-	if trans.read != nil {
-		tracing.AddTaskStep(trans.id, d.cache, "read-mshr-hit")
-	} else {
-		tracing.AddTaskStep(trans.id, d.cache, "write-mshr-hit")
-	}
+	// if trans.read != nil {
+	// 	tracing.AddTaskStep(trans.id, d.cache, "read-mshr-hit")
+	// 	// if d.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	// 	fmt.Printf("\t\t\t\t\t\t\tRead MSHR hit\n")
+	// 	// }
+	// } else {
+	// 	tracing.AddTaskStep(trans.id, d.cache, "write-mshr-hit")
+	// 	// if d.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	// 	fmt.Printf("\t\t\t\t\t\t\tWrite MSHR hit\n")
+	// 	// }
+	// }
 
 	d.buf.Pop()
 
@@ -119,7 +124,10 @@ func (d *directory) processReadHit(
 	bankBuf.Push(trans)
 
 	d.buf.Pop()
-	tracing.AddTaskStep(trans.id, d.cache, "read-hit")
+	// tracing.AddTaskStep(trans.id, d.cache, "read-hit")
+	// if d.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("\t\t\t\t\t\t\tRead hit\n")
+	// }
 
 	return true
 }
@@ -144,7 +152,7 @@ func (d *directory) processReadMiss(trans *transaction) bool {
 	}
 
 	d.buf.Pop()
-	tracing.AddTaskStep(trans.id, d.cache, "read-miss")
+	// tracing.AddTaskStep(trans.id, d.cache, "read-miss")
 
 	return true
 }
@@ -156,6 +164,10 @@ func (d *directory) processWrite(trans *transaction) bool {
 	blockSize := uint64(1 << d.cache.log2BlockSize)
 	cacheLineID := addr / blockSize * blockSize
 
+	// if d.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\t[directory]\tProcess read: VA %x\n", d.cache.name, write.GetVAddr())
+	// }
+
 	mshrEntry := d.cache.mshr.Query(pid, cacheLineID)
 	if mshrEntry != nil {
 		ok := d.writeBottom(trans)
@@ -165,6 +177,10 @@ func (d *directory) processWrite(trans *transaction) bool {
 
 		return false
 	}
+
+	// if d.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("\t\t\t\t\t\t\tMSHR miss\n")
+	// }
 
 	block := d.cache.directory.Lookup(pid, cacheLineID)
 	if block != nil && block.IsValid {
@@ -176,7 +192,7 @@ func (d *directory) processWrite(trans *transaction) bool {
 
 func (d *directory) writeMiss(trans *transaction) bool {
 	if ok := d.writeBottom(trans); ok {
-		tracing.AddTaskStep(trans.id, d.cache, "write-miss")
+		// tracing.AddTaskStep(trans.id, d.cache, "write-miss")
 		d.buf.Pop()
 
 		return true
@@ -193,9 +209,11 @@ func (d *directory) writeBottom(trans *transaction) bool {
 		WithSrc(d.cache.bottomPort.AsRemote()).
 		WithDst(d.cache.addressToPortMapper.Find(addr)).
 		WithAddress(addr).
+		WithVAddr(write.GetVAddr()).
 		WithPID(write.PID).
 		WithData(write.Data).
 		WithDirtyMask(write.DirtyMask).
+		WithReqFrom(d.cache.name).
 		Build()
 
 	err := d.cache.bottomPort.Send(writeToBottom)
@@ -204,8 +222,7 @@ func (d *directory) writeBottom(trans *transaction) bool {
 	}
 
 	trans.writeToBottom = writeToBottom
-
-	tracing.TraceReqInitiate(writeToBottom, d.cache, trans.id)
+	// tracing.TraceReqInitiate(writeToBottom, d.cache, trans.id)
 
 	return true
 }
@@ -243,7 +260,7 @@ func (d *directory) processWriteHit(
 	trans.block = block
 	bankBuf.Push(trans)
 
-	tracing.AddTaskStep(trans.id, d.cache, "write-hit")
+	// tracing.AddTaskStep(trans.id, d.cache, "write-hit")
 	d.buf.Pop()
 
 	return true
@@ -263,8 +280,10 @@ func (d *directory) fetchFromBottom(
 		WithSrc(d.cache.bottomPort.AsRemote()).
 		WithDst(bottomModule).
 		WithAddress(cacheLineID).
+		WithVAddr(trans.read.GetVAddr()).
 		WithPID(pid).
 		WithByteSize(blockSize).
+		WithReqFrom(d.cache.name).
 		Build()
 
 	err := d.cache.bottomPort.Send(readToBottom)
@@ -272,7 +291,7 @@ func (d *directory) fetchFromBottom(
 		return false
 	}
 
-	tracing.TraceReqInitiate(readToBottom, d.cache, trans.id)
+	// tracing.TraceReqInitiate(readToBottom, d.cache, trans.id)
 	trans.readToBottom = readToBottom
 	trans.block = victim
 

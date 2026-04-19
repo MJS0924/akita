@@ -153,6 +153,7 @@ func (b Builder) Build(name string) *Comp {
 		log2BlockSize:  b.log2BlockSize,
 		numReqPerCycle: b.numReqPerCycle,
 	}
+	c.name = name
 	c.TickingComponent = sim.NewTickingComponent(
 		name, b.engine, b.freq, c)
 

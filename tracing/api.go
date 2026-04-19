@@ -104,6 +104,7 @@ func StartTaskWithSpecificLocation(
 		Item:   task,
 		Pos:    HookPosTaskStart,
 	}
+
 	domain.InvokeHook(ctx)
 }
 

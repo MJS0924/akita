@@ -24,6 +24,7 @@ type bankStage struct {
 }
 
 func (s *bankStage) Reset() {
+	s.cache.bankBufs[s.bankID].Clear()
 	s.postPipelineBuf.Clear()
 	s.pipeline.Clear()
 }

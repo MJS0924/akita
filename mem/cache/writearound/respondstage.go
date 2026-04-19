@@ -40,12 +40,17 @@ func (s *respondStage) respondReadTrans(trans *transaction) bool {
 		WithDst(read.Src).
 		WithRspTo(read.ID).
 		WithData(trans.data).
+		WithOrigin(read).
 		Build()
 
 	err := s.cache.topPort.Send(dr)
 	if err != nil {
 		return false
 	}
+
+	// if s.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\t[respond]\tSend read response: Addr %x\n", s.cache.name, read.Address)
+	// }
 
 	s.removeTransaction(trans)
 
@@ -64,6 +69,7 @@ func (s *respondStage) respondWriteTrans(trans *transaction) bool {
 		WithSrc(s.cache.topPort.AsRemote()).
 		WithDst(write.Src).
 		WithRspTo(write.ID).
+		WithOrigin(write).
 		Build()
 
 	err := s.cache.topPort.Send(done)
@@ -71,6 +77,9 @@ func (s *respondStage) respondWriteTrans(trans *transaction) bool {
 		return false
 	}
 
+	// if s.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\t[respond]\tSend write response: %x\n", s.cache.name, write.Address)
+	// }
 	s.removeTransaction(trans)
 
 	tracing.TraceReqComplete(write, s.cache)

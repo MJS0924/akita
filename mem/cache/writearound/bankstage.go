@@ -3,7 +3,6 @@ package writearound
 import (
 	"github.com/sarchlab/akita/v4/pipelining"
 	"github.com/sarchlab/akita/v4/sim"
-	"github.com/sarchlab/akita/v4/tracing"
 )
 
 type bankTransaction struct {
@@ -83,6 +82,10 @@ func (s *bankStage) finalizeTrans() bool {
 }
 
 func (s *bankStage) finalizeReadHitTrans(trans *transaction) bool {
+	// if s.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\t[bankstage]\tFinalize read hit transaction: Addr %x\n", s.cache.name, trans.read.Address)
+	// }
+
 	block := trans.block
 
 	data, err := s.cache.storage.Read(
@@ -102,12 +105,16 @@ func (s *bankStage) finalizeReadHitTrans(trans *transaction) bool {
 	s.removeTransaction(trans)
 	s.postPipelineBuf.Pop()
 
-	tracing.EndTask(trans.id, s.cache)
+	// tracing.EndTask(trans.id, s.cache)
 
 	return true
 }
 
 func (s *bankStage) finalizeWriteTrans(trans *transaction) bool {
+	// if s.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\t[bankstage]\tFinalize write transaction: Addr %x\n", s.cache.name, trans.write.Address)
+	// }
+
 	write := trans.write
 	block := trans.block
 	blockSize := 1 << s.cache.log2BlockSize
@@ -135,12 +142,16 @@ func (s *bankStage) finalizeWriteTrans(trans *transaction) bool {
 
 	s.postPipelineBuf.Pop()
 
-	tracing.EndTask(trans.id, s.cache)
+	// tracing.EndTask(trans.id, s.cache)
 
 	return true
 }
 
 func (s *bankStage) finalizeWriteFetchedTrans(trans *transaction) bool {
+	// if s.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\t[bankstage]\tFinalize write fetched transaction: Addr %x\n", s.cache.name, trans.read.Address)
+	// }
+
 	block := trans.block
 
 	err := s.cache.storage.Write(block.CacheAddress, trans.data)

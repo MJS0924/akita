@@ -1,6 +1,8 @@
 package writethrough
 
 import (
+	"strings"
+
 	"github.com/sarchlab/akita/v4/mem/cache"
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/pipelining"
@@ -267,11 +269,15 @@ func (d *directory) writeBottom(trans *transaction) bool {
 		WithSrc(d.cache.bottomPort.AsRemote()).
 		WithDst(d.cache.addressToPortMapper.Find(addr)).
 		WithAddress(addr).
+		WithVAddr(trans.write.GetVAddr()).
 		WithPID(write.PID).
 		WithData(write.Data).
 		WithDirtyMask(write.DirtyMask).
 		Build()
-
+	if strings.Contains(d.cache.name, "L1ICache") {
+		writeToBottom.VAddr = 0
+		// L1I cache의 data는 RDMA에서 print하지 않도록 하기 위해 0으로 표시
+	}
 	err := d.cache.bottomPort.Send(writeToBottom)
 	if err != nil {
 		return false
@@ -336,14 +342,21 @@ func (d *directory) fetchFromBottom(
 		WithSrc(d.cache.bottomPort.AsRemote()).
 		WithDst(bottomModule).
 		WithAddress(cacheLineID).
+		WithVAddr(trans.read.GetVAddr()).
 		WithPID(pid).
 		WithByteSize(blockSize).
 		Build()
+	if strings.Contains(d.cache.name, "L1ICache") {
+		readToBottom.VAddr = 0
+		// L1I cache의 data는 RDMA에서 print하지 않도록 하기 위해 0으로 표시
+	}
 	err := d.cache.bottomPort.Send(readToBottom)
 
 	if err != nil {
 		return false
 	}
+
+	// fmt.Printf("[%s]\n\tSend read request to bottom: VA %x, PA %x\n", d.cache.name, readToBottom.VAddr, readToBottom.Address)
 
 	tracing.TraceReqInitiate(readToBottom, d.cache, trans.id)
 	trans.readToBottom = readToBottom

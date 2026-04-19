@@ -12,6 +12,8 @@ type Comp struct {
 	*sim.TickingComponent
 	sim.MiddlewareHolder
 
+	name string
+
 	topPort     sim.Port
 	bottomPort  sim.Port
 	controlPort sim.Port

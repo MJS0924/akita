@@ -1,6 +1,9 @@
 package writeback
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/sarchlab/akita/v4/mem/cache"
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/tracing"
@@ -124,6 +127,9 @@ func (wb *writeBufferStage) fetchFromBottom(
 	}
 
 	lowModulePort := wb.cache.addressToPortMapper.Find(trans.fetchAddress)
+	// if strings.Contains(fmt.Sprintf("%s", lowModulePort), "RDMA") {
+	// 	fmt.Printf("[%s]\tFetch %x from %s\n", wb.cache.Name(), trans.fetchAddress, lowModulePort)
+	// }
 	read := mem.ReadReqBuilder{}.
 		WithSrc(wb.cache.bottomPort.AsRemote()).
 		WithDst(lowModulePort).
@@ -131,6 +137,10 @@ func (wb *writeBufferStage) fetchFromBottom(
 		WithAddress(trans.fetchAddress).
 		WithByteSize(1 << wb.cache.log2BlockSize).
 		Build()
+	if trans.accessReq() != nil {
+		read.VAddr = trans.accessReq().GetVAddr()
+	}
+
 	wb.cache.bottomPort.Send(read)
 
 	trans.fetchReadReq = read
@@ -139,6 +149,14 @@ func (wb *writeBufferStage) fetchFromBottom(
 
 	tracing.TraceReqInitiate(read, wb.cache,
 		tracing.MsgIDAtReceiver(trans.req(), wb.cache))
+
+	what := ""
+	if strings.Contains(fmt.Sprintf("%s", read.Meta().Dst), "DRAM") {
+		what = "ToLocal"
+	} else {
+		what = "ToRemote"
+	}
+	tracing.AddTaskStep(read.ID, wb.cache, what)
 
 	return true
 }
@@ -241,6 +259,11 @@ func (wb *writeBufferStage) write() bool {
 		WithData(trans.evictingData).
 		WithDirtyMask(trans.evictingDirtyMask).
 		Build()
+
+	if trans.accessReq() != nil {
+		write.VAddr = trans.accessReq().GetVAddr()
+	}
+
 	wb.cache.bottomPort.Send(write)
 
 	trans.evictionWriteReq = write
@@ -250,6 +273,18 @@ func (wb *writeBufferStage) write() bool {
 	tracing.TraceReqInitiate(write, wb.cache,
 		tracing.MsgIDAtReceiver(trans.req(), wb.cache))
 
+	what := ""
+	if strings.Contains(fmt.Sprintf("%s", write.Meta().Dst), "DRAM") {
+		what = "ToLocal"
+	} else {
+		what = "ToRemote"
+	}
+	tracing.AddTaskStep(write.ID, wb.cache, what)
+
+	// if trans.writeToHomeNode {
+	// 	fmt.Printf("[%s]\tWrite(%s -> %s) %x to %s\n",
+	// 		wb.cache.Name(), trans.req().Meta().ID, write.Meta().ID, trans.evictingAddr, lowModulePort)
+	// }
 	// log.Printf("%.10f, %s, wb write to bottom， "+
 	// " %s, %04X, %04X, (%d, %d), %v\n",
 	// 	now, wb.cache.Name(),
@@ -282,6 +317,13 @@ func (wb *writeBufferStage) processDataReadyRsp(
 	dataReady *mem.DataReadyRsp,
 ) bool {
 	trans := wb.findInflightFetchByFetchReadReqID(dataReady.RespondTo)
+	if trans == nil {
+		// prefetch로 처리하기
+
+		wb.cache.bottomPort.RetrieveIncoming()
+		return true
+	}
+
 	bankIndex := bankID(
 		trans.block,
 		wb.cache.directory.WayAssociativity(),
@@ -350,7 +392,8 @@ func (wb *writeBufferStage) findInflightFetchByFetchReadReqID(
 		}
 	}
 
-	panic("inflight read not found")
+	return nil
+	// panic("inflight read not found")
 }
 
 func (wb *writeBufferStage) removeInflightFetch(f *transaction) {
@@ -394,7 +437,8 @@ func (wb *writeBufferStage) processWriteDoneRsp(
 		}
 	}
 
-	panic("write request not found")
+	wb.cache.bottomPort.RetrieveIncoming()
+	return true
 }
 
 func (wb *writeBufferStage) writeBufferFull() bool {
@@ -412,4 +456,7 @@ func (wb *writeBufferStage) tooManyInflightEvictions() bool {
 
 func (wb *writeBufferStage) Reset() {
 	wb.cache.writeBufferBuffer.Clear()
+	wb.pendingEvictions = nil
+	wb.inflightFetch = nil
+	wb.inflightEviction = nil
 }

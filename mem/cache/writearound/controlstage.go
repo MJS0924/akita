@@ -3,6 +3,7 @@ package writearound
 import (
 	"log"
 	"reflect"
+	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/cache"
 	"github.com/sarchlab/akita/v4/sim"
@@ -41,6 +42,7 @@ func (s *controlStage) processCurrentFlush() bool {
 		WithSrc(s.ctrlPort.AsRemote()).
 		WithDst(s.currFlushReq.Src).
 		WithRspTo(s.currFlushReq.ID).
+		SetFromL1I(strings.Contains(s.cache.name, "L1ICache")).
 		Build()
 
 	err := s.ctrlPort.Send(rsp)
@@ -63,12 +65,23 @@ func (s *controlStage) hardResetCache() {
 		s.flushBuffer(bankBuf)
 	}
 
-	s.directory.Reset()
+	if s.currFlushReq.InvalidateAllCachelines {
+		s.directory.Reset()
+	}
+
+	s.cache.dirBuf.Clear()
+	s.cache.directoryStage.pipeline.Clear()
+	s.cache.directoryStage.buf.Clear()
+
 	s.cache.mshr.Reset()
 	s.cache.coalesceStage.Reset()
 
 	for _, bankStage := range s.cache.bankStages {
 		bankStage.Reset()
+	}
+
+	for _, bankBuf := range s.cache.bankBufs {
+		bankBuf.Clear()
 	}
 
 	s.cache.transactions = nil
@@ -114,6 +127,10 @@ func (s *controlStage) startCacheFlush(req *cache.FlushReq) bool {
 		return false
 	}
 
+	// if s.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\tFlush\t\n", s.cache.name)
+	// }
+
 	s.currFlushReq = req
 	s.ctrlPort.RetrieveIncoming()
 
@@ -122,20 +139,18 @@ func (s *controlStage) startCacheFlush(req *cache.FlushReq) bool {
 
 func (s *controlStage) doCacheRestart(req *cache.RestartReq) bool {
 	s.cache.isPaused = false
+	s.cache.debug = 5
 
 	s.ctrlPort.RetrieveIncoming()
 
-	for s.cache.topPort.PeekIncoming() != nil {
-		s.cache.topPort.RetrieveIncoming()
-	}
-
-	for s.cache.bottomPort.PeekIncoming() != nil {
-		s.cache.bottomPort.RetrieveIncoming()
-	}
+	s.flushPort(s.cache.topPort)
+	s.flushPort(s.cache.bottomPort)
+	s.flushBuffer(s.cache.dirBuf)
 
 	rsp := cache.RestartRspBuilder{}.
 		WithSrc(s.ctrlPort.AsRemote()).
 		WithDst(req.Src).
+		SetFromL1I(strings.Contains(s.cache.name, "L1ICache")).
 		Build()
 
 	err := s.ctrlPort.Send(rsp)

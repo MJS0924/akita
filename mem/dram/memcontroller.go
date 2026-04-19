@@ -189,6 +189,7 @@ func (m *middleware) finalizeWriteTrans(
 		WithSrc(m.topPort.AsRemote()).
 		WithDst(t.Write.Src).
 		WithRspTo(t.Write.ID).
+		WithOrigin(t.Write).
 		Build()
 
 	sendErr := m.topPort.Send(writeDone)
@@ -219,6 +220,7 @@ func (m *middleware) finalizeReadTrans(
 		WithDst(t.Read.Src).
 		WithData(data).
 		WithRspTo(t.Read.ID).
+		WithOrigin(t.Read).
 		Build()
 
 	sendErr := m.topPort.Send(dataReady)

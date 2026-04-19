@@ -1,6 +1,9 @@
 package mem
 
-import "log"
+import (
+	"fmt"
+	"log"
+)
 
 // AddressConverter can translate the address between two domains
 type AddressConverter interface {
@@ -35,8 +38,12 @@ func (c InterleavingConverter) ConvertExternalToInternal(
 	belongsTo := int(addr % roundSize / c.InterleavingSize)
 
 	if belongsTo != c.CurrentElementIndex {
-		log.Panicf("address 0x%x does not belongs to current element %d",
-			external, c.CurrentElementIndex)
+		fmt.Printf("address 0x%x does not belongs to current element %d but to element %d (%x %x %d)",
+			external, c.CurrentElementIndex, belongsTo, addr, c.InterleavingSize, c.TotalNumOfElements)
+		for true {
+		}
+		log.Panicf("address 0x%x does not belongs to current element %d but to element %d (%x %x %d)",
+			external, c.CurrentElementIndex, belongsTo, addr, c.InterleavingSize, c.TotalNumOfElements)
 	}
 
 	internal := addr/(roundSize)*c.InterleavingSize +

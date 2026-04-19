@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"fmt"
 	"log"
 	"reflect"
 	"sync"
@@ -70,6 +71,7 @@ func (e *SerialEngine) Run() error {
 
 	for {
 		if e.noMoreEvent() {
+			fmt.Printf("[Warning]\tNo More Event: %d %d\n", e.queue.Len(), e.secondaryQueue.Len())
 			return nil
 		}
 
@@ -160,4 +162,12 @@ func (e *SerialEngine) Continue() {
 // Specifically, the run time of the current event.
 func (e *SerialEngine) CurrentTime() VTimeInSec {
 	return e.readNow()
+}
+
+func (e *SerialEngine) GetQueue() EventQueue {
+	return e.queue
+}
+
+func (e *SerialEngine) GetSecondaryQueue() EventQueue {
+	return e.secondaryQueue
 }

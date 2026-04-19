@@ -2,6 +2,7 @@ package tlb
 
 import (
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/mem/vm/tlb/internal"
 	"github.com/sarchlab/akita/v4/pipelining"
 	"github.com/sarchlab/akita/v4/sim"
@@ -22,17 +23,27 @@ type Comp struct {
 	numSets        int
 	numWays        int
 	pageSize       uint64
+	log2PageSize   uint64
 	numReqPerCycle int
 	state          string
 
 	sets []internal.Set
 
-	mshr                mshr
-	respondingMSHREntry *mshrEntry
-	responsePipeline    pipelining.Pipeline
-	responseBuffer      sim.Buffer
+	mshr                  mshr
+	migrationMshr         mshr
+	invalidationMshr      mshr
+	respondingMSHREntry   *mshrEntry
+	responsePipeline      pipelining.Pipeline
+	responseBuffer        sim.Buffer
+	migrationBuffer       []*vm.TranslationReq
+	migrationBufferCap    int
+	invalidationBuffer    []*vm.TranslationReq
+	invalidationBufferCap int
 
 	isPaused bool
+
+	accessCounter       *map[vm.PID]map[uint64]uint8
+	pageMigrationPolicy uint64
 }
 
 // reset sets all the entries in the TLB to be invalid

@@ -3,6 +3,7 @@ package cache
 import (
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/mem/vm"
+	"github.com/sarchlab/akita/v4/sim"
 )
 
 // A Block of a cache is the information that is associated with a cache line
@@ -17,6 +18,9 @@ type Block struct {
 	ReadCount    int
 	IsLocked     bool
 	DirtyMask    []bool
+	Accessed     bool
+	Sharer       []sim.RemotePort
+	VAddr        uint64
 }
 
 // A Set is a list of blocks where a certain piece memory can be stored at
@@ -136,6 +140,8 @@ func (d *DirectoryImpl) Reset() {
 		for j := 0; j < d.NumWays; j++ {
 			block := new(Block)
 			block.IsValid = false
+			block.IsLocked = false
+			block.Accessed = false
 			block.SetID = i
 			block.WayID = j
 			block.CacheAddress = uint64(i*d.NumWays+j) * uint64(d.BlockSize)

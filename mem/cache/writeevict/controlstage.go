@@ -3,6 +3,7 @@ package writeevict
 import (
 	"log"
 	"reflect"
+	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/cache"
 	"github.com/sarchlab/akita/v4/sim"
@@ -41,6 +42,7 @@ func (s *controlStage) processCurrentFlush() bool {
 		WithSrc(s.ctrlPort.AsRemote()).
 		WithDst(s.currFlushReq.Src).
 		WithRspTo(s.currFlushReq.ID).
+		SetFromL1I(strings.Contains(s.cache.name, "L1ICache")).
 		Build()
 
 	err := s.ctrlPort.Send(rsp)
@@ -138,6 +140,7 @@ func (s *controlStage) doCacheRestart(req *cache.RestartReq) bool {
 	rsp := cache.RestartRspBuilder{}.
 		WithSrc(s.ctrlPort.AsRemote()).
 		WithDst(req.Src).
+		SetFromL1I(strings.Contains(s.cache.name, "L1ICache")).
 		Build()
 
 	err := s.ctrlPort.Send(rsp)

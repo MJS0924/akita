@@ -11,6 +11,8 @@ import (
 
 type memMiddleware struct {
 	*Comp
+
+	returnValue bool
 }
 
 func (m *memMiddleware) Handle(e sim.Event) error {
@@ -34,6 +36,7 @@ func (m *memMiddleware) Tick() bool {
 	madeProgress = m.takeNewReqs() || madeProgress
 	madeProgress = m.execute() || madeProgress
 
+	m.returnValue = madeProgress
 	return madeProgress
 }
 
@@ -138,6 +141,7 @@ func (m *memMiddleware) handleReadRespondEvent(e *readRespondEvent) error {
 		WithDst(req.Src).
 		WithRspTo(req.ID).
 		WithData(data).
+		WithOrigin(req).
 		Build()
 
 	networkErr := m.topPort.Send(rsp)
@@ -162,6 +166,7 @@ func (m *memMiddleware) handleWriteRespondEvent(e *writeRespondEvent) error {
 		WithSrc(m.topPort.AsRemote()).
 		WithDst(req.Src).
 		WithRspTo(req.ID).
+		WithOrigin(req).
 		Build()
 
 	networkErr := m.topPort.Send(rsp)

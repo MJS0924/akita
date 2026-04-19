@@ -15,6 +15,8 @@ type FlushReq struct {
 	InvalidateAllCachelines bool
 	DiscardInflight         bool
 	PauseAfterFlushing      bool
+	FlushOnlyLocalRequest   bool
+	Addr                    uint64
 }
 
 // Meta returns the meta data associated with the message.
@@ -100,7 +102,8 @@ func (b FlushReqBuilder) Build() *FlushReq {
 type FlushRsp struct {
 	sim.MsgMeta
 
-	RspTo string
+	RspTo   string
+	FromL1I bool
 }
 
 // Meta returns the meta data associated with the message.
@@ -124,6 +127,7 @@ func (r *FlushRsp) GetRspTo() string {
 type FlushRspBuilder struct {
 	src, dst sim.RemotePort
 	rspTo    string
+	FromL1I  bool
 }
 
 // WithSrc sets the source of the request to build.
@@ -144,6 +148,12 @@ func (b FlushRspBuilder) WithRspTo(id string) FlushRspBuilder {
 	return b
 }
 
+// WithRspTo sets ID of the request that the respond to build is replying to.
+func (b FlushRspBuilder) SetFromL1I(FromL1I bool) FlushRspBuilder {
+	b.FromL1I = FromL1I
+	return b
+}
+
 // Build creates a new FlushRsp
 func (b FlushRspBuilder) Build() *FlushRsp {
 	r := &FlushRsp{}
@@ -152,6 +162,7 @@ func (b FlushRspBuilder) Build() *FlushRsp {
 	r.Dst = b.dst
 	r.RspTo = b.rspTo
 	r.TrafficClass = reflect.TypeOf(FlushReq{}).String()
+	r.FromL1I = b.FromL1I
 
 	return r
 }
@@ -218,7 +229,8 @@ func (b RestartReqBuilder) Build() *RestartReq {
 type RestartRsp struct {
 	sim.MsgMeta
 
-	RspTo string
+	RspTo   string
+	FromL1I bool
 }
 
 // Meta returns the meta data associated with the message.
@@ -242,6 +254,7 @@ func (r *RestartRsp) GetRspTo() string {
 type RestartRspBuilder struct {
 	src, dst sim.RemotePort
 	rspTo    string
+	FromL1I  bool
 }
 
 // WithSrc sets the source of the request to build.
@@ -262,6 +275,12 @@ func (b RestartRspBuilder) WithRspTo(id string) RestartRspBuilder {
 	return b
 }
 
+// WithRspTo sets ID of the request that the respond to build is replying to.
+func (b RestartRspBuilder) SetFromL1I(FromL1I bool) RestartRspBuilder {
+	b.FromL1I = FromL1I
+	return b
+}
+
 // Build creates a new RestartRsp
 func (b RestartRspBuilder) Build() *RestartRsp {
 	r := &RestartRsp{}
@@ -270,6 +289,7 @@ func (b RestartRspBuilder) Build() *RestartRsp {
 	r.Dst = b.dst
 	r.RspTo = b.rspTo
 	r.TrafficClass = reflect.TypeOf(RestartReq{}).String()
+	r.FromL1I = b.FromL1I
 
 	return r
 }

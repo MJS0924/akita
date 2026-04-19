@@ -75,3 +75,25 @@ func NewBankedAddressPortMapper(bankSize uint64) *BankedAddressPortMapper {
 
 	return f
 }
+
+// L2BottomMapper는 주소 범위에 따라 Local DRAM 뱅크 또는 RDMA 포트로 라우팅합니다.
+type L2BottomMapper struct {
+	LocalBank sim.RemotePort
+	RDMAPort  sim.RemotePort
+	LocalLow  uint64
+	LocalHigh uint64
+}
+
+func (m *L2BottomMapper) Find(addr uint64) sim.RemotePort {
+	// 주소가 현재 GPU의 로컬 메모리 범위 내에 있으면 해당 DRAM Bank로 전달
+	if addr >= m.LocalLow && addr < m.LocalHigh {
+		return m.LocalBank
+	}
+	// 범위를 벗어나면 원격 메모리로 간주하고 RDMA로 전달
+	return m.RDMAPort
+}
+
+func NewL2BottomMapper() *L2BottomMapper {
+	f := new(L2BottomMapper)
+	return f
+}

@@ -2,8 +2,6 @@
 package pipelining
 
 import (
-	"reflect"
-
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -79,6 +77,8 @@ func (p *pipelineImpl) Clear() {
 	for i := 0; i < p.width; i++ {
 		p.stages[i] = make([]pipelineStageInfo, p.numStage)
 	}
+
+	p.postPipelineBuf.Clear()
 }
 
 // Tick moves elements in the pipeline forward.
@@ -117,7 +117,7 @@ func (p *pipelineImpl) tryMoveToPostPipelineBuffer(
 		return false
 	}
 
-	tracing.EndTask(stage.elem.TaskID()+"pipeline", p)
+	// tracing.EndTask(stage.elem.TaskID()+"pipeline", p)
 
 	p.postPipelineBuf.Push(stage.elem)
 	stage.elem = nil
@@ -174,14 +174,14 @@ func (p *pipelineImpl) Accept(elem PipelineItem) {
 		p.stages[lane][0].elem = elem
 		p.stages[lane][0].cycleLeft = p.cyclePerStage - 1
 
-		tracing.StartTask(
-			elem.TaskID()+"pipeline",
-			elem.TaskID(),
-			p,
-			"pipeline",
-			reflect.TypeOf(elem).String(),
-			nil,
-		)
+		// tracing.StartTask(
+		// 	elem.TaskID()+"pipeline",
+		// 	elem.TaskID(),
+		// 	p,
+		// 	"pipeline",
+		// 	reflect.TypeOf(elem).String(),
+		// 	nil,
+		// )
 
 		return
 	}

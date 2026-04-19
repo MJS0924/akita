@@ -38,6 +38,10 @@ func (p *bottomParser) processDoneRsp(done *mem.WriteDoneRsp) bool {
 		t.done = true
 	}
 
+	// if p.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\t[bottomparser]\tReceive write done response: Addr %x\n", p.cache.name, trans.write.Address)
+	// }
+
 	p.removeTransaction(trans)
 	p.cache.bottomPort.RetrieveIncoming()
 
@@ -165,6 +169,10 @@ func (p *bottomParser) removeTransaction(trans *transaction) {
 			return
 		}
 	}
+
+	// if p.cache.name == "GPU[1].SA[0].L1VCache[0]" {
+	// 	fmt.Printf("[%s]\t[bottomParser]\tWarning: Try to remove invalid transaction\n", p.cache.name)
+	// }
 }
 
 func (p *bottomParser) getBankBuf(block *cache.Block) sim.Buffer {

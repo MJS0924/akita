@@ -124,7 +124,10 @@ type TickingComponent struct {
 	*ComponentBase
 	*TickScheduler
 
-	ticker Ticker
+	ticker      Ticker
+	returnValue bool
+	printReturn bool
+	tickCnt     uint64
 }
 
 // NotifyPortFree triggers the TickingComponent to start ticking again.
@@ -147,6 +150,13 @@ func (c *TickingComponent) Handle(e Event) error {
 	if madeProgress {
 		c.TickLater()
 	}
+
+	// c.returnValue = madeProgress
+	// c.tickCnt++
+	// if c.tickCnt == 30000 {
+	// 	c.tickCnt = 0
+	// 	fmt.Fprintf(os.Stderr, "[%s.TickingComponent]\treturn %v\n", c.name, c.returnValue)
+	// }
 
 	return nil
 }

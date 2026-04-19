@@ -47,8 +47,11 @@ type Comp struct {
 	state            string
 
 	inflightBuffer []sim.Msg
+
+	returnValue bool
 }
 
 func (c *Comp) Tick() bool {
-	return c.MiddlewareHolder.Tick()
+	c.returnValue = c.MiddlewareHolder.Tick()
+	return c.returnValue
 }

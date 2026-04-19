@@ -4,11 +4,15 @@ import "github.com/sarchlab/akita/v4/mem/mem"
 
 type ctrlMiddleware struct {
 	*Comp
+
+	returnValue bool
 }
 
 func (m *ctrlMiddleware) Tick() (madeProgress bool) {
 	madeProgress = m.handleIncomingCommands() || madeProgress
 	madeProgress = m.handleStateUpdate() || madeProgress
+
+	m.returnValue = madeProgress
 	return madeProgress
 }
 

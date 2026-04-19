@@ -2,25 +2,28 @@ package tlb
 
 import (
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/pipelining"
 	"github.com/sarchlab/akita/v4/sim"
 )
 
 // A Builder can build TLBs
 type Builder struct {
-	engine            sim.Engine
-	freq              sim.Freq
-	numReqPerCycle    int
-	numSets           int
-	numWays           int
-	log2PageSize      uint64
-	pageSize          uint64
-	numMSHREntry      int
-	state             string
-	latency           int
-	addressMapper     mem.AddressToPortMapper
-	addressMapperType string
-	remotePorts       []sim.RemotePort
+	engine              sim.Engine
+	freq                sim.Freq
+	numReqPerCycle      int
+	numSets             int
+	numWays             int
+	log2PageSize        uint64
+	pageSize            uint64
+	numMSHREntry        int
+	state               string
+	latency             int
+	addressMapper       mem.AddressToPortMapper
+	addressMapperType   string
+	remotePorts         []sim.RemotePort
+	accessCounter       *map[vm.PID]map[uint64]uint8
+	pageMigrationPolicy uint64
 }
 
 // MakeBuilder returns a Builder
@@ -66,6 +69,12 @@ func (b Builder) WithNumWays(n int) Builder {
 // WithLog2PageSize sets the page size as a power of 2
 func (b Builder) WithLog2PageSize(n uint64) Builder {
 	b.log2PageSize = n
+	b.pageSize = 1 << b.log2PageSize
+	return b
+}
+
+func (b Builder) WithPageMigrationPolicy(policy uint64) Builder {
+	b.pageMigrationPolicy = policy
 	return b
 }
 
@@ -132,6 +141,13 @@ func (b Builder) WithTranslationProviderMapper(
 	return b
 }
 
+func (b Builder) WithAccessCounter(
+	ac *map[vm.PID]map[uint64]uint8,
+) Builder {
+	b.accessCounter = ac
+	return b
+}
+
 // WithTranslationProviderMapperType sets the type of the translation provider
 // mapper. The mapper can find the remote port that can provide the translation
 // service according to the virtual address. The type can be "single" or
@@ -164,8 +180,17 @@ func (b Builder) Build(name string) *Comp {
 	tlb.numWays = b.numWays
 	tlb.numReqPerCycle = b.numReqPerCycle
 	tlb.pageSize = b.pageSize
+	tlb.log2PageSize = b.log2PageSize
 	tlb.addressMapper = b.addressMapper
 	tlb.mshr = newMSHR(b.numMSHREntry)
+	tlb.migrationMshr = newMSHR(b.numMSHREntry)
+	tlb.invalidationMshr = newMSHR(b.numMSHREntry)
+	tlb.accessCounter = b.accessCounter
+	tlb.migrationBuffer = make([]*vm.TranslationReq, 0)
+	tlb.migrationBufferCap = 16
+	tlb.invalidationBuffer = make([]*vm.TranslationReq, 0)
+	tlb.invalidationBufferCap = 16
+	tlb.pageMigrationPolicy = b.pageMigrationPolicy
 
 	b.createPorts(name, tlb)
 	b.createTranslationProviderMapper(tlb)
@@ -181,8 +206,8 @@ func (b Builder) Build(name string) *Comp {
 		WithPostPipelineBuffer(buf).
 		Build(name + ".ResponsePipeline")
 
-	ctrlMiddleware := &ctrlMiddleware{Comp: tlb}
-	tlb.AddMiddleware(ctrlMiddleware)
+	// ctrlMiddleware := &ctrlMiddleware{Comp: tlb}
+	// tlb.AddMiddleware(ctrlMiddleware)
 
 	middleware := &tlbMiddleware{Comp: tlb}
 	tlb.AddMiddleware(middleware)

@@ -7,7 +7,6 @@ import (
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
-	"github.com/sarchlab/akita/v4/tracing"
 )
 
 type transaction struct {
@@ -27,6 +26,9 @@ type reqToBottom struct {
 type Comp struct {
 	*sim.TickingComponent
 	sim.MiddlewareHolder
+	sim.HookableBase
+
+	name string
 
 	topPort         sim.Port
 	bottomPort      sim.Port
@@ -43,6 +45,8 @@ type Comp struct {
 
 	transactions        []*transaction
 	inflightReqToBottom []reqToBottom
+
+	accessCounter *map[vm.PID]map[uint64]uint8
 }
 
 func (c *Comp) Tick() bool {
@@ -102,6 +106,13 @@ func (m *middleware) translate() bool {
 		WithDeviceID(m.deviceID).
 		Build()
 
+	switch req.(type) {
+	case *mem.WriteReq:
+		transReq.ForWrite = true
+	default:
+		transReq.ForWrite = false
+	}
+
 	err := m.translationPort.Send(transReq)
 	if err != nil {
 		return false
@@ -113,12 +124,12 @@ func (m *middleware) translate() bool {
 	}
 	m.transactions = append(m.transactions, translation)
 
-	tracing.TraceReqReceive(req, m.Comp)
-	tracing.TraceReqInitiate(
-		transReq,
-		m.Comp,
-		tracing.MsgIDAtReceiver(req, m.Comp),
-	)
+	// tracing.TraceReqReceive(req, m.Comp)
+	// tracing.TraceReqInitiate(
+	// 	transReq,
+	// 	m.Comp,
+	// 	tracing.MsgIDAtReceiver(req, m.Comp),
+	// )
 
 	m.topPort.RetrieveIncoming()
 
@@ -152,13 +163,18 @@ func (m *middleware) parseTranslation() bool {
 		return false
 	}
 
-	tracing.AddMilestone(
-		tracing.MsgIDAtReceiver(translatedReq, m.Comp),
-		tracing.MilestoneKindNetworkBusy,
-		m.bottomPort.Name(),
-		m.Comp.Name(),
-		m.Comp,
-	)
+	// if m.name == "GPU[2].SA[0].L1IAddrTrans[0]" {
+	// fmt.Printf("[%s]\tSend Translated Request to %s: PID %d, VA %x, PA %x\n",
+	// 	m.name, translatedReq.Meta().Dst, translatedReq.GetPID(), (translatedReq.GetVAddr())>>12, translatedReq.GetAddress())
+	// }
+
+	// tracing.AddMilestone(
+	// 	tracing.MsgIDAtReceiver(translatedReq, m.Comp),
+	// 	tracing.MilestoneKindNetworkBusy,
+	// 	m.bottomPort.Name(),
+	// 	m.Comp.Name(),
+	// 	m.Comp,
+	// )
 
 	m.inflightReqToBottom = append(m.inflightReqToBottom,
 		reqToBottom{
@@ -171,19 +187,21 @@ func (m *middleware) parseTranslation() bool {
 		m.removeExistingTranslation(transaction)
 	}
 
-	tracing.AddMilestone(
-		tracing.MsgIDAtReceiver(reqFromTop, m.Comp),
-		tracing.MilestoneKindTranslation,
-		"translation",
-		m.Comp.Name(),
-		m.Comp,
-	)
+	// tracing.AddMilestone(
+	// 	tracing.MsgIDAtReceiver(reqFromTop, m.Comp),
+	// 	tracing.MilestoneKindTranslation,
+	// 	"translation",
+	// 	m.Comp.Name(),
+	// 	m.Comp,
+	// )
 
 	m.translationPort.RetrieveIncoming()
 
-	tracing.TraceReqFinalize(transaction.translationReq, m.Comp)
-	tracing.TraceReqInitiate(translatedReq, m.Comp,
-		tracing.MsgIDAtReceiver(reqFromTop, m.Comp))
+	// tracing.TraceReqFinalize(transaction.translationReq, m.Comp)
+	// tracing.TraceReqInitiate(translatedReq, m.Comp,
+	// 	tracing.MsgIDAtReceiver(reqFromTop, m.Comp))
+
+	// m.recordAccessCount(transRsp, translatedReq)
 
 	return true
 }
@@ -216,13 +234,13 @@ func (m *middleware) respond() bool {
 				WithData(rsp.Data).
 				Build()
 			rspToTop = drToTop
-			tracing.AddMilestone(
-				tracing.MsgIDAtReceiver(reqFromTop, m.Comp),
-				tracing.MilestoneKindData,
-				"data",
-				m.Comp.Name(),
-				m.Comp,
-			)
+			// tracing.AddMilestone(
+			// 	tracing.MsgIDAtReceiver(reqFromTop, m.Comp),
+			// 	tracing.MilestoneKindData,
+			// 	"data",
+			// 	m.Comp.Name(),
+			// 	m.Comp,
+			// )
 		}
 	case *mem.WriteDoneRsp:
 		reqInBottom = m.isReqInBottomByID(rsp.RespondTo)
@@ -234,13 +252,13 @@ func (m *middleware) respond() bool {
 				WithDst(reqFromTop.Meta().Src).
 				WithRspTo(reqFromTop.Meta().ID).
 				Build()
-			tracing.AddMilestone(
-				tracing.MsgIDAtReceiver(reqFromTop, m.Comp),
-				tracing.MilestoneKindSubTask,
-				"subtask",
-				m.Comp.Name(),
-				m.Comp,
-			)
+			// tracing.AddMilestone(
+			// 	tracing.MsgIDAtReceiver(reqFromTop, m.Comp),
+			// 	tracing.MilestoneKindSubTask,
+			// 	"subtask",
+			// 	m.Comp.Name(),
+			// 	m.Comp,
+			// )
 		}
 	default:
 		log.Panicf("cannot handle respond of type %s", reflect.TypeOf(rsp))
@@ -252,18 +270,18 @@ func (m *middleware) respond() bool {
 			return false
 		}
 
-		tracing.AddMilestone(
-			tracing.MsgIDAtReceiver(reqFromTop, m.Comp),
-			tracing.MilestoneKindNetworkBusy,
-			m.topPort.Name(),
-			m.Comp.Name(),
-			m.Comp,
-		)
+		// tracing.AddMilestone(
+		// 	tracing.MsgIDAtReceiver(reqFromTop, m.Comp),
+		// 	tracing.MilestoneKindNetworkBusy,
+		// 	m.topPort.Name(),
+		// 	m.Comp.Name(),
+		// 	m.Comp,
+		// )
 
 		m.removeReqToBottomByID(rsp.(mem.AccessRsp).GetRspTo())
 
-		tracing.TraceReqFinalize(reqToBottomCombo.reqToBottom, m.Comp)
-		tracing.TraceReqComplete(reqToBottomCombo.reqFromTop, m.Comp)
+		// tracing.TraceReqFinalize(reqToBottomCombo.reqToBottom, m.Comp)
+		// tracing.TraceReqComplete(reqToBottomCombo.reqFromTop, m.Comp)
 	}
 
 	m.bottomPort.RetrieveIncoming()
@@ -296,8 +314,9 @@ func (m *middleware) createTranslatedReadReq(
 		WithSrc(m.bottomPort.AsRemote()).
 		WithDst(m.memoryPortMapper.Find(addr)).
 		WithAddress(addr).
+		WithVAddr(req.Address).
 		WithByteSize(req.AccessByteSize).
-		WithPID(0).
+		WithPID(page.PID).
 		WithInfo(req.Info).
 		Build()
 	clone.CanWaitForCoalesce = req.CanWaitForCoalesce
@@ -317,7 +336,8 @@ func (m *middleware) createTranslatedWriteReq(
 		WithData(req.Data).
 		WithDirtyMask(req.DirtyMask).
 		WithAddress(addr).
-		WithPID(0).
+		WithVAddr(req.Address).
+		WithPID(page.PID).
 		WithInfo(req.Info).
 		Build()
 	clone.CanWaitForCoalesce = req.CanWaitForCoalesce
@@ -452,5 +472,37 @@ func (m *middleware) handleRestartReq(
 
 	m.ctrlPort.RetrieveIncoming()
 
+	return true
+}
+
+func (m *middleware) recordAccessCount(
+	transRsp *vm.TranslationRsp,
+	transReq mem.AccessReq,
+) bool {
+	deviceID := transRsp.Page.DeviceID
+	if deviceID == m.deviceID {
+		return true
+	}
+
+	va := transRsp.Page.VAddr
+	pid := transRsp.Page.PID
+	size := transReq.GetByteSize()
+
+	startPage := va >> m.log2PageSize
+	endPage := (va + size - 1) >> m.log2PageSize
+
+	ac := *(m.accessCounter)
+	innerMap, found := ac[pid]
+
+	if !found {
+		innerMap = make(map[uint64]uint8)
+		ac[pid] = innerMap
+	}
+
+	for addr := startPage; addr <= endPage; addr++ {
+		if innerMap[addr] < 255 {
+			innerMap[addr]++
+		}
+	}
 	return true
 }

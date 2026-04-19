@@ -2,8 +2,6 @@
 package vm
 
 import (
-	"reflect"
-
 	"github.com/sarchlab/akita/v4/sim"
 )
 
@@ -11,9 +9,13 @@ import (
 type TranslationReq struct {
 	sim.MsgMeta
 
-	VAddr    uint64
-	PID      PID
-	DeviceID uint64
+	VAddr           uint64
+	PID             PID
+	AccessCount     uint8
+	DeviceID        uint64
+	ForWrite        bool
+	ForMigration    bool
+	ForInvalidation bool
 }
 
 // Meta returns the meta data associated with the message.
@@ -29,24 +31,16 @@ func (r *TranslationReq) Clone() sim.Msg {
 	return &cloneMsg
 }
 
-// GenerateRsp generates response to original translation request
-func (r *TranslationReq) GenerateRsp(page Page) sim.Rsp {
-	rsp := TranslationRspBuilder{}.
-		WithSrc(r.Dst).
-		WithDst(r.Src).
-		WithRspTo(r.ID).
-		WithPage(page).
-		Build()
-
-	return rsp
-}
-
 // TranslationReqBuilder can build translation requests
 type TranslationReqBuilder struct {
-	src, dst sim.RemotePort
-	vAddr    uint64
-	pid      PID
-	deviceID uint64
+	src, dst        sim.RemotePort
+	vAddr           uint64
+	pid             PID
+	AccessCount     uint8
+	deviceID        uint64
+	forWrite        bool
+	forMigration    bool
+	forInvalidation bool
 }
 
 // WithSrc sets the source of the request to build.
@@ -77,11 +71,31 @@ func (b TranslationReqBuilder) WithPID(pid PID) TranslationReqBuilder {
 	return b
 }
 
+func (b TranslationReqBuilder) WithAccessCount(ac uint8) TranslationReqBuilder {
+	b.AccessCount = ac
+	return b
+}
+
 // WithDeviceID sets the GPU ID of the request to build.
 func (b TranslationReqBuilder) WithDeviceID(
 	deviceID uint64,
 ) TranslationReqBuilder {
 	b.deviceID = deviceID
+	return b
+}
+
+func (b TranslationReqBuilder) SetForWrite(bo bool) TranslationReqBuilder {
+	b.forWrite = bo
+	return b
+}
+
+func (b TranslationReqBuilder) SetForMigration(bo bool) TranslationReqBuilder {
+	b.forMigration = bo
+	return b
+}
+
+func (b TranslationReqBuilder) SetForInvalidation(bo bool) TranslationReqBuilder {
+	b.forInvalidation = bo
 	return b
 }
 
@@ -94,7 +108,8 @@ func (b TranslationReqBuilder) Build() *TranslationReq {
 	r.VAddr = b.vAddr
 	r.PID = b.pid
 	r.DeviceID = b.deviceID
-	r.TrafficClass = reflect.TypeOf(TranslationReq{}).String()
+	r.ForMigration = b.forMigration
+	r.ForInvalidation = b.forInvalidation
 
 	return r
 }
@@ -104,8 +119,11 @@ func (b TranslationReqBuilder) Build() *TranslationReq {
 type TranslationRsp struct {
 	sim.MsgMeta
 
-	RespondTo string // The ID of the request it replies
-	Page      Page
+	RespondTo         string // The ID of the request it replies
+	Page              Page
+	IsMigrationRsp    bool
+	IsInvalidationRsp bool
+	OriginalReq       TranslationReq
 }
 
 // Meta returns the meta data associated with the message.
@@ -128,9 +146,12 @@ func (r *TranslationRsp) GetRspTo() string {
 
 // TranslationRspBuilder can build translation requests
 type TranslationRspBuilder struct {
-	src, dst sim.RemotePort
-	rspTo    string
-	page     Page
+	src, dst          sim.RemotePort
+	rspTo             string
+	page              Page
+	IsMigrationRsp    bool
+	IsInvalidationRsp bool
+	OriginalReq       TranslationReq
 }
 
 // WithSrc sets the source of the respond to build.
@@ -161,6 +182,23 @@ func (b TranslationRspBuilder) WithPage(page Page) TranslationRspBuilder {
 	return b
 }
 
+// WithPage sets the page of the respond to build.
+func (b TranslationRspBuilder) SetIsMigrationRsp(bo bool) TranslationRspBuilder {
+	b.IsMigrationRsp = bo
+	return b
+}
+
+// WithPage sets the page of the respond to build.
+func (b TranslationRspBuilder) SetIsInvalidationRsp(bo bool) TranslationRspBuilder {
+	b.IsInvalidationRsp = bo
+	return b
+}
+
+func (b TranslationRspBuilder) WithOriginalReq(originalReq TranslationReq) TranslationRspBuilder {
+	b.OriginalReq = originalReq
+	return b
+}
+
 // Build creates a new TranslationRsp
 func (b TranslationRspBuilder) Build() *TranslationRsp {
 	r := &TranslationRsp{}
@@ -169,7 +207,9 @@ func (b TranslationRspBuilder) Build() *TranslationRsp {
 	r.Dst = b.dst
 	r.RespondTo = b.rspTo
 	r.Page = b.page
-	r.TrafficClass = reflect.TypeOf(TranslationReq{}).String()
+	r.IsMigrationRsp = b.IsMigrationRsp
+	r.IsInvalidationRsp = b.IsInvalidationRsp
+	r.OriginalReq = b.OriginalReq
 
 	return r
 }
@@ -193,6 +233,9 @@ type PageMigrationReqToDriver struct {
 	CurrPageHostGPU   uint64
 	PageSize          uint64
 	RespondToTop      bool
+	RequestingDevice  uint64
+	ForDuplication    bool
+	ForInvalidation   bool
 }
 
 // Meta returns the meta data associated with the message.
@@ -218,7 +261,7 @@ func NewPageMigrationReqToDriver(
 	cmd := new(PageMigrationReqToDriver)
 	cmd.Src = src
 	cmd.Dst = dst
-	cmd.TrafficClass = reflect.TypeOf(PageMigrationReqToDriver{}).String()
+	cmd.ID = sim.GetIDGenerator().Generate()
 
 	return cmd
 }
@@ -259,7 +302,347 @@ func NewPageMigrationRspFromDriver(
 	cmd.Src = src
 	cmd.Dst = dst
 	cmd.OriginalReq = originalReq
-	cmd.TrafficClass = reflect.TypeOf(PageMigrationReqToDriver{}).String()
 
 	return cmd
+}
+
+type RemoveRequestInMMUFromDriver struct {
+	sim.MsgMeta
+}
+
+func (m *RemoveRequestInMMUFromDriver) Meta() *sim.MsgMeta {
+	return &m.MsgMeta
+}
+
+func (m *RemoveRequestInMMUFromDriver) Clone() sim.Msg {
+	return m
+}
+
+func NewRemoveRequestInMMUFromDriver(
+	src, dst sim.RemotePort,
+) *RemoveRequestInMMUFromDriver {
+	cmd := new(RemoveRequestInMMUFromDriver)
+	cmd.Src = src
+	cmd.Dst = dst
+
+	return cmd
+}
+
+type RemoveRequestRspFromMMU struct {
+	sim.MsgMeta
+}
+
+func (m *RemoveRequestRspFromMMU) Meta() *sim.MsgMeta {
+	return &m.MsgMeta
+}
+
+func (m *RemoveRequestRspFromMMU) Clone() sim.Msg {
+	return m
+}
+
+func NewRemoveRequestRspFromMMU(
+	src, dst sim.RemotePort,
+) *RemoveRequestRspFromMMU {
+	cmd := new(RemoveRequestRspFromMMU)
+	cmd.Src = src
+	cmd.Dst = dst
+
+	return cmd
+}
+
+// ==========================================================================================
+// A TranslationReq asks the receiver component to translate the request.
+type PTEInvalidationReq struct {
+	sim.MsgMeta
+
+	VAddr    uint64
+	PID      PID
+	PageSize uint64
+}
+
+func (r *PTEInvalidationReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+func (r *PTEInvalidationReq) Clone() sim.Msg {
+	cloneMsg := *r
+	cloneMsg.ID = sim.GetIDGenerator().Generate()
+
+	return &cloneMsg
+}
+
+type PTEInvalidationReqBuilder struct {
+	src, dst sim.RemotePort
+	VAddr    uint64
+	PID      PID
+	PageSize uint64
+}
+
+func (b PTEInvalidationReqBuilder) WithSrc(
+	src sim.RemotePort,
+) PTEInvalidationReqBuilder {
+	b.src = src
+	return b
+}
+
+func (b PTEInvalidationReqBuilder) WithDst(
+	dst sim.RemotePort,
+) PTEInvalidationReqBuilder {
+	b.dst = dst
+	return b
+}
+
+func (b PTEInvalidationReqBuilder) WithVAddr(
+	VAddr uint64,
+) PTEInvalidationReqBuilder {
+	b.VAddr = VAddr
+	return b
+}
+
+func (b PTEInvalidationReqBuilder) WithPID(
+	PID PID,
+) PTEInvalidationReqBuilder {
+	b.PID = PID
+	return b
+}
+
+func (b PTEInvalidationReqBuilder) WithPageSize(
+	PageSize uint64,
+) PTEInvalidationReqBuilder {
+	b.PageSize = PageSize
+	return b
+}
+
+func (b PTEInvalidationReqBuilder) Build() *PTEInvalidationReq {
+	r := &PTEInvalidationReq{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+	r.VAddr = b.VAddr
+	r.PID = b.PID
+	r.PageSize = b.PageSize
+
+	return r
+}
+
+type PTEInvalidationRsp struct {
+	sim.MsgMeta
+}
+
+func (r *PTEInvalidationRsp) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+func (r *PTEInvalidationRsp) Clone() sim.Msg {
+	cloneMsg := *r
+	cloneMsg.ID = sim.GetIDGenerator().Generate()
+
+	return &cloneMsg
+}
+
+type PTEInvalidationRspBuilder struct {
+	src, dst sim.RemotePort
+}
+
+func (b PTEInvalidationRspBuilder) WithSrc(
+	src sim.RemotePort,
+) PTEInvalidationRspBuilder {
+	b.src = src
+	return b
+}
+
+func (b PTEInvalidationRspBuilder) WithDst(
+	dst sim.RemotePort,
+) PTEInvalidationRspBuilder {
+	b.dst = dst
+	return b
+}
+
+func (b PTEInvalidationRspBuilder) Build() *PTEInvalidationRsp {
+	r := &PTEInvalidationRsp{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+
+	return r
+}
+
+// ==========================================================================================
+
+type FlushReq struct {
+	sim.MsgMeta
+}
+
+// Meta returns the meta data associated with the message.
+func (r *FlushReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+// Clone returns cloned FlushReq with different ID
+func (r *FlushReq) Clone() sim.Msg {
+	cloneMsg := *r
+	cloneMsg.ID = sim.GetIDGenerator().Generate()
+
+	return &cloneMsg
+}
+
+// FlushReqBuilder can build AT flush requests
+type FlushReqBuilder struct {
+	src, dst sim.RemotePort
+}
+
+// WithSrc sets the source of the request to build.
+func (b FlushReqBuilder) WithSrc(src sim.RemotePort) FlushReqBuilder {
+	b.src = src
+	return b
+}
+
+// WithDst sets the destination of the request to build.
+func (b FlushReqBuilder) WithDst(dst sim.RemotePort) FlushReqBuilder {
+	b.dst = dst
+	return b
+}
+
+// Build creates a new TLBFlushReq
+func (b FlushReqBuilder) Build() *FlushReq {
+	r := &FlushReq{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+
+	return r
+}
+
+type FlushRsp struct {
+	sim.MsgMeta
+}
+
+// Meta returns the meta data associated with the message.
+func (r *FlushRsp) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+// Clone returns cloned FlushReq with different ID
+func (r *FlushRsp) Clone() sim.Msg {
+	cloneMsg := *r
+	cloneMsg.ID = sim.GetIDGenerator().Generate()
+
+	return &cloneMsg
+}
+
+// FlushReqBuilder can build AT flush requests
+type FlushRspBuilder struct {
+	src, dst sim.RemotePort
+}
+
+// WithSrc sets the source of the request to build.
+func (b FlushRspBuilder) WithSrc(src sim.RemotePort) FlushRspBuilder {
+	b.src = src
+	return b
+}
+
+// WithDst sets the destination of the request to build.
+func (b FlushRspBuilder) WithDst(dst sim.RemotePort) FlushRspBuilder {
+	b.dst = dst
+	return b
+}
+
+// Build creates a new TLBFlushReq
+func (b FlushRspBuilder) Build() *FlushRsp {
+	r := &FlushRsp{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+
+	return r
+}
+
+// ==========================================================================================
+
+type RestartReq struct {
+	sim.MsgMeta
+}
+
+// Meta returns the meta data associated with the message.
+func (r *RestartReq) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+// Clone returns cloned FlushReq with different ID
+func (r *RestartReq) Clone() sim.Msg {
+	cloneMsg := *r
+	cloneMsg.ID = sim.GetIDGenerator().Generate()
+
+	return &cloneMsg
+}
+
+// FlushReqBuilder can build AT flush requests
+type RestartReqBuilder struct {
+	src, dst sim.RemotePort
+}
+
+// WithSrc sets the source of the request to build.
+func (b RestartReqBuilder) WithSrc(src sim.RemotePort) RestartReqBuilder {
+	b.src = src
+	return b
+}
+
+// WithDst sets the destination of the request to build.
+func (b RestartReqBuilder) WithDst(dst sim.RemotePort) RestartReqBuilder {
+	b.dst = dst
+	return b
+}
+
+// Build creates a new TLBFlushReq
+func (b RestartReqBuilder) Build() *RestartReq {
+	r := &RestartReq{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+
+	return r
+}
+
+type RestartRsp struct {
+	sim.MsgMeta
+}
+
+// Meta returns the meta data associated with the message.
+func (r *RestartRsp) Meta() *sim.MsgMeta {
+	return &r.MsgMeta
+}
+
+// Clone returns cloned RestartReq with different ID
+func (r *RestartRsp) Clone() sim.Msg {
+	cloneMsg := *r
+	cloneMsg.ID = sim.GetIDGenerator().Generate()
+
+	return &cloneMsg
+}
+
+// RestartReqBuilder can build AT Restart requests
+type RestartRspBuilder struct {
+	src, dst sim.RemotePort
+}
+
+// WithSrc sets the source of the request to build.
+func (b RestartRspBuilder) WithSrc(src sim.RemotePort) RestartRspBuilder {
+	b.src = src
+	return b
+}
+
+// WithDst sets the destination of the request to build.
+func (b RestartRspBuilder) WithDst(dst sim.RemotePort) RestartRspBuilder {
+	b.dst = dst
+	return b
+}
+
+// Build creates a new TLBRestartReq
+func (b RestartRspBuilder) Build() *RestartRsp {
+	r := &RestartRsp{}
+	r.ID = sim.GetIDGenerator().Generate()
+	r.Src = b.src
+	r.Dst = b.dst
+
+	return r
 }

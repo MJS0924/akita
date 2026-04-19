@@ -47,6 +47,9 @@ type Port interface {
 	Send(msg Msg) *SendError
 	RetrieveIncoming() Msg
 	PeekIncoming() Msg
+
+	GetIncomingBuf() Buffer
+	GetOutgoingBuf() Buffer
 }
 
 // DefaultPort implements the port interface.
@@ -104,17 +107,27 @@ func (p *defaultPort) CanSend() bool {
 
 // Send is used to send a message out from a component
 func (p *defaultPort) Send(msg Msg) *SendError {
+	// if msg.Meta().ID == "14861018" {
+	// 	fmt.Fprintf(os.Stderr, "Debug: %s sending msg %s from %s to %s\n", p.Name(), msg.Meta().ID, msg.Meta().Src, msg.Meta().Dst)
+	// }
+
 	p.lock.Lock()
 
 	p.msgMustBeValid(msg)
 
 	if !p.outgoingBuf.CanPush() {
 		p.lock.Unlock()
+		// if msg.Meta().ID == "14861018" {
+		// 	fmt.Fprintf(os.Stderr, "\tFailed\n")
+		// }
 		return NewSendError()
 	}
 
 	wasEmpty := (p.outgoingBuf.Size() == 0)
 	p.outgoingBuf.Push(msg)
+	// if msg.Meta().ID == "14861018" {
+	// 	fmt.Fprintf(os.Stderr, "\tSuccess\n")
+	// }
 
 	hookCtx := HookCtx{
 		Domain: p,
@@ -274,6 +287,14 @@ func (p *defaultPort) msgMustBeValid(msg Msg) {
 	portMustBeMsgSrc(p, msg)
 	dstMustNotBeEmpty(msg.Meta().Dst)
 	srcDstMustNotBeTheSame(msg)
+}
+
+func (p *defaultPort) GetIncomingBuf() Buffer {
+	return p.incomingBuf
+}
+
+func (p *defaultPort) GetOutgoingBuf() Buffer {
+	return p.outgoingBuf
 }
 
 func portMustBeMsgSrc(port Port, msg Msg) {

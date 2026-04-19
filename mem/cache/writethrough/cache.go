@@ -3,6 +3,7 @@ package writethrough
 import (
 	"github.com/sarchlab/akita/v4/mem/cache"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
 )
 
@@ -11,11 +12,15 @@ type Comp struct {
 	*sim.TickingComponent
 	sim.MiddlewareHolder
 
+	name     string
+	deviceID uint64
+
 	topPort     sim.Port
 	bottomPort  sim.Port
 	controlPort sim.Port
 
 	numReqPerCycle      int
+	log2PageSize        uint64
 	log2BlockSize       uint64
 	storage             *mem.Storage
 	directory           cache.Directory
@@ -39,6 +44,10 @@ type Comp struct {
 	postCoalesceTransactions []*transaction
 
 	isPaused bool
+
+	dirtyMask *[]map[vm.PID]map[uint64][]uint8
+	readMask  *[]map[vm.PID]map[uint64][]uint8
+	debug     int
 }
 
 // SetAddressToPortMapper sets the finder that tells which remote port can serve

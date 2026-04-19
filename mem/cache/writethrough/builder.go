@@ -5,6 +5,7 @@ import (
 
 	"github.com/sarchlab/akita/v4/mem/cache"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/pipelining"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
@@ -12,8 +13,10 @@ import (
 
 // A Builder can build an writethrough cache
 type Builder struct {
+	deviceID              uint64
 	engine                sim.Engine
 	freq                  sim.Freq
+	log2PageSize          uint64
 	log2BlockSize         uint64
 	totalByteSize         uint64
 	wayAssociativity      int
@@ -27,6 +30,9 @@ type Builder struct {
 	visTracer             tracing.Tracer
 	addressMapperType     string
 	remotePorts           []sim.RemotePort
+
+	dirtyMask *[]map[vm.PID]map[uint64][]uint8
+	readMask  *[]map[vm.PID]map[uint64][]uint8
 }
 
 // MakeBuilder creates a builder with default parameter setting
@@ -42,6 +48,11 @@ func MakeBuilder() Builder {
 		maxNumConcurrentTrans: 16,
 		bankLatency:           20,
 	}
+}
+
+func (b Builder) WithDeviceID(id uint64) Builder {
+	b.deviceID = id
+	return b
 }
 
 // WithEngine sets the event driven simulation engine that the cache uses
@@ -65,6 +76,11 @@ func (b Builder) WithWayAssociativity(wayAssociativity int) Builder {
 // WithNumMSHREntry sets the number of mshr entry
 func (b Builder) WithNumMSHREntry(num int) Builder {
 	b.numMSHREntry = num
+	return b
+}
+
+func (b Builder) WithLog2PageSize(n uint64) Builder {
+	b.log2PageSize = n
 	return b
 }
 
@@ -139,14 +155,28 @@ func (b Builder) WithRemotePorts(ports ...sim.RemotePort) Builder {
 	return b
 }
 
+func (b Builder) WithDirtyMask(mask *[]map[vm.PID]map[uint64][]uint8) Builder {
+	b.dirtyMask = mask
+	return b
+}
+
+func (b Builder) WithReadMask(mask *[]map[vm.PID]map[uint64][]uint8) Builder {
+	b.readMask = mask
+	return b
+}
+
 // Build returns a new cache unit
 func (b Builder) Build(name string) *Comp {
 	b.assertAllRequiredInformationIsAvailable()
 
 	c := &Comp{
+		log2PageSize:   b.log2PageSize,
 		log2BlockSize:  b.log2BlockSize,
 		numReqPerCycle: b.numReqPerCycle,
 	}
+
+	c.name = name
+	c.deviceID = b.deviceID
 
 	b.setTickingComponent(c, name)
 	b.createPorts(c, name)
@@ -163,6 +193,15 @@ func (b Builder) Build(name string) *Comp {
 
 	middleware := &middleware{Comp: c}
 	c.AddMiddleware(middleware)
+
+	c.dirtyMask = b.dirtyMask
+	c.readMask = b.readMask
+	if c.dirtyMask == nil {
+		fmt.Printf("Warning: Write-around cache %s has no dirty mask set.\n", c.name)
+	}
+	if c.readMask == nil {
+		fmt.Printf("Warning: Write-around cache %s has no read mask set.\n", c.name)
+	}
 
 	return c
 }
