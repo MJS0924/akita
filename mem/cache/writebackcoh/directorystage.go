@@ -452,10 +452,26 @@ func (ds *directoryStage) doRead(trans *transaction) bool {
 	block := ds.cache.directory.Lookup(
 		trans.read.PID, cachelineID)
 	if block != nil {
-		return ds.handleReadHit(trans, block)
+		ok := ds.handleReadHit(trans, block)
+		if ok {
+			ds.cache.InvokeHook(sim.HookCtx{
+				Domain: ds.cache,
+				Pos:    HookPosL2Access,
+				Detail: L2AccessDetail{Hit: true, Addr: cachelineID},
+			})
+		}
+		return ok
 	}
 
-	return ds.handleReadMiss(trans)
+	ok := ds.handleReadMiss(trans)
+	if ok {
+		ds.cache.InvokeHook(sim.HookCtx{
+			Domain: ds.cache,
+			Pos:    HookPosL2Access,
+			Detail: L2AccessDetail{Hit: false, Addr: cachelineID},
+		})
+	}
+	return ok
 }
 
 func (ds *directoryStage) handleReadMSHRHit(
@@ -669,6 +685,11 @@ func (ds *directoryStage) doWrite(trans *transaction) bool {
 					"remote-write-hit",
 				)
 			}
+			ds.cache.InvokeHook(sim.HookCtx{
+				Domain: ds.cache,
+				Pos:    HookPosL2Access,
+				Detail: L2AccessDetail{Hit: true, Addr: cachelineID},
+			})
 		}
 
 		return ok
@@ -688,6 +709,11 @@ func (ds *directoryStage) doWrite(trans *transaction) bool {
 				"remote-write-miss",
 			)
 		}
+		ds.cache.InvokeHook(sim.HookCtx{
+			Domain: ds.cache,
+			Pos:    HookPosL2Access,
+			Detail: L2AccessDetail{Hit: false, Addr: cachelineID},
+		})
 	}
 
 	return ok
@@ -1150,6 +1176,15 @@ func (ds *directoryStage) fetch(
 		ds.cache,
 		fmt.Sprintf("add-mshr-entry-0x%x-0x%x", mshrEntry.Address, block.Tag),
 	)
+
+	ds.cache.InvokeHook(sim.HookCtx{
+		Domain: ds.cache,
+		Pos:    HookPosRegionFetch,
+		Detail: RegionFetchDetail{
+			RegionTag:       cacheLineID,
+			RegionSizeBytes: uint64(1) << ds.cache.log2BlockSize,
+		},
+	})
 
 	ds.activeBuf.Pop()
 
