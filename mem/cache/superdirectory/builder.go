@@ -313,7 +313,9 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	if b.eventLogger != nil {
 		cacheModule.eventLogger = b.eventLogger
 	} else {
-		cacheModule.eventLogger = newEventLogger(b.engine, 1<<b.log2NumSubEntry)
+		l := newEventLogger(b.engine, 1<<b.log2NumSubEntry)
+		l.Enable() // default ON — events buffered in memory; caller flushes via EventLogger()
+		cacheModule.eventLogger = l
 	}
 }
 
