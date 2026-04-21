@@ -46,6 +46,8 @@ type Builder struct {
 
 	dirtyMask *[]map[vm.PID]map[uint64][]uint8
 	readMask  *[]map[vm.PID]map[uint64][]uint8
+
+	eventLogger *EventLogger
 }
 
 // MakeBuilder creates a new builder with default configurations.
@@ -220,6 +222,13 @@ func (b Builder) WithToRDMA(port sim.RemotePort) Builder {
 	return b
 }
 
+// WithEventLogger attaches an EventLogger to the cache. The logger must
+// already be enabled by the caller (logger.Enable()) before building.
+func (b Builder) WithEventLogger(l *EventLogger) Builder {
+	b.eventLogger = l
+	return b
+}
+
 func (b Builder) WithDirtyMask(mask *[]map[vm.PID]map[uint64][]uint8) Builder {
 	b.dirtyMask = mask
 	return b
@@ -300,6 +309,12 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.ReadMask = b.readMask
 
 	cacheModule.regionSizeBuffer = *internal.NewRegionSizeBuffer(64, b.log2PageSize, regionLen)
+
+	if b.eventLogger != nil {
+		cacheModule.eventLogger = b.eventLogger
+	} else {
+		cacheModule.eventLogger = newEventLogger(b.engine, 1<<b.log2NumSubEntry)
+	}
 }
 
 func (b *Builder) createPorts(cache *Comp) {

@@ -94,7 +94,14 @@ type Comp struct {
 	debugProcess   bool
 	debugAddress   uint64
 	recordTime     sim.VTimeInSec
+
+	eventLogger *EventLogger
 }
+
+// EventLogger returns the EventLogger attached to this cache component.
+// The caller can call Enable() on it before simulation starts, and read
+// Events() after simulation completes.
+func (c *Comp) EventLogger() *EventLogger { return c.eventLogger }
 
 func (c *Comp) SetAddressToPortMapper(lmf mem.AddressToPortMapper) {
 	c.addressToPortMapper = lmf
@@ -118,8 +125,8 @@ type middleware struct {
 
 func (m *middleware) Tick() bool {
 	m.printReturn = false
-	m.debugPromotion = true
-	m.debugProcess = true
+	m.debugPromotion = false
+	m.debugProcess = false
 	m.debugAddress = 21475446080
 	// now := m.Engine.CurrentTime()
 	// if now >= m.recordTime+0.00002 {

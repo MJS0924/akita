@@ -449,6 +449,14 @@ func (s *mshrStage) insertPromotionEntry() bool {
 	}
 
 	s.cache.dirStageMotionBuffer.Push(&newTrans)
+
+	// B.1 promotion event emission (read-only observation, no side effects)
+	if s.cache.eventLogger.IsEnabled() {
+		numSubs := 1 << s.cache.log2NumSubEntry
+		s.cache.eventLogger.logPromotion(
+			addr, trans.bankID, trans.bankID-1, len(newTrans.sharers), numSubs)
+	}
+
 	s.promotionQueue[0] = nil
 	s.promotionQueue = s.promotionQueue[1:]
 
@@ -482,6 +490,14 @@ func (s *mshrStage) insertDemotionEntry() bool {
 
 	if trans.block.SubEntry[trans.blockIdx].IsLocked || trans.block.GetReadCount() > 0 { // 누가 사용 중임
 		return false
+	}
+
+	// B.2 capture valid sub-entry count before modifying state
+	validSubsBefore := 0
+	for i := range trans.block.SubEntry {
+		if trans.block.SubEntry[i].IsValid {
+			validSubsBefore++
+		}
 	}
 
 	trans.block.SubEntry[trans.blockIdx].IsValid = false
@@ -539,6 +555,11 @@ func (s *mshrStage) insertDemotionEntry() bool {
 	newTrans.reqToBottom = nil
 
 	s.cache.dirStageMotionBuffer.Push(&newTrans)
+
+	// B.2 demotion event emission (read-only observation, no side effects)
+	if s.cache.eventLogger.IsEnabled() {
+		s.cache.eventLogger.logDemotion(addr, bankID, bankID+1, validSubsBefore)
+	}
 
 	if s.cache.debugPromotion {
 		fmt.Printf("[%s]\tDemotion Entry: Addr %x, bank %d -> %d, Owner %s, Sharer [ ",
