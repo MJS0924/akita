@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"fmt"
+
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
@@ -153,6 +155,8 @@ func NewRECDirectory(
 
 	d.Reset()
 
+	fmt.Printf("[Directory]\tBuild new coherence directory: %d sets, %d ways, %d entries\n", d.NumSets, d.NumWays, d.NumSets*d.NumWays)
+
 	return d
 }
 
@@ -180,6 +184,9 @@ func (d *RECDirectoryImpl) Lookup(PID vm.PID, reqAddr uint64) (*CohEntry, int) {
 	for _, entry := range set.CohEntries {
 		if entry.IsValid && entry.Tag>>maskLen == reqAddr>>maskLen && entry.PID == PID {
 			index := (int(reqAddr) >> d.log2BlockSize) % (1 << d.log2NumSubEntry)
+			if !entry.SubEntry[index].IsValid {
+				return nil, -1
+			}
 			return entry, index
 		}
 	}

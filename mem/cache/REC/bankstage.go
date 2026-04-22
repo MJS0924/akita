@@ -267,6 +267,7 @@ func (s *bankStage) InsertNewEntry(trans *transaction, bottomSenderBuffer sim.Bu
 		fmt.Printf("\n")
 	}
 
+	entry.IsValid = true
 	entry.IsLocked = false
 	if trans.read != nil && trans.read.FetchForWriteMiss {
 		trans.action = Nothing
@@ -311,6 +312,7 @@ func (s *bankStage) UpdateEntry(trans *transaction, bottomSenderBuffer sim.Buffe
 		fmt.Printf("\n")
 	}
 
+	entry.IsValid = true
 	entry.IsLocked = false
 	if trans.read != nil && trans.read.FetchForWriteMiss {
 		trans.action = Nothing
@@ -344,7 +346,7 @@ func (s *bankStage) InvalidateAndUpdateEntry(trans *transaction, bottomSenderBuf
 	targetMshrBuf.Push(trans)
 
 	if !blk.IsValidEntry() {
-		blk.IsValid = true
+		blk.IsValid = false
 		for i := range blk.SubEntry { // 혹시 몰라서
 			if i == trans.blockIdx {
 				continue
