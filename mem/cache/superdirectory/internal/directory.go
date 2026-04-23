@@ -26,7 +26,7 @@ type CohEntry struct {
 	WayID        int
 	SetID        int
 	CacheAddress uint64
-	SubEntry     [4]CohSubEntry
+	SubEntry     []CohSubEntry // length = 1 << log2NumSubEntry
 	IsValid      bool
 	// lock을 subentry가 아니라 entry 단위로 걸어야 할 수도 있음
 }
@@ -153,6 +153,7 @@ type SuperDirectoryImpl struct {
 
 	BFSize      uint64
 	bloomFilter []*CountingBloomFilter
+	disableCBF  bool
 
 	Sets      [][]CohSet // 1st index: bank, 2nd index: set
 	RegionLen []int
@@ -163,7 +164,7 @@ type SuperDirectoryImpl struct {
 
 func NewSuperDirectory(
 	bank, set, way, blockSize, log2NumSubEntry, BFSize int,
-	victimFinder VictimFinder, regionLen []int,
+	victimFinder VictimFinder, regionLen []int, disableCBF bool,
 ) *SuperDirectoryImpl {
 	d := new(SuperDirectoryImpl)
 	d.victimFinder = victimFinder
@@ -173,6 +174,7 @@ func NewSuperDirectory(
 	d.NumWays = way
 	d.BlockSize = blockSize
 	d.log2NumSubEntry = log2NumSubEntry
+	d.disableCBF = disableCBF
 	d.isIdealDirectory = false
 
 	for i := 0; i < bank; i++ {
@@ -209,6 +211,13 @@ func (d *SuperDirectoryImpl) TotalSize() uint64 {
 }
 
 func (d *SuperDirectoryImpl) GetBank(reqAddr uint64) (bankID []int) {
+	if d.disableCBF {
+		// CBF disabled: treat all banks as candidates (finest-first)
+		for i := d.NumBanks - 1; i >= 0; i-- {
+			bankID = append(bankID, i)
+		}
+		return
+	}
 	// fine-grain bank(높은 인덱스)부터 확인하여, data가 집중되는 finest bank를
 	// acceptNewTransaction()이 가장 먼저 시도하도록 순서를 반환한다.
 	for i := d.NumBanks - 1; i >= 0; i-- {
@@ -295,6 +304,7 @@ func (d *SuperDirectoryImpl) GetBanks() [][]CohSet {
 }
 
 func (d *SuperDirectoryImpl) Reset() {
+	numSubEntries := 1 << d.log2NumSubEntry
 	for i := 0; i < d.NumBanks; i++ {
 		for j := 0; j < d.NumSets[i]; j++ {
 			for k := 0; k < d.NumWays; k++ {
@@ -302,7 +312,8 @@ func (d *SuperDirectoryImpl) Reset() {
 				entry.IsValid = false
 				entry.SetID = j
 				entry.WayID = k
-				entry.CacheAddress = uint64(j*d.NumWays+k) * uint64(d.BlockSize) * (1 << d.log2NumSubEntry)
+				entry.CacheAddress = uint64(j*d.NumWays+k) * uint64(d.BlockSize) * uint64(numSubEntries)
+				entry.SubEntry = make([]CohSubEntry, numSubEntries)
 				d.Sets[i][j].CohEntries = append(d.Sets[i][j].CohEntries, entry)
 				d.Sets[i][j].LRUQueue = append(d.Sets[i][j].LRUQueue, entry)
 			}
@@ -327,10 +338,16 @@ func (d *SuperDirectoryImpl) GetRegionLen(regionID int) int {
 }
 
 func (d *SuperDirectoryImpl) InsertBloomfilter(regionID int, addr uint64) {
+	if d.disableCBF {
+		return
+	}
 	d.bloomFilter[regionID].Insert(addr, d.RegionLen[regionID])
 }
 
 func (d *SuperDirectoryImpl) EvictBloomfilter(regionID int, addr uint64) {
+	if d.disableCBF {
+		return
+	}
 	d.bloomFilter[regionID].Evict(addr, d.RegionLen[regionID])
 }
 
@@ -374,15 +391,6 @@ func (e *CohEntry) Reset() {
 	e.IsValid = false
 	for i := range e.SubEntry {
 		sub := &e.SubEntry[i]
-
-		// IsValid   bool
-		// IsDirty   bool
-		// ReadCount int
-		// IsLocked  bool
-		// Sharer    []sim.RemotePort
-		// VAddr     uint64
-		// DirtyMask []bool
-		// Accessed  bool
 		sub.IsValid = false
 		sub.IsDirty = false
 		sub.ReadCount = 0

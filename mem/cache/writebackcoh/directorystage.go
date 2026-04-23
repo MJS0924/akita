@@ -216,7 +216,9 @@ func (ds *directoryStage) doPrefetch(trans *transaction) bool {
 
 		if victim.IsLocked || victim.ReadCount > 0 {
 			*ds.activeString = *ds.activeString + fmt.Sprintf("Victim %x is being used", victim.Tag)
-			fmt.Printf("[%s]\t%s\n", ds.cache.name, *ds.activeString)
+			if ds.cache.debugProcess {
+				fmt.Printf("[%s]\t%s\n", ds.cache.name, *ds.activeString)
+			}
 			trans.returnFalse = *ds.activeString
 			return false
 		}
@@ -340,7 +342,13 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 	mshrEntry := ds.cache.mshr.Query(req.PID, cachelineID)
 
 	// 1. 블록 상태 확인 및 통계 정보 사전 추출 (초기화 전 미리 백업)
-	what := "InvalidateInvalidBlock"
+	suffix := ""
+	if req.IsWriteInv {
+		suffix = "-Write"
+	} else {
+		suffix = "-Evict"
+	}
+	what := "InvalidateInvalidBlock" + suffix
 	var pid vm.PID
 	var vAddr uint64
 	accessedCount := 0
@@ -359,7 +367,7 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 		}
 
 		if block.IsValid {
-			what = "InvalidateValidBlock"
+			what = "InvalidateValidBlock" + suffix
 		}
 
 		// 블록이 지워지기 전에 필요한 정보들을 안전하게 추출

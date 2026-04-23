@@ -62,6 +62,8 @@ type transaction struct {
 
 	entryProcessingPromotion bool
 	sharers                  []sim.RemotePort // 하위 뱅크에서 응답받은 sharer들 누적
+
+	utilRecorded bool // set true once evict-utilization has been sampled for this transaction
 }
 
 func (t transaction) accessReq() mem.AccessReq {

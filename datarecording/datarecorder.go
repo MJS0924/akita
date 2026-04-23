@@ -90,6 +90,7 @@ type sqliteWriter struct {
 	*sql.DB
 
 	mu           sync.Mutex
+	flushMu      sync.Mutex
 	dbName       string
 	tables       map[string]*table
 	locationInfo map[string]int
@@ -116,6 +117,8 @@ func (t *sqliteWriter) Init() {
 	if err != nil {
 		panic(err)
 	}
+
+	db.SetMaxOpenConns(1)
 
 	t.DB = db
 }
@@ -374,12 +377,24 @@ func (t *sqliteWriter) ListTables() []string {
 }
 
 func (t *sqliteWriter) Flush() {
+	t.flushMu.Lock()
+	defer t.flushMu.Unlock()
+
 	if t.entryCount == 0 {
 		return
 	}
 
-	t.mustExecute("BEGIN TRANSACTION")
-	defer t.mustExecute("COMMIT TRANSACTION")
+	tx, err := t.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		panic(err)
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
 
 	for tableName, table := range t.tables {
 		if len(table.entries) == 0 {
@@ -391,13 +406,17 @@ func (t *sqliteWriter) Flush() {
 		}
 
 		for _, task := range table.entries {
-			t.insertEntryForTable(task, table)
+			t.insertEntryForTable(task, table, tx)
 		}
 
 		table.entries = nil
 	}
 
-	t.flushLocationTable()
+	t.flushLocationTable(tx)
+
+	if err := tx.Commit(); err != nil {
+		panic(err)
+	}
 
 	t.entryCount = 0
 }
@@ -405,6 +424,7 @@ func (t *sqliteWriter) Flush() {
 func (t *sqliteWriter) insertEntryForTable(
 	task any,
 	table *table,
+	tx *sql.Tx,
 ) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -433,7 +453,8 @@ func (t *sqliteWriter) insertEntryForTable(
 		}
 	}
 
-	_, err := table.statement.ExecContext(context.Background(), v...)
+	stmt := tx.StmtContext(context.Background(), table.statement)
+	_, err := stmt.ExecContext(context.Background(), v...)
 	if err != nil {
 		panic(err)
 	}
@@ -470,7 +491,7 @@ func (t *sqliteWriter) fieldLocation(field reflect.StructField) bool {
 	return ok && strings.Contains(tag, "location")
 }
 
-func (t *sqliteWriter) flushLocationTable() {
+func (t *sqliteWriter) flushLocationTable(tx *sql.Tx) {
 	table, exists := t.tables["location"]
 	if !exists {
 		return
@@ -479,6 +500,8 @@ func (t *sqliteWriter) flushLocationTable() {
 	if len(table.entries) == 0 {
 		return
 	}
+
+	stmt := tx.StmtContext(context.Background(), table.statement)
 
 	for _, task := range table.entries {
 		v := []any{}
@@ -500,7 +523,7 @@ func (t *sqliteWriter) flushLocationTable() {
 			v = append(v, value.Field(i).Interface())
 		}
 
-		_, err := table.statement.ExecContext(context.Background(), v...)
+		_, err := stmt.ExecContext(context.Background(), v...)
 		if err != nil {
 			panic(err)
 		}

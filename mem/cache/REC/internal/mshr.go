@@ -60,7 +60,7 @@ func (m *mshrImpl) Add(pid vm.PID, addr uint64) *MSHREntry {
 		mask := m.log2BlockSize
 		if e.PID == pid && e.Address>>mask == addr>>mask {
 			fmt.Printf("[%s]\tentry already in mshr: input(addr %x), entry[%d](%v)\n",
-				m.Name, addr, i, e)
+				m.Name(), addr, i, e)
 
 			panic(fmt.Sprintf("entry already in mshr: input(addr %x ), entry(%v)\n",
 				addr, e))

@@ -38,17 +38,39 @@ type coalescabilitySnapshot struct {
 	StrictRatio           float64
 	AvgRelaxedRatio       float64
 	FullRedundantRatio    float64
-	CardinalityDistJSON   string
+	CardinalityDistJSON   string // per-block cardinality distribution (legacy/debug)
+
+	// Per-region cardinality ratios (Exp-C).
+	// "Region cardinality" = popcount of the union of all sharerSets within
+	// the R-byte region. For strict regions this equals the single sharer set.
+	RegCard1Ratio           float64 // regions with card==1 / total
+	RegCard2Ratio           float64 // regions with card==2 / total
+	RegCard3Ratio           float64 // regions with card==3 / total
+	RegCard4PlusRatio       float64 // regions with card>=4 / total
+	CoalescablePrivateRatio float64 // strict=1 AND card==1 / total
+	CoalescableSharedRatio  float64 // strict=1 AND card>=2 / total
+	// SharedOnlyStrictRatio: among card>=2 regions only, what fraction are strict.
+	// -1.0 if no card>=2 regions exist.
+	SharedOnlyStrictRatio float64
 }
 
 var coalescabilityViews = []string{"read_only", "union", "snapshot"}
 
 // per-GPU CSV file handles. Single-threaded sim, but guard anyway.
 var (
-	csvMu       sync.Mutex
-	csvFiles    = make(map[string]*os.File)
-	csvHeader   = "sim_time,gpu_id,kernel_id,view,region_size_bytes,num_regions_with_entries,strict_coalescable_ratio,avg_relaxed_ratio,full_redundant_ratio,sharer_set_cardinality_dist_json\n"
-	cumulHeader = "gpu_id,view,region_size_bytes,num_kernels,avg_strict_ratio,avg_relaxed_ratio,avg_full_redundant_ratio,min_strict_ratio,max_strict_ratio,phase0_pass\n"
+	csvMu     sync.Mutex
+	csvFiles  = make(map[string]*os.File)
+	csvHeader = "sim_time,gpu_id,kernel_id,view,region_size_bytes," +
+		"num_regions_with_entries,strict_coalescable_ratio,avg_relaxed_ratio," +
+		"full_redundant_ratio,sharer_set_cardinality_dist_json," +
+		"reg_card1_ratio,reg_card2_ratio,reg_card3_ratio,reg_card4plus_ratio," +
+		"coalescable_private_ratio,coalescable_shared_ratio,shared_only_strict_ratio\n"
+	cumulHeader = "gpu_id,view,region_size_bytes,num_kernels," +
+		"avg_strict_ratio,avg_relaxed_ratio,avg_full_redundant_ratio," +
+		"min_strict_ratio,max_strict_ratio,phase0_pass," +
+		"avg_reg_card1_ratio,avg_reg_card2_ratio,avg_reg_card3_ratio,avg_reg_card4plus_ratio," +
+		"avg_coalescable_private_ratio,avg_coalescable_shared_ratio," +
+		"avg_shared_only_strict_ratio\n"
 )
 
 func openCSV(filename, header string) *os.File {
@@ -143,15 +165,22 @@ func (c *Comp) computeViewSnapshot(
 	strictCount := 0
 	fullRedundantCount := 0
 	totalRelaxed := 0.0
-	cardDist := make(map[int]int)
+	cardDist := make(map[int]int) // per-block cardinality (legacy)
+
+	// per-region cardinality counters
+	regCardCount := [5]int{} // index 0 unused; [1]=card1, [2]=card2, [3]=card3, [4]=card4+
+	coalescablePrivateCount := 0
+	coalescableSharedCount := 0
+	sharedRegionCount := 0   // card>=2
+	strictSharedCount := 0   // strict=1 AND card>=2
 
 	for _, rd := range regions {
-		// cardinality histogram across all entries
+		// per-block cardinality histogram (legacy JSON column)
 		for _, s := range rd.sharers {
 			cardDist[popcount64(s)]++
 		}
 
-		// strict: all sharer sets identical
+		// strict: all sharer sets in region are identical
 		ref := rd.sharers[0]
 		allSame := true
 		for _, s := range rd.sharers[1:] {
@@ -187,9 +216,43 @@ func (c *Comp) computeViewSnapshot(
 			}
 		}
 		totalRelaxed += float64(maxCount) / float64(len(rd.sharers))
+
+		// per-region cardinality = popcount of union of all sharerSets in region
+		unionSharers := uint64(0)
+		for _, s := range rd.sharers {
+			unionSharers |= s
+		}
+		regionCard := popcount64(unionSharers)
+
+		if regionCard <= 0 {
+			regionCard = 0
+		}
+		if regionCard >= 4 {
+			regCardCount[4]++
+		} else if regionCard >= 1 {
+			regCardCount[regionCard]++
+		}
+
+		if regionCard >= 2 {
+			sharedRegionCount++
+			if allSame {
+				strictSharedCount++
+				coalescableSharedCount++
+			}
+		} else if regionCard == 1 {
+			if allSame {
+				coalescablePrivateCount++
+			}
+		}
 	}
 
 	cardJSON, _ := json.Marshal(cardDist)
+
+	fTotal := float64(numRegions)
+	sharedOnlyStrict := -1.0
+	if sharedRegionCount > 0 {
+		sharedOnlyStrict = float64(strictSharedCount) / float64(sharedRegionCount)
+	}
 
 	return &coalescabilitySnapshot{
 		SimTime:               simTime,
@@ -198,10 +261,18 @@ func (c *Comp) computeViewSnapshot(
 		View:                  view,
 		RegionSizeBytes:       R,
 		NumRegionsWithEntries: numRegions,
-		StrictRatio:           float64(strictCount) / float64(numRegions),
-		AvgRelaxedRatio:       totalRelaxed / float64(numRegions),
-		FullRedundantRatio:    float64(fullRedundantCount) / float64(numRegions),
+		StrictRatio:           float64(strictCount) / fTotal,
+		AvgRelaxedRatio:       totalRelaxed / fTotal,
+		FullRedundantRatio:    float64(fullRedundantCount) / fTotal,
 		CardinalityDistJSON:   string(cardJSON),
+
+		RegCard1Ratio:           float64(regCardCount[1]) / fTotal,
+		RegCard2Ratio:           float64(regCardCount[2]) / fTotal,
+		RegCard3Ratio:           float64(regCardCount[3]) / fTotal,
+		RegCard4PlusRatio:       float64(regCardCount[4]) / fTotal,
+		CoalescablePrivateRatio: float64(coalescablePrivateCount) / fTotal,
+		CoalescableSharedRatio:  float64(coalescableSharedCount) / fTotal,
+		SharedOnlyStrictRatio:   sharedOnlyStrict,
 	}
 }
 
@@ -243,7 +314,8 @@ func (c *Comp) writeCoalescabilityRow(s coalescabilitySnapshot) {
 
 	csvMu.Lock()
 	defer csvMu.Unlock()
-	fmt.Fprintf(f, "%.9f,%d,%d,%s,%d,%d,%.6f,%.6f,%.6f,%s\n",
+	fmt.Fprintf(f,
+		"%.9f,%d,%d,%s,%d,%d,%.6f,%.6f,%.6f,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
 		float64(s.SimTime),
 		s.GPUID,
 		s.KernelID,
@@ -254,6 +326,13 @@ func (c *Comp) writeCoalescabilityRow(s coalescabilitySnapshot) {
 		s.AvgRelaxedRatio,
 		s.FullRedundantRatio,
 		s.CardinalityDistJSON,
+		s.RegCard1Ratio,
+		s.RegCard2Ratio,
+		s.RegCard3Ratio,
+		s.RegCard4PlusRatio,
+		s.CoalescablePrivateRatio,
+		s.CoalescableSharedRatio,
+		s.SharedOnlyStrictRatio,
 	)
 }
 
@@ -269,6 +348,12 @@ func (c *Comp) EmitCumulativeReport() {
 		sumStrict, sumRelaxed, sumRedundant float64
 		count                               int
 		minStrict, maxStrict                float64
+
+		// Exp-C cardinality aggregates
+		sumCard1, sumCard2, sumCard3, sumCard4Plus float64
+		sumPrivate, sumShared                      float64
+		sumSharedOnlyStrict                        float64
+		sharedOnlyStrictCount                      int // rows where sharedOnlyStrict != -1
 	}
 
 	aggregated := make(map[key]*agg)
@@ -289,6 +374,16 @@ func (c *Comp) EmitCumulativeReport() {
 		if snap.StrictRatio < a.minStrict {
 			a.minStrict = snap.StrictRatio
 		}
+		a.sumCard1 += snap.RegCard1Ratio
+		a.sumCard2 += snap.RegCard2Ratio
+		a.sumCard3 += snap.RegCard3Ratio
+		a.sumCard4Plus += snap.RegCard4PlusRatio
+		a.sumPrivate += snap.CoalescablePrivateRatio
+		a.sumShared += snap.CoalescableSharedRatio
+		if snap.SharedOnlyStrictRatio >= 0 {
+			a.sumSharedOnlyStrict += snap.SharedOnlyStrictRatio
+			a.sharedOnlyStrictCount++
+		}
 	}
 
 	// Print a deterministic table (sort by view, then R).
@@ -304,9 +399,9 @@ func (c *Comp) EmitCumulativeReport() {
 	})
 
 	fmt.Printf("\n=== [%s] Cumulative Coalescability Report ===\n", c.name)
-	fmt.Printf("%-10s %-10s %-12s %-12s %-12s %-10s %-10s %-8s\n",
-		"view", "R(bytes)", "avg_strict", "avg_relaxed", "avg_fullred",
-		"min_str", "max_str", "kernels")
+	fmt.Printf("%-10s %-8s %-10s %-10s %-10s %-8s %-8s %-6s %-8s %-8s %-8s\n",
+		"view", "R(B)", "avg_strict", "priv_coal", "shar_coal", "shar_str",
+		"card1%", "card2%", "card3%", "card4+%", "kernels")
 
 	passedAny := false
 	cumFile, err := os.Create(fmt.Sprintf("motivation_cumulative_GPU%d.csv", c.deviceID))
@@ -322,23 +417,40 @@ func (c *Comp) EmitCumulativeReport() {
 
 	for _, k := range keys {
 		a := aggregated[k]
-		avgStrict := a.sumStrict / float64(a.count)
-		avgRelaxed := a.sumRelaxed / float64(a.count)
-		avgRedundant := a.sumRedundant / float64(a.count)
+		n := float64(a.count)
+		avgStrict := a.sumStrict / n
+		avgRelaxed := a.sumRelaxed / n
+		avgRedundant := a.sumRedundant / n
+		avgCard1 := a.sumCard1 / n
+		avgCard2 := a.sumCard2 / n
+		avgCard3 := a.sumCard3 / n
+		avgCard4Plus := a.sumCard4Plus / n
+		avgPrivate := a.sumPrivate / n
+		avgShared := a.sumShared / n
+
+		avgSharedOnlyStrict := -1.0
+		if a.sharedOnlyStrictCount > 0 {
+			avgSharedOnlyStrict = a.sumSharedOnlyStrict / float64(a.sharedOnlyStrictCount)
+		}
+
 		pass := 0
 		if avgStrict >= 0.30 {
 			passedAny = true
 			pass = 1
 		}
 
-		fmt.Printf("%-10s %-10d %-12.4f %-12.4f %-12.4f %-10.4f %-10.4f %-8d\n",
-			k.view, k.R, avgStrict, avgRelaxed, avgRedundant,
-			a.minStrict, a.maxStrict, a.count)
+		fmt.Printf("%-10s %-8d %-10.4f %-10.4f %-10.4f %-8.4f %-8.4f %-8.4f %-8.4f %-8.4f %-6d\n",
+			k.view, k.R, avgStrict, avgPrivate, avgShared,
+			avgSharedOnlyStrict, avgCard1, avgCard2, avgCard3, avgCard4Plus,
+			a.count)
 
-		fmt.Fprintf(cumFile, "%d,%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%d\n",
+		fmt.Fprintf(cumFile,
+			"%d,%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
 			c.deviceID, k.view, k.R, a.count,
 			avgStrict, avgRelaxed, avgRedundant,
 			a.minStrict, a.maxStrict, pass,
+			avgCard1, avgCard2, avgCard3, avgCard4Plus,
+			avgPrivate, avgShared, avgSharedOnlyStrict,
 		)
 	}
 

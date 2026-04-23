@@ -131,6 +131,7 @@ func (bs *bottomSender) processBypassReq() bool {
 	trans.ack++
 
 	tracing.AddTaskStep(tracing.MsgIDAtReceiver(trans.accessReq(), bs.cache), bs.cache, "BypassToLocalL2")
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	return true
@@ -242,9 +243,14 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 		return true
 	}
 
-	what := "Nothing"
+	what := ""
 	if trans.action != Nothing {
-		what = ""
+		what = "UpdateEntry"
+		tracing.AddTaskStep(
+			tracing.MsgIDAtReceiver(trans.accessReq(), bs.cache),
+			bs.cache,
+			what,
+		)
 	}
 	what += fmt.Sprintf(" - %d", trans.bankID)
 	tracing.AddTaskStep(
@@ -253,6 +259,7 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 		what,
 	)
 
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	return true
@@ -361,6 +368,7 @@ func (bs *bottomSender) sendMultipleRequestToBottom( // TODO: local에서 remote
 		what,
 	)
 
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	return true
@@ -392,6 +400,23 @@ func (bs *bottomSender) sendInvalidationRequest(
 		if hasValidTargets {
 			break
 		}
+	}
+
+	// sample utilization once per eviction transaction
+	if !trans.utilRecorded {
+		numSub := len(victim.SubEntry)
+		if numSub > 0 {
+			validCount := 0
+			for k := 0; k < numSub; k++ {
+				if victim.SubEntry[k].IsValid {
+					validCount++
+				}
+			}
+			util := float64(validCount) / float64(numSub)
+			bs.cache.evictEntryUtilSum += util
+			bs.cache.evictEntryCount++
+		}
+		trans.utilRecorded = true
 	}
 
 	progress := false
@@ -471,13 +496,16 @@ func (bs *bottomSender) sendInvalidationRequest(
 				}
 			}
 
-			fmt.Printf("[%s]\tEvict entry from bank %d: Addr %x\n", bs.cache.name, trans.bankID, addr)
+			if bs.cache.debugProcess {
+				fmt.Printf("[%s]\tEvict entry from bank %d: Addr %x\n", bs.cache.name, trans.bankID, addr)
+			}
 		}
 	} else {
 		// [Deadlock 방지] 보낼 대상이 없으면 성공(true)한 것으로 간주하여 Pop 되도록 유도
 		progress = true
 	}
 
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	// 4. Bottom으로의 추가 요청 하달
@@ -546,6 +574,7 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 				WithReqFrom(trans.accessReq().Meta().ID).
 				WithDstRDMA(sh).
 				WithRegionID(bankID).
+				WithIsWriteInv(true).
 				Build()
 
 			bs.sendToTopQue = append(bs.sendToTopQue, req)
@@ -575,6 +604,7 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 	// 5. 메시지 생성이 모두 끝났으므로 invalidationList 비움
 	trans.invalidationList = nil
 
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	return progress
@@ -613,7 +643,8 @@ func (bs *bottomSender) insertDemotedEntry(
 	currAddr := addr >> prevRegionLen << prevRegionLen
 	endAddr := currAddr + (1 << prevRegionLen)
 	newBlk := &internal.CohEntry{
-		Tag: currAddr,
+		Tag:      currAddr,
+		SubEntry: make([]internal.CohSubEntry, 1<<bs.cache.log2NumSubEntry),
 	}
 
 	i := 0
@@ -769,9 +800,9 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 
 	if i == -1 {
 		// superdirectory 환경에서 트랜잭션 유실을 추적하기 위해 기존 로그 유지
-		// if bs.cache.debugProcess && msg.Origin.GetAddress() == bs.cache.debugAddress {
-		fmt.Printf("[%s] [bottomSender]\tDiscard read rsp - 3.2: addr %x\n", bs.cache.name, msg.Origin.GetAddress())
-		// }
+		if bs.cache.debugProcess {
+			fmt.Printf("[%s] [bottomSender]\tDiscard read rsp - 3.2: addr %x\n", bs.cache.name, msg.Origin.GetAddress())
+		}
 		port.RetrieveIncoming()
 		return true
 	}
@@ -899,7 +930,10 @@ func (bs *bottomSender) processWriteDoneRsp(msg *mem.WriteDoneRsp, port sim.Port
 func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) bool {
 	i := bs.findInvalidationByID(rsp.RespondTo, bs.inflightInvToBottom)
 	if i == -1 {
-		fmt.Printf("[%s]\tCannot find transaction for InvRsp with RspTo %s\n", bs.cache.Name(), rsp.RespondTo)
+		if bs.cache.debugProcess {
+			fmt.Printf("[%s]\tCannot find transaction for InvRsp with RspTo %s\n", bs.cache.Name(), rsp.RespondTo)
+
+		}
 		port.RetrieveIncoming()
 		return true
 	}
@@ -1037,7 +1071,7 @@ func (bs *bottomSender) sendBypassRspToTop() bool {
 	return true
 }
 
-/// sendRemoteRspToTop은 Dst에 "RDMA"가 없는 remote 응답을 RDMAPort를 통해 전송한다.
+// / sendRemoteRspToTop은 Dst에 "RDMA"가 없는 remote 응답을 RDMAPort를 통해 전송한다.
 func (bs *bottomSender) sendRemoteRspToTop() bool {
 	if len(bs.sendToRemoteTopQue) == 0 {
 		return false

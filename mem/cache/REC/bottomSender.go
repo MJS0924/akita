@@ -2,7 +2,6 @@ package REC
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
@@ -137,6 +136,7 @@ func (bs *bottomSender) processBypassReq() bool {
 	trans.ack++
 
 	tracing.AddTaskStep(tracing.MsgIDAtReceiver(trans.accessReq(), bs.cache), bs.cache, "BypassToLocalL2")
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	return true
@@ -252,6 +252,7 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 		what,
 	)
 
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	return true
@@ -283,6 +284,23 @@ func (bs *bottomSender) sendInvalidationRequest(
 		if hasValidTargets {
 			break
 		}
+	}
+
+	// sample utilization once per eviction transaction
+	if !trans.utilRecorded {
+		numSub := 1 << bs.cache.log2NumSubEntry
+		if numSub > 0 {
+			validCount := 0
+			for k := 0; k < numSub; k++ {
+				if victim.SubEntry[k].IsValid {
+					validCount++
+				}
+			}
+			util := float64(validCount) / float64(numSub)
+			bs.cache.evictEntryUtilSum += util
+			bs.cache.evictEntryCount++
+		}
+		trans.utilRecorded = true
 	}
 
 	progress := false
@@ -359,6 +377,7 @@ func (bs *bottomSender) sendInvalidationRequest(
 		progress = true
 	}
 
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	// 4. Bottom으로의 추가 요청 하달
@@ -452,6 +471,7 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 	// 5. 메시지 생성이 모두 끝났으므로 invalidationList 비움
 	trans.invalidationList = nil
 
+	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
 	return progress
@@ -561,11 +581,11 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 	if i == -1 {
 		// superdirectory 환경에서 트랜잭션 유실을 추적하기 위해 기존 로그 유지
 		// if bs.cache.debugProcess && msg.Origin.GetAddress() == bs.cache.debugAddress {
-		fmt.Printf("[%s] [bottomSender]\tDiscard read rsp - 3.2: addr %x\n", bs.cache.name, msg.Origin.GetAddress())
+		// fmt.Printf("[%s] [bottomSender]\tDiscard read rsp - 3.2: addr %x\n", bs.cache.name, msg.Origin.GetAddress())
 		// }
-		if msg.ID == "14861018" {
-			fmt.Fprintf(os.Stderr, "\tDiscard\n")
-		}
+		// if msg.ID == "14861018" {
+		// 	fmt.Fprintf(os.Stderr, "\tDiscard\n")
+		// }
 		port.RetrieveIncoming()
 		return true
 	}
@@ -616,9 +636,9 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 	if bs.cache.debugProcess && msg.Origin.GetAddress() == bs.cache.debugAddress {
 		fmt.Printf("[%s] [bottomSender]\tSend read rsp - 3.3: addr %x, dst %s\n", bs.cache.name, trans.read.Address, msg.Dst)
 	}
-	if msg.ID == "14861018" {
-		fmt.Fprintf(os.Stderr, "\tSend read rsp: addr %x, dst %s, dstRDMA %s\n", trans.read.Address, msg.Dst)
-	}
+	// if msg.ID == "14861018" {
+	// 	fmt.Fprintf(os.Stderr, "\tSend read rsp: addr %x, dst %s, dstRDMA %s\n", trans.read.Address, msg.Dst)
+	// }
 	return true
 }
 
@@ -702,7 +722,9 @@ func (bs *bottomSender) processWriteDoneRsp(msg *mem.WriteDoneRsp, port sim.Port
 func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) bool {
 	i := bs.findInvalidationByID(rsp.RespondTo, bs.inflightInvToBottom)
 	if i == -1 {
-		fmt.Printf("[%s]\tCannot find transaction for InvRsp with RspTo %s\n", bs.cache.Name(), rsp.RespondTo)
+		if bs.cache.debugProcess {
+			fmt.Printf("[%s]\tCannot find transaction for InvRsp with RspTo %s\n", bs.cache.Name(), rsp.RespondTo)
+		}
 		port.RetrieveIncoming()
 		return true
 	}
@@ -854,7 +876,7 @@ func (bs *bottomSender) sendRemoteRspToTop() bool {
 	return true
 }
 
-/// [FIX: head-of-line blocking] RDMAPort 혼잡 시 뒤에 있는 topPort 응답까지 막히는 문제 수정.
+// / [FIX: head-of-line blocking] RDMAPort 혼잡 시 뒤에 있는 topPort 응답까지 막히는 문제 수정.
 // RDMAPort(데이터 채널 WriteDoneRsp)만 혼잡 시 skip; RDMAInvPort·topPort는 순서 보장을 위해 원래대로 return false.
 // 원래 코드(return false)로 되돌리려면 아래 루프를 제거하고 sendToTopQue[0]만 처리하는 원래 로직으로 교체.
 func (bs *bottomSender) sendToTop() bool {

@@ -96,6 +96,20 @@ type Comp struct {
 	recordTime     sim.VTimeInSec
 
 	eventLogger *EventLogger
+
+	evictEntryUtilSum float64
+	evictEntryCount   uint64
+}
+
+func (c *Comp) AvgEvictUtilization() float64 {
+	if c.evictEntryCount == 0 {
+		return 0
+	}
+	return c.evictEntryUtilSum / float64(c.evictEntryCount)
+}
+
+func (c *Comp) EvictCount() uint64 {
+	return c.evictEntryCount
 }
 
 // EventLogger returns the EventLogger attached to this cache component.

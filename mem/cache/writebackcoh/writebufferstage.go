@@ -49,7 +49,7 @@ func (wb *writeBufferStage) processNewTransaction() bool {
 	if wb.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == wb.cache.debugAddress1 {
 		fmt.Printf("[%s] [writebufferstage]\tReceived read req - 3: addr %x, action %d\n", wb.cache.name, trans.accessReq().GetAddress(), trans.action)
 	}
-	if trans.responsing {
+	if wb.cache.debugProcess && trans.responsing {
 		fmt.Printf("[%s]\tTransaction %x is responsing, discard.\n", wb.cache.name, trans.accessReq().GetAddress())
 		wb.cache.writeBufferBuffer.Pop()
 		return true

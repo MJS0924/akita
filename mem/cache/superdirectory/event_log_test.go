@@ -38,7 +38,7 @@ func newTestMshrStage(enableLogging bool) (*mshrStage, *EventLogger) {
 // buildPromotionTrans creates a transaction whose block passes AbleToPromotion
 // in bank 2 (so bankID-1=1 is a valid target).
 func buildPromotionTrans(sharer sim.RemotePort) *transaction {
-	blk := &internal.CohEntry{IsValid: true}
+	blk := &internal.CohEntry{IsValid: true, SubEntry: make([]internal.CohSubEntry, 4)}
 	for i := range blk.SubEntry {
 		blk.SubEntry[i].IsValid = true
 		blk.SubEntry[i].Sharer = []sim.RemotePort{sharer}
@@ -56,7 +56,7 @@ func buildPromotionTrans(sharer sim.RemotePort) *transaction {
 // buildDemotionTrans creates a demotion candidate in bank 1 with all 4
 // sub-entries valid before the targeted one is cleared.
 func buildDemotionTrans(owner sim.RemotePort) *transaction {
-	blk := &internal.CohEntry{IsValid: true}
+	blk := &internal.CohEntry{IsValid: true, SubEntry: make([]internal.CohSubEntry, 4)}
 	for i := range blk.SubEntry {
 		blk.SubEntry[i].IsValid = true
 	}

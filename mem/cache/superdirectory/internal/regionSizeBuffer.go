@@ -10,16 +10,18 @@ type RegionSizeBuffer struct {
 	entries      []RegionSizeBufferEntry
 	log2PageSize uint64
 	regionLen    []int
+	disabled     bool
 }
 
 // NewCountingBloomFilter는 새로운 블룸 필터를 생성합니다.
 // numEntries는 전체 카운터 배열의 크기(m)입니다.
-func NewRegionSizeBuffer(numEntries uint64, pageSize uint64, regionLen []int) *RegionSizeBuffer {
+func NewRegionSizeBuffer(numEntries uint64, pageSize uint64, regionLen []int, disabled bool) *RegionSizeBuffer {
 	return &RegionSizeBuffer{
 		numEntries:   numEntries,
 		entries:      make([]RegionSizeBufferEntry, numEntries),
 		log2PageSize: pageSize,
 		regionLen:    regionLen,
+		disabled:     disabled,
 	}
 }
 
@@ -28,6 +30,9 @@ func (b *RegionSizeBuffer) Reset() {
 }
 
 func (b *RegionSizeBuffer) Search(addr uint64) RegionSizeBufferEntry {
+	if b.disabled {
+		return RegionSizeBufferEntry{RegionID: -1}
+	}
 	addr = addr >> b.log2PageSize
 	for _, entry := range b.entries {
 		mask := b.regionLen[entry.RegionID]
@@ -69,6 +74,9 @@ func (b *RegionSizeBuffer) Delete(e RegionSizeBufferEntry) {
 }
 
 func (b *RegionSizeBuffer) Update(addr uint64, regionID int) {
+	if b.disabled {
+		return
+	}
 	e := b.Search(addr)
 	b.Delete(e)
 
@@ -85,6 +93,9 @@ func (b *RegionSizeBuffer) GetEntries() *[]RegionSizeBufferEntry {
 // its page-level address falls within the same region as addr at that bank's
 // granularity.
 func (b *RegionSizeBuffer) InvalidateForPromotion(addr uint64, prevBankID int) {
+	if b.disabled {
+		return
+	}
 	pageAddr := addr >> b.log2PageSize
 	n := 0
 	for _, e := range b.entries {

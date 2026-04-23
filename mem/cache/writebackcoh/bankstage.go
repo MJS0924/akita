@@ -204,7 +204,7 @@ func (s *bankStage) finalizeTrans() bool {
 		if s.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == s.cache.debugAddress1 {
 			fmt.Printf("[%s] [bankStage]\tReceived req - 2: addr %x, action %d\n", s.cache.name, trans.accessReq().GetAddress(), trans.action)
 		}
-		if trans.responsing {
+		if s.cache.debugProcess && trans.responsing {
 			fmt.Printf("[%s]\tTransaction %x is responsing, discard.\n", s.cache.name, trans.accessReq().GetAddress())
 			s.postPipelineBuf.Remove(i)
 			continue
@@ -387,7 +387,7 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		trans.action = writeBufferFlush
 		s.cache.writeBufferBuffer.Push(trans)
 
-		if trans.action == bankWritePrefetched {
+		if s.cache.debugProcess && trans.action == bankWritePrefetched {
 			fmt.Printf("[%s]\t[WARNING]\twrong trans action\n", s.cache.name)
 		}
 	}
@@ -559,7 +559,9 @@ func (s *bankStage) finalizeBankWritePrefetched(
 		s.downwardInflightTransCount--
 		what = "EvictAndPrefetch"
 
-		fmt.Printf("[Prefetch Profiling] [%s]\tEvict And Prefetch: evict %x, prefetch %x\n", s.cache.name, trans.evictingAddr, block.Tag)
+		if s.cache.debugProcess {
+			fmt.Printf("[Prefetch Profiling] [%s]\tEvict And Prefetch: evict %x, prefetch %x\n", s.cache.name, trans.evictingAddr, block.Tag)
+		}
 	}
 
 	s.inflightTransCount--

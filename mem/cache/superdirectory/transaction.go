@@ -71,6 +71,8 @@ type transaction struct {
 	// InsertBloomfilter before the transaction enters the bank pipeline.
 	// writeToBank checks this flag to avoid incrementing the same BF counter twice.
 	bfEagerInserted bool
+
+	utilRecorded bool // set true once evict-utilization has been sampled for this transaction
 }
 
 func (t transaction) accessReq() mem.AccessReq {

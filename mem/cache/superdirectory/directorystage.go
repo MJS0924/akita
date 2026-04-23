@@ -87,6 +87,12 @@ func (ds *directoryStage) acceptNewTransaction(fromLocal bool) bool {
 			return madeProgress // 상태 미변경 — 다음 cycle에 동일 로직 재실행 가능
 		}
 
+		tracing.AddTaskStep(
+			tracing.MsgIDAtReceiver(req, ds.cache),
+			ds.cache,
+			fmt.Sprintf("GetBankCount - %d", 1+len(sel.bankList)),
+		)
+
 		targetPipeline[trans.bankID].Accept(dirPipelineItem{trans})
 		if sel.onCommit != nil {
 			sel.onCommit() // ★ dispatch 성공 후에만 state mutation
@@ -561,11 +567,20 @@ func (ds *directoryStage) doWriteHit(
 
 	if trans.isReadTrans() && !trans.read.FetchForWriteMiss {
 		if ds.readPermission(trans, subEntry.Sharer) {
+			// 이미 sharer에 포함되어 있으므로 directory 업데이트 불필요 — 바로 bottom으로 전송
 			trans.action = Nothing
-		} else {
-			trans.action = UpdateEntry
+			targetBuffer := ds.cache.localBottomSenderBuffer
+			if !isLocal {
+				targetBuffer = ds.cache.remoteBottomSenderBuffer
+			}
+			if !targetBuffer.CanPush() {
+				*ds.returnFalse += "Cannot push to bottom sender buffer"
+				return false
+			}
+			targetBuffer.Push(trans)
+			return true
 		}
-
+		trans.action = UpdateEntry
 		return ds.writeToBank(trans, block, index, isLocal)
 	}
 
@@ -780,7 +795,7 @@ func (ds *directoryStage) needEviction(victim *internal.CohEntry) bool {
 func (ds *directoryStage) readPermission(trans *transaction, sharer []sim.RemotePort) bool {
 	if !trans.fromLocal { // remote access
 		for _, sh := range sharer {
-			if sh == trans.accessReq().Meta().Src {
+			if sh == trans.accessReq().GetSrcRDMA() {
 				return true
 			}
 		}
@@ -835,7 +850,7 @@ type bankSelection struct {
 //
 // GetBank returns banks finest-first ([0]=finest, [last]=coarsest).
 func (ds *directoryStage) selectBank(addr uint64) bankSelection {
-	e := ds.cache.regionSizeBuffer.Search(addr)
+	e := ds.cache.regionSizeBuffer.Search(addr) // miss when RSB disabled
 	if e.RegionID != -1 {
 		bfList := ds.cache.directory.GetBank(addr)
 		n := len(bfList)
@@ -855,7 +870,7 @@ func (ds *directoryStage) selectBank(addr uint64) bankSelection {
 		rsbEntry := e
 		routedBank := e.RegionID
 		return bankSelection{
-			bankID:  routedBank,
+			bankID: routedBank,
 			onCommit: func() {
 				ds.cache.directory.InsertBloomfilter(routedBank, addr)
 				ds.cache.regionSizeBuffer.Delete(rsbEntry)

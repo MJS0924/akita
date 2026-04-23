@@ -2,7 +2,6 @@ package optdirectory
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
@@ -265,8 +264,8 @@ func (bs *bottomSender) sendMultipleRequest(trans *transaction, isLocal bool) bo
 	req.SetReqFrom(trans.accessReq().Meta().ID)
 
 	if req.GetAddress()%(1<<bs.cache.log2BlockSize)+req.GetByteSize() > 1<<bs.cache.log2BlockSize {
-		fmt.Printf("[%s][sendMultipleRequest]\tERROR: addr %x, offset %d, bytesize %d, blkSize %d\n",
-			bs.cache.name, req.GetAddress()%(1<<bs.cache.log2BlockSize), req.GetByteSize(), bs.cache.log2BlockSize)
+		fmt.Printf("[%s][sendMultipleRequest]\tERROR: addr %x, offset %x, bytesize %d, blkSize %d\n",
+			bs.cache.name, req.GetAddress(), req.GetAddress()%(1<<bs.cache.log2BlockSize), req.GetByteSize(), bs.cache.log2BlockSize)
 		panic("ERR")
 	}
 
@@ -386,7 +385,7 @@ func (bs *bottomSender) sendInvalidationRequest(trans *transaction, isLocal bool
 			if trans.action == EvictAndInsertNewEntry {
 				what = "InvalidateByEviction"
 			} else if trans.action == InvalidateAndUpdateEntry {
-				fmt.Fprintf(os.Stderr, "[%s] [DEBUG]\tInvalidateAndupdateEntry - 2.2\n", bs.cache.name)
+				// fmt.Fprintf(os.Stderr, "[%s] [DEBUG]\tInvalidateAndupdateEntry - 2.2\n", bs.cache.name)
 				what = "InvalidateByWrite"
 			}
 			if what != "" {
@@ -401,7 +400,7 @@ func (bs *bottomSender) sendInvalidationRequest(trans *transaction, isLocal bool
 	trans.invalidationList = nil
 
 	if trans.action != InvalidateEntry {
-		if progress && !isLocal && trans.accessReq() != nil && trans.accessReq().GetAddress() == bs.cache.debugAddress {
+		if bs.cache.debugProcess && progress && !isLocal && trans.accessReq() != nil && trans.accessReq().GetAddress() == bs.cache.debugAddress {
 			fmt.Printf("[%s][DEBUG]\tReadReq received - 3.3.0: %x\n", bs.cache.name, trans.accessReq().GetAddress())
 		}
 		return bs.sendRequestToBottom(trans, isLocal) || progress
@@ -618,9 +617,9 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 	// [핵심 추가] 처리가 완료된 트랜잭션을 Inflight 배열에서 안전하게 삭제합니다.
 	bs.removeInflightInvalidation(i)
 	// fmt.Printf("[%s]\tFinalize Inv Req - 0: %s\n", bs.cache.name, req.ReqFrom)
-	if req.Address == 21475226560 {
-		fmt.Printf("[%s]\t[DEBUG] Invalidation - 3: %s\n", bs.cache.name, rsp.RespondTo)
-	}
+	// if req.Address == 21475226560 {
+	// 	fmt.Printf("[%s]\t[DEBUG] Invalidation - 3: %s\n", bs.cache.name, rsp.RespondTo)
+	// }
 
 	return true
 }
@@ -666,9 +665,9 @@ func (bs *bottomSender) processInvalidationReq() bool {
 	bs.inflightInvToBottom = append(bs.inflightInvToBottom, &tr)
 	bs.cache.invReqBuffer.Pop()
 
-	if req.Address == 21475226560 {
-		fmt.Printf("[%s]\t[DEBUG] Invalidation - 1: %x\n", bs.cache.name, req.Meta().ID)
-	}
+	// if req.Address == 21475226560 {
+	// 	fmt.Printf("[%s]\t[DEBUG] Invalidation - 1: %x\n", bs.cache.name, req.Meta().ID)
+	// }
 	return true
 }
 

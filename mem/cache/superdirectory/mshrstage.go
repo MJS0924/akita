@@ -514,8 +514,9 @@ func (s *mshrStage) insertDemotionEntry() bool {
 	currAddr := addr >> prevRegionLen << prevRegionLen
 	endAddr := currAddr + (1 << prevRegionLen)
 	newBlk := &internal.CohEntry{
-		PID: pid,
-		Tag: currAddr,
+		PID:      pid,
+		Tag:      currAddr,
+		SubEntry: make([]internal.CohSubEntry, 1<<s.cache.log2NumSubEntry),
 	}
 
 	i := 0

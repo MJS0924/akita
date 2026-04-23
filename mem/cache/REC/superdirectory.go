@@ -91,6 +91,20 @@ type Comp struct {
 	debugProcess   bool
 	debugAddress   uint64
 	recordTime     sim.VTimeInSec
+
+	evictEntryUtilSum float64
+	evictEntryCount   uint64
+}
+
+func (c *Comp) AvgEvictUtilization() float64 {
+	if c.evictEntryCount == 0 {
+		return 0
+	}
+	return c.evictEntryUtilSum / float64(c.evictEntryCount)
+}
+
+func (c *Comp) EvictCount() uint64 {
+	return c.evictEntryCount
 }
 
 func (c *Comp) SetAddressToPortMapper(lmf mem.AddressToPortMapper) {

@@ -246,7 +246,8 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.deviceID = b.deviceID
 	blockSize := 1 << b.log2BlockSize
 	vimctimFinder := internal.NewLRUVictimFinder()
-	numSet := int(b.byteSize/uint64(b.wayAssociativity*blockSize)) / 2 // REC는 entry 크기가 baseline에 비해 2배정도 크기 때문에 set 크기를 절반으로 줄임
+	numSet := int(b.byteSize / uint64(b.wayAssociativity*blockSize)) // REC는 entry 크기가 baseline에 비해 2배정도 크기 때문에 set 크기를 절반으로 줄임
+	// numSet := int(b.byteSize/uint64(b.wayAssociativity*blockSize)) / 2 // REC는 entry 크기가 baseline에 비해 2배정도 크기 때문에 set 크기를 절반으로 줄임
 	directory := internal.NewRECDirectory(
 		numSet, b.wayAssociativity, blockSize, int(b.log2NumSubEntry), int(b.log2BlockSize), vimctimFinder)
 

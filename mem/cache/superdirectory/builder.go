@@ -22,6 +22,8 @@ type Builder struct {
 	log2PageSize        uint64
 	log2NumSubEntry      uint64
 	fetchSingleCacheLine bool // true이면 miss 시 64B(1 cacheline)만 fetch
+	disableRSB           bool
+	disableCBF           bool
 
 	interleaving          bool
 	numInterleavingBlock  int
@@ -104,6 +106,21 @@ func (b Builder) WithLog2PageSize(n uint64) Builder {
 
 func (b Builder) WithLog2NumSubEntry(n uint64) Builder {
 	b.log2NumSubEntry = n
+	return b
+}
+
+func (b Builder) WithNumBanks(n int) Builder {
+	b.numBanks = n
+	return b
+}
+
+func (b Builder) WithDisableRSB(v bool) Builder {
+	b.disableRSB = v
+	return b
+}
+
+func (b Builder) WithDisableCBF(v bool) Builder {
+	b.disableCBF = v
 	return b
 }
 
@@ -268,7 +285,7 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 		// regionLen = {14, 12, 10, 8, 6}
 	}
 	directory := internal.NewSuperDirectory(
-		b.numBanks, numSet, b.wayAssociativity, blockSize, int(b.log2NumSubEntry), 64, vimctimFinder, regionLen)
+		b.numBanks, numSet, b.wayAssociativity, blockSize, int(b.log2NumSubEntry), 64, vimctimFinder, regionLen, b.disableCBF)
 
 	if b.interleaving {
 		directory.AddrConverter = &mem.InterleavingConverter{
@@ -308,7 +325,7 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.DirtyMask = b.dirtyMask
 	cacheModule.ReadMask = b.readMask
 
-	cacheModule.regionSizeBuffer = *internal.NewRegionSizeBuffer(64, b.log2PageSize, regionLen)
+	cacheModule.regionSizeBuffer = *internal.NewRegionSizeBuffer(64, b.log2PageSize, regionLen, b.disableRSB)
 
 	if b.eventLogger != nil {
 		cacheModule.eventLogger = b.eventLogger

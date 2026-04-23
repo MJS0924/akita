@@ -76,7 +76,7 @@ func newMockDir(getBankResult []int) *mockSuperDirectory {
 func newTestDirStage(dir *mockSuperDirectory, rsbRegionID int) *directoryStage {
 	// numEntries=1: Push evicts the zero-initialised slot, leaving only the
 	// actual entry and preventing spurious RSB hits on zero-valued entries.
-	rsb := internal.NewRegionSizeBuffer(1, testLog2PageSize, testRegionLen)
+	rsb := internal.NewRegionSizeBuffer(1, testLog2PageSize, testRegionLen, false)
 	if rsbRegionID >= 0 {
 		rsb.Push(testAddr, rsbRegionID)
 	}
@@ -263,7 +263,7 @@ func TestWriteToBank_BFEagerSuppression(t *testing.T) {
 	dir := newMockDir(nil)
 	ds := newTestDirStageForWriteToBank(dir)
 
-	block := &internal.CohEntry{}
+	block := &internal.CohEntry{SubEntry: make([]internal.CohSubEntry, 4)}
 	// SubEntry[0].IsValid = false → would normally trigger InsertBloomfilter
 
 	trans := &transaction{
@@ -284,7 +284,7 @@ func TestWriteToBank_BFInsert_WhenNotEager(t *testing.T) {
 	dir := newMockDir(nil)
 	ds := newTestDirStageForWriteToBank(dir)
 
-	block := &internal.CohEntry{}
+	block := &internal.CohEntry{SubEntry: make([]internal.CohSubEntry, 4)}
 	// SubEntry[0].IsValid = false, bfEagerInserted = false → insert expected
 
 	trans := &transaction{

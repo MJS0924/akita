@@ -102,6 +102,13 @@ type Comp struct {
 
 	cumulativeSnapshots []coalescabilitySnapshot
 	currentKernelID     int
+
+	// --- Exp-W: write workload tracking ---
+	writeEventCountKernel     int               // total write events in current kernel
+	sharerSetChurnCountKernel int               // times sharerSet[blockID] changed value this kernel
+	prevSharerSetKernel       map[uint64]uint64 // sharerSet at start of write event (for churn detection)
+	falseInvalidCountKernel   int               // writes to different GPUs in same 4-CL group
+	hmg4CLWritersKernel       map[uint64]uint64 // 4-CL group → union of writer GPU bits this kernel
 }
 
 func (c *Comp) SetAddressToPortMapper(lmf mem.AddressToPortMapper) {
@@ -132,7 +139,7 @@ func (m *middleware) Tick() bool {
 	// 	m.printMask = true
 	// 	// m.printReturn = true
 	// }
-	m.debugProcess = true
+	m.debugProcess = false
 	m.debugAddress = 12884921984
 
 	madeProgress := false
@@ -413,10 +420,32 @@ func (c *Comp) recordSharerRead(blockID uint64, gpuBit uint) {
 // recordSharerWrite is called on a write access (InvalidateAndUpdateEntry).
 // All other sharers are invalidated; the writer becomes the sole sharer.
 func (c *Comp) recordSharerWrite(blockID uint64, gpuBit uint) {
-	c.sharerSet[blockID] = uint64(1) << gpuBit
+	prevSet := c.sharerSet[blockID]
+	newSet := uint64(1) << gpuBit
+
+	// Exp-W: churn = sharerSet actually changes value
+	if prevSet != newSet {
+		c.sharerSetChurnCountKernel++
+	}
+	c.prevSharerSetKernel[blockID] = prevSet
+
+	c.sharerSet[blockID] = newSet
 	c.cohState[blockID] = 1
 	c.writeMaskKernel[blockID] = true
 	c.accessMaskKernel[blockID] = true
+	c.writeEventCountKernel++
+
+	// Exp-W: false invalidation detection (HMG 4-CL basis).
+	// A false invalidation occurs when two different GPUs write to different
+	// blocks within the same 4-CL group in the same kernel.
+	group4CL := blockID / 4
+	existingWriters := c.hmg4CLWritersKernel[group4CL]
+	writerBit := uint64(1) << gpuBit
+	if existingWriters != 0 && (existingWriters&writerBit) == 0 {
+		// A different GPU already wrote to this 4-CL group this kernel
+		c.falseInvalidCountKernel++
+	}
+	c.hmg4CLWritersKernel[group4CL] |= writerBit
 }
 
 // recordSharerInvalidate is called when a block is fully invalidated
@@ -437,8 +466,10 @@ func (c *Comp) gpuBitFromPort(srcPort sim.RemotePort) (uint, bool) {
 }
 
 // OnKernelBoundary is called by the runner at every kernel boundary.
-// It emits per-(view, R) coalescability metrics and resets kernel-local state.
+// It emits per-(view, R) coalescability metrics and write metrics, then
+// resets kernel-local state.
 func (c *Comp) OnKernelBoundary(simTime sim.VTimeInSec, kernelID int) {
+	c.emitWriteMetrics(simTime, kernelID)
 	c.emitCoalescabilityMetrics(simTime, kernelID)
 }
 

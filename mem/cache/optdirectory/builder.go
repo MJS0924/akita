@@ -322,6 +322,10 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.writeMaskKernel = make(map[uint64]bool)
 	cacheModule.accessMaskKernel = make(map[uint64]bool)
 
+	// Exp-W: write workload tracking
+	cacheModule.prevSharerSetKernel = make(map[uint64]uint64)
+	cacheModule.hmg4CLWritersKernel = make(map[uint64]uint64)
+
 	if len(b.regionSizesBytes) == 0 {
 		cacheModule.regionSizesBytes = []uint64{64, 256, 1024, 4096, 16384}
 	} else {

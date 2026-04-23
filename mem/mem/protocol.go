@@ -743,11 +743,12 @@ func (b ControlMsgBuilder) Build() *ControlMsg {
 type InvReq struct {
 	sim.MsgMeta
 
-	PID      vm.PID
-	Address  uint64
-	ReqFrom  string
-	DstRDMA  sim.RemotePort
-	RegionID int
+	PID        vm.PID
+	Address    uint64
+	ReqFrom    string
+	DstRDMA    sim.RemotePort
+	RegionID   int
+	IsWriteInv bool // true if caused by a write (vs. eviction/promotion/demotion)
 }
 
 // Meta returns the message meta.
@@ -775,12 +776,13 @@ func (r *InvReq) GetPID() vm.PID {
 
 // InvReqBuilder can build read requests.
 type InvReqBuilder struct {
-	src, dst sim.RemotePort
-	pid      vm.PID
-	address  uint64
-	reqFrom  string
-	dstRDMA  sim.RemotePort
-	RegionID int
+	src, dst   sim.RemotePort
+	pid        vm.PID
+	address    uint64
+	reqFrom    string
+	dstRDMA    sim.RemotePort
+	RegionID   int
+	isWriteInv bool
 }
 
 // WithSrc sets the source of the request to build.
@@ -824,6 +826,11 @@ func (b InvReqBuilder) WithRegionID(len int) InvReqBuilder {
 	return b
 }
 
+func (b InvReqBuilder) WithIsWriteInv(v bool) InvReqBuilder {
+	b.isWriteInv = v
+	return b
+}
+
 // Build creates a new InvReq
 func (b InvReqBuilder) Build() *InvReq {
 	r := &InvReq{}
@@ -837,6 +844,7 @@ func (b InvReqBuilder) Build() *InvReq {
 	r.ReqFrom = b.reqFrom
 	r.DstRDMA = b.dstRDMA
 	r.RegionID = b.RegionID
+	r.IsWriteInv = b.isWriteInv
 
 	return r
 }

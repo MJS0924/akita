@@ -331,7 +331,8 @@ func (pt *LevelPageTableImpl) Find(pid PID, Addr uint64) (Page, bool) {
 	var rslt Page
 
 	if pt.level == 1 {
-		page, found := pt.pageTable.find(Addr)
+		alignedAddr := (Addr >> pt.log2PageSize) << pt.log2PageSize
+		page, found := pt.pageTable.find(alignedAddr)
 		return page, found
 	} else {
 		var index uint64
