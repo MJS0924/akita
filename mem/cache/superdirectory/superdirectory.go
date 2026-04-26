@@ -104,6 +104,33 @@ type Comp struct {
 	remoteAcceptCount  uint64 // diagnostic: how many times acceptNewTransaction(false) fires
 	doWriteMissCount   uint64 // diagnostic: how many times doWriteMiss is reached
 	doWriteMissRemote  uint64 // diagnostic: doWriteMiss with fromLocal=false
+
+	// OP5 deviation regression slots (PHASE C-2). Increment sites are
+	// intentionally absent in the post-fix code: a non-zero value means
+	// either (a) a future change reintroduced the buggy branch and wired
+	// the counter back, or (b) someone added a new code path that
+	// re-exhibits the deviation. Either case is a regression.
+	op5aShortcutWithRemoteSharer uint64 // local write hit took the no-inv shortcut despite a remote sharer
+	// Note: superdirectory's OP5b is PROTOCOL-INTENTIONAL (paper-correct
+	// at the finest bank, by-design demote at coarser banks — see
+	// cross_model_op5_audit.md C1.3). This counter records the "writer
+	// cleared at finest bank" case only, which should never fire.
+	op5bWriterClearedAtFinestBank uint64
+}
+
+// ActionCounts returns the diagnostic counters in a uniform map for
+// summary.csv emission (matches the keys used by REC and optdirectory).
+// op5a_/op5b_ keys are PHASE C-2 regression slots and are expected to be 0
+// in the post-fix codebase.
+func (c *Comp) ActionCounts() map[string]uint64 {
+	return map[string]uint64{
+		"allocation_count":     c.allocationCount,
+		"remote_accept_count":  c.remoteAcceptCount,
+		"do_write_miss":        c.doWriteMissCount,
+		"do_write_miss_remote": c.doWriteMissRemote,
+		"op5a_shortcut_with_remote_sharer":     c.op5aShortcutWithRemoteSharer,
+		"op5b_writer_cleared_at_finest_bank":   c.op5bWriterClearedAtFinestBank,
+	}
 }
 
 func (c *Comp) AvgEvictUtilization() float64 {

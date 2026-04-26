@@ -830,11 +830,19 @@ func (ds *directoryStage) writePermission(trans *transaction, sharer []sim.Remot
 		return true
 
 	} else { // local access
-		if len(sharer) > 1 {
-			return false
-		}
-
-		return true
+		// Spec: local writes to remotely-shared data must propagate
+		// invalidations to every recorded sharer. Home GPU is excluded
+		// from the sharer list, so any present sharer is a remote GPU
+		// holding a stale copy. This decision is bank-agnostic — it
+		// applies to fine-bank and coarse-bank hits identically.
+		//
+		// Pre-fix code returned true here when len(sharer) <= 1, silently
+		// dropping the invalidation to a lone remote sharer.
+		// op5aShortcutWithRemoteSharer (Comp field) is the regression slot
+		// for that bug; if a future change reintroduces the shortcut, also
+		// reintroduce the increment site here so the post-C-2 sanity dump
+		// catches it.
+		return len(sharer) == 0
 	}
 }
 
