@@ -443,6 +443,12 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 		fmt.Printf("[%s] [directoryStage]\tInvalidation - 1.1: addr %x, ID %s\n", ds.cache.name, trans.invalidation.Address, req.ReqFrom)
 	}
 
+	ds.cache.InvokeHook(sim.HookCtx{
+		Domain: ds.cache,
+		Pos:    HookPosL2Invalidation,
+		Detail: L2InvalidationDetail{IsWriteInv: req.IsWriteInv, Addr: cachelineID},
+	})
+
 	return true
 }
 

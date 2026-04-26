@@ -153,6 +153,7 @@ func (bs *bottomSender) sendInvalidationRequest(
 			WithPID(trans.evictingPID).
 			WithReqFrom(trans.accessReq().Meta().ID).
 			WithDstRDMA(sh).
+			WithIsWriteInv(trans.action == InvalidateAndUpdateEntry).
 			Build()
 		err := bs.cache.topPort.Send(req)
 
@@ -209,6 +210,7 @@ func (bs *bottomSender) sendInvReqToBottom(req *mem.InvReq) bool {
 		WithPID(req.PID).
 		WithAddress(req.Address).
 		WithReqFrom(req.Meta().ID).
+		WithIsWriteInv(req.IsWriteInv).
 		Build()
 
 	err := bs.cache.bottomPort.Send(reqToBottom)

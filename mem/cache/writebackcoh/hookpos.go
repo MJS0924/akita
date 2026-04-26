@@ -12,6 +12,11 @@ var HookPosL2Access = &sim.HookPos{Name: "L2Access"}
 // ctx.Domain is *Comp; ctx.Detail is RegionFetchDetail.
 var HookPosRegionFetch = &sim.HookPos{Name: "RegionFetch"}
 
+// HookPosL2Invalidation fires in directoryStage.doInvalidation() when an
+// InvReq is successfully processed and the response sent.
+// ctx.Domain is *Comp; ctx.Detail is L2InvalidationDetail.
+var HookPosL2Invalidation = &sim.HookPos{Name: "L2Invalidation"}
+
 // L2AccessDetail carries the result of an L2 directory lookup.
 type L2AccessDetail struct {
 	Hit  bool
@@ -22,4 +27,10 @@ type L2AccessDetail struct {
 type RegionFetchDetail struct {
 	RegionTag       uint64 // cacheline-aligned address (= cacheLineID from fetch())
 	RegionSizeBytes uint64 // bytes per cacheline (= 1 << log2BlockSize)
+}
+
+// L2InvalidationDetail carries the result of an L2 invalidation.
+type L2InvalidationDetail struct {
+	IsWriteInv bool   // true = write-initiated; false = eviction-initiated
+	Addr       uint64 // cacheline-aligned address
 }
