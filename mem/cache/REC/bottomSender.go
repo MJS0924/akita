@@ -187,6 +187,12 @@ func (bs *bottomSender) processNewTransaction(trans *transaction, isLocal bool) 
 		progress = bs.sendInvalidationRequest(trans, isLocal)
 	case InvalidateAndUpdateEntry: // subentry 하나에 대한 invalidation
 		progress = bs.sendInvalidationRequestByWrite(trans, isLocal)
+	case RemoteWriteHitPreserveWriter:
+		// OP5b/REC fix: same wire behavior as InvalidateAndUpdateEntry
+		// (send invalidations to non-writer sharers carried in
+		// trans.invalidationList) but the directory state mutation in
+		// bankstage preserves the writer instead of clearing all sharers.
+		progress = bs.sendInvalidationRequestByWrite(trans, isLocal)
 	default:
 		panic("unknown transaction action")
 	}

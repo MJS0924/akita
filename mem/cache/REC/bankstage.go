@@ -231,6 +231,8 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 			done = s.UpdateEntry(trans, bottomSenderBuf, mshrStageBuf)
 		case InvalidateAndUpdateEntry:
 			done = s.InvalidateAndUpdateEntry(trans, bottomSenderBuf, mshrStageBuf)
+		case RemoteWriteHitPreserveWriter:
+			done = s.RemoteWriteHitPreserveWriter(trans, bottomSenderBuf, mshrStageBuf)
 		case InvalidateEntry:
 			done = s.InvalidateEntry(trans, bottomSenderBuf)
 		default:
@@ -362,6 +364,35 @@ func (s *bankStage) InvalidateAndUpdateEntry(trans *transaction, bottomSenderBuf
 			e.ReadCount = 0
 		}
 	}
+
+	return true
+}
+
+// RemoteWriteHitPreserveWriter handles a remote write request that hit an
+// existing valid offset. Per REC paper §4.2 "Remote writes" (p. 7): set the
+// source GPU's sharer bit, clear every other sharer bit, leave the offset's
+// position bit set, and leave the entry valid. The bottomSender then sends
+// invalidation messages to each *cleared* sharer (carried in
+// trans.invalidationList prepared by directoryStage.doWriteHit).
+//
+// This handler is the OP5b/REC fix counterpart of InvalidateAndUpdateEntry.
+// InvalidateAndUpdateEntry remains the local-write handler — it correctly
+// clears all sharers and may transition the offset/entry to invalid since
+// the home GPU is never in the sharer list per paper §2.3.
+func (s *bankStage) RemoteWriteHitPreserveWriter(trans *transaction, bottomSenderBuffer sim.Buffer, targetMshrBuf sim.Buffer) bool {
+	blk := trans.block
+	entry := &blk.SubEntry[trans.blockIdx]
+
+	// Writer becomes sole sharer; position bit and entry validity preserved.
+	writer := trans.accessReq().GetSrcRDMA()
+	entry.Sharer = entry.Sharer[:0]
+	entry.Sharer = append(entry.Sharer, writer)
+	entry.IsValid = true
+	entry.IsLocked = false
+	// blk.IsValid is intentionally NOT touched — entry remains valid.
+
+	bottomSenderBuffer.Push(trans)
+	targetMshrBuf.Push(trans)
 
 	return true
 }

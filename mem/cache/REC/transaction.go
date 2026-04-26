@@ -28,6 +28,17 @@ const (
 
 	QueryLowerBankForPromotion // [추가] 하위 뱅크에 Sharer 탐색 요청
 	PromotionGatherAck         // [추가] 하위 뱅크로부터 Sharer 수집 완료 응답
+
+	// RemoteWriteHitPreserveWriter handles a remote write request
+	// that hits an existing valid offset. Per REC paper §4.2, the
+	// writer becomes the sole sharer; the position bit stays set
+	// and the writer's sharer bit is preserved (NOT cleared as in
+	// InvalidateAndUpdateEntry). All other sharers receive
+	// invalidation messages. Producer site (replacing the prior
+	// InvalidateAndUpdateEntry emit for this case) is in
+	// directoryStage.doWriteHit; consumer site is the matching
+	// bankStage handler of the same name.
+	RemoteWriteHitPreserveWriter
 )
 
 type transaction struct {

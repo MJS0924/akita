@@ -257,6 +257,25 @@ func (ds *directoryStage) doWriteHit(
 
 	if ds.writePermission(trans, subEntry.Sharer) {
 		trans.action = Nothing
+	} else if !trans.fromLocal {
+		// Remote write hit on a valid offset: per REC paper §4.2,
+		// the writer becomes the sole sharer; the position bit and
+		// writer's sharer bit are preserved. This branch *moves* the
+		// emit from InvalidateAndUpdateEntry to the dedicated
+		// RemoteWriteHitPreserveWriter handler in bankstage; pre-fix
+		// REC clobbered both the writer and the position bit here.
+		trans.action = RemoteWriteHitPreserveWriter
+		// invalidationList must exclude the writer; bottomSender
+		// filters self-as-writer, but we set it explicitly for
+		// clarity at the producer site.
+		trans.invalidationList = make([]sim.RemotePort, 0, len(subEntry.Sharer))
+		for _, sh := range subEntry.Sharer {
+			if sh != trans.accessReq().GetSrcRDMA() && sh != "" {
+				trans.invalidationList = append(trans.invalidationList, sh)
+			}
+		}
+		trans.evictingAddr = block.Tag + uint64(index)*(1<<ds.cache.log2NumSubEntry)
+		trans.evictingPID = block.PID
 	} else {
 		trans.action = InvalidateAndUpdateEntry
 		trans.invalidationList = subEntry.Sharer
