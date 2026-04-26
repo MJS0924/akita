@@ -70,6 +70,7 @@ func (s *mshrStage) processOneReq() bool {
 		blk.Sharer = s.appendSharer(t.accessReq().GetSrcRDMA(), blk.Sharer)
 		t.action = Nothing
 		targetBuf.Push(t)
+		s.cache.mshrFwdCount++
 
 		// 처리 완료된 원소 제거
 		s.processingTrans.mshrEntry.Requests[0] = nil

@@ -109,6 +109,43 @@ type Comp struct {
 	prevSharerSetKernel       map[uint64]uint64 // sharerSet at start of write event (for churn detection)
 	falseInvalidCountKernel   int               // writes to different GPUs in same 4-CL group
 	hmg4CLWritersKernel       map[uint64]uint64 // 4-CL group → union of writer GPU bits this kernel
+
+	// --- Diagnostic counters (mirror REC for direct comparison) ---
+	actNothing       uint64
+	actInsertNew     uint64
+	actUpdate        uint64
+	actEvictInsert   uint64
+	actInvalidateEnt uint64
+	actInvUpdate     uint64
+	actBypass        uint64
+	bottomSendCount  uint64
+	mshrFwdCount     uint64
+
+	// Stall cause counters (mirrors REC for comparison)
+	stallMSHRFull       uint64
+	stallBlockLocked    uint64
+	stallBankFull       uint64
+	totalDoWriteCalls   uint64
+}
+
+// ActionCounts returns dispatch counts by transaction action type and the
+// total bottom-sender forwarding count and MSHR-stage forwarding count.
+func (c *Comp) ActionCounts() map[string]uint64 {
+	return map[string]uint64{
+		"act_Nothing":              c.actNothing,
+		"act_InsertNewEntry":       c.actInsertNew,
+		"act_UpdateEntry":          c.actUpdate,
+		"act_EvictAndInsertNew":    c.actEvictInsert,
+		"act_InvalidateEntry":      c.actInvalidateEnt,
+		"act_InvalidateAndUpdate":  c.actInvUpdate,
+		"act_BypassingDirectory":   c.actBypass,
+		"bottom_send_count":        c.bottomSendCount,
+		"mshr_forward_count":       c.mshrFwdCount,
+		"stall_mshr_full":          c.stallMSHRFull,
+		"stall_block_locked":       c.stallBlockLocked,
+		"stall_bank_full":          c.stallBankFull,
+		"total_dowrite_calls":      c.totalDoWriteCalls,
+	}
 }
 
 func (c *Comp) SetAddressToPortMapper(lmf mem.AddressToPortMapper) {

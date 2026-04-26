@@ -135,6 +135,7 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 }
 
 func (ds *directoryStage) doWrite(trans *transaction) bool {
+	ds.cache.totalDoWriteCalls++
 	req := trans.accessReq()
 	cachelineID, _ := getCacheLineID(req.GetAddress(), ds.cache.log2BlockSize+ds.cache.log2UnitSize)
 
@@ -207,6 +208,7 @@ func (ds *directoryStage) doWriteHit(
 	block *internal.Block,
 ) bool {
 	if block.IsLocked || block.ReadCount > 0 {
+		ds.cache.stallBlockLocked++
 		return false
 	}
 
@@ -307,10 +309,12 @@ func (ds *directoryStage) writeToBank(
 	}
 
 	if !bankBuf.CanPush() {
+		ds.cache.stallBankFull++
 		return false
 	}
 
 	if ds.cache.mshr.IsFull() {
+		ds.cache.stallMSHRFull++
 		return false
 	}
 

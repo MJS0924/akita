@@ -127,6 +127,9 @@ func (bs *bottomSender) processBypassReq() bool {
 	trans.reqToBottom = append(trans.reqToBottom, &req)
 	trans.ack++
 
+	bs.cache.actBypass++
+	bs.cache.bottomSendCount++
+
 	tracing.AddTaskStep(tracing.MsgIDAtReceiver(trans.accessReq(), bs.cache), bs.cache, "BypassToLocalL2")
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
@@ -185,6 +188,23 @@ func (bs *bottomSender) processNewTransaction(trans *transaction, isLocal bool) 
 	}
 
 	if progress {
+		switch trans.action {
+		case Nothing:
+			bs.cache.actNothing++
+		case InsertNewEntry:
+			bs.cache.actInsertNew++
+		case UpdateEntry:
+			bs.cache.actUpdate++
+		case EvictAndInsertNewEntry:
+			bs.cache.actEvictInsert++
+		case InvalidateEntry:
+			bs.cache.actInvalidateEnt++
+		case InvalidateAndUpdateEntry:
+			bs.cache.actInvUpdate++
+		}
+	}
+
+	if progress {
 		if bs.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == bs.cache.debugAddress {
 			if !isLocal {
 				fmt.Printf("[%s][DEBUG]\tReadReq received - 3, action %d: %x\n", bs.cache.name, trans.action, trans.accessReq().GetAddress())
@@ -227,6 +247,8 @@ func (bs *bottomSender) sendRequestToBottom(trans *transaction, isLocal bool) bo
 
 	trans.reqToBottom = append(trans.reqToBottom, &req)
 	trans.ack++
+
+	bs.cache.bottomSendCount++
 
 	what := "Nothing"
 	if trans.action != Nothing {
@@ -375,6 +397,7 @@ func (bs *bottomSender) sendInvalidationRequest(trans *transaction, isLocal bool
 				WithPID(trans.evictingPID).
 				WithReqFrom(trans.accessReq().Meta().ID).
 				WithDstRDMA(sh).
+				WithIsWriteInv(trans.action == InvalidateAndUpdateEntry).
 				Build()
 
 			bs.sendToTopQue = append(bs.sendToTopQue, req)
@@ -654,6 +677,7 @@ func (bs *bottomSender) processInvalidationReq() bool {
 			WithPID(req.PID).
 			WithAddress(req.Address).
 			WithReqFrom(req.Meta().ID).
+			WithIsWriteInv(req.IsWriteInv).
 			Build()
 
 		bs.remoteSendToBottomQue = append(bs.remoteSendToBottomQue, reqToBottom)
