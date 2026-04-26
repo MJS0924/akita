@@ -447,10 +447,18 @@ func (ds *directoryStage) writePermission(trans *transaction, sharer []sim.Remot
 		return true
 
 	} else { // local access
-		if len(sharer) > 1 {
-			return false
-		}
-
-		return true
+		// Paper §4.2 "Local writes": if any sharer is recorded, an
+		// invalidation must be sent. Home GPU is excluded from the
+		// sharer list per §2.3, so any present sharer is a remote
+		// GPU that holds a stale copy. Returning false here forces
+		// doWriteHit to emit InvalidateAndUpdateEntry.
+		//
+		// Pre-fix code returned true here when len(sharer) <= 1,
+		// silently leaving stale data on the lone remote sharer.
+		// op5aShortcutWithRemoteSharer (Comp field) is the regression
+		// slot for that bug; if a future change reintroduces the
+		// shortcut, also reintroduce the increment site here so the
+		// post-C-2 sanity dump catches it.
+		return len(sharer) == 0
 	}
 }

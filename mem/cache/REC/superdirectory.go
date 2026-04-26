@@ -121,6 +121,14 @@ type Comp struct {
 	stallSubEntryLocked uint64 // doWriteHit returned false because sub-entry IsLocked
 	stallBankFull      uint64 // writeToBank returned false because bankBuf.CanPush() == false
 	totalDoWriteCalls  uint64 // every call into doWrite (successful or not)
+
+	// OP5 deviation regression slots (PHASE C-2). Increment sites are
+	// intentionally absent in the post-fix code: a non-zero value means
+	// either (a) a future change reintroduced the buggy branch and wired
+	// the counter back, or (b) someone added a new code path that
+	// re-exhibits the deviation. Either case is a regression.
+	op5aShortcutWithRemoteSharer uint64 // local write hit took the no-inv shortcut despite a remote sharer (paper §4.2 OP5a)
+	op5bRemoteWriteHitClearedWriter uint64 // remote write hit on valid offset cleared the writer's sharer bit (paper §4.2 OP5b)
 }
 
 func (c *Comp) AvgEvictUtilization() float64 {
@@ -142,6 +150,8 @@ func (c *Comp) DiagCounts() (alloc, needEvict, silentReset, defCleanup, invSent,
 
 // ActionCounts returns dispatch counts by transaction action type and the
 // total bottom-sender forwarding count and MSHR-stage forwarding count.
+// op5a_/op5b_ keys are PHASE C-2 regression slots and are expected to be 0
+// in the post-fix codebase.
 func (c *Comp) ActionCounts() map[string]uint64 {
 	return map[string]uint64{
 		"act_Nothing":              c.actNothing,
@@ -157,6 +167,8 @@ func (c *Comp) ActionCounts() map[string]uint64 {
 		"stall_subentry_locked":    c.stallSubEntryLocked,
 		"stall_bank_full":          c.stallBankFull,
 		"total_dowrite_calls":      c.totalDoWriteCalls,
+		"op5a_shortcut_with_remote_sharer":   c.op5aShortcutWithRemoteSharer,
+		"op5b_remote_write_hit_cleared_writer": c.op5bRemoteWriteHitClearedWriter,
 	}
 }
 
