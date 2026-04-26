@@ -99,6 +99,11 @@ type Comp struct {
 
 	evictEntryUtilSum float64
 	evictEntryCount   uint64
+
+	allocationCount    uint64
+	remoteAcceptCount  uint64 // diagnostic: how many times acceptNewTransaction(false) fires
+	doWriteMissCount   uint64 // diagnostic: how many times doWriteMiss is reached
+	doWriteMissRemote  uint64 // diagnostic: doWriteMiss with fromLocal=false
 }
 
 func (c *Comp) AvgEvictUtilization() float64 {
@@ -112,10 +117,57 @@ func (c *Comp) EvictCount() uint64 {
 	return c.evictEntryCount
 }
 
+// AllocationCount returns the total number of directory entries allocated during the simulation.
+func (c *Comp) AllocationCount() uint64 {
+	return c.allocationCount
+}
+
+// DiagCounts returns diagnostic counters for investigation.
+func (c *Comp) DiagCounts() (remoteAccept, doWriteMiss, doWriteMissRemote uint64) {
+	return c.remoteAcceptCount, c.doWriteMissCount, c.doWriteMissRemote
+}
+
 // EventLogger returns the EventLogger attached to this cache component.
 // The caller can call Enable() on it before simulation starts, and read
 // Events() after simulation completes.
 func (c *Comp) EventLogger() *EventLogger { return c.eventLogger }
+
+// BankEntryCount returns the number of valid entries in bankID.
+// Safe to call only between simulation ticks (SerialEngine guarantee).
+func (c *Comp) BankEntryCount(bankID int) int {
+	banks := c.directory.GetBanks()
+	if bankID < 0 || bankID >= len(banks) {
+		return 0
+	}
+	count := 0
+	for _, set := range banks[bankID] {
+		for _, entry := range set.CohEntries {
+			if entry.IsValidEntry() {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// BankMaxCapacity returns the maximum number of entries (sets × ways) in bankID.
+func (c *Comp) BankMaxCapacity(bankID int) int {
+	banks := c.directory.GetBanks()
+	if bankID < 0 || bankID >= len(banks) {
+		return 0
+	}
+	total := 0
+	for _, set := range banks[bankID] {
+		total += len(set.CohEntries)
+	}
+	return total
+}
+
+// NumBanks returns the number of banks in this superdirectory.
+func (c *Comp) NumBanks() int { return c.numBanks }
+
+// DeviceID returns the GPU device ID this superdirectory belongs to.
+func (c *Comp) DeviceID() int { return c.deviceID }
 
 func (c *Comp) SetAddressToPortMapper(lmf mem.AddressToPortMapper) {
 	c.addressToPortMapper = lmf

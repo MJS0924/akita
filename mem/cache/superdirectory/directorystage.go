@@ -69,6 +69,9 @@ func (ds *directoryStage) acceptNewTransaction(fromLocal bool) bool {
 		if item == nil {
 			break
 		}
+		if !fromLocal {
+			ds.cache.remoteAcceptCount++
+		}
 		trans := item.(*transaction)
 		req := trans.accessReq()
 
@@ -612,6 +615,10 @@ func (ds *directoryStage) doWriteHit(
 }
 
 func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
+	ds.cache.doWriteMissCount++
+	if !trans.fromLocal {
+		ds.cache.doWriteMissRemote++
+	}
 	*ds.returnFalse += "[doWriteMiss] "
 	targetBuffer := ds.cache.localBottomSenderBuffer
 	if !isLocal {
@@ -765,6 +772,7 @@ func (ds *directoryStage) writeToBank(
 	subEntry.IsValid = true
 	trans.block = block
 	trans.blockIdx = index
+	ds.cache.allocationCount++
 
 	bankBuf.Push(trans)
 
