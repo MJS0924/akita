@@ -94,6 +94,33 @@ type Comp struct {
 
 	evictEntryUtilSum float64
 	evictEntryCount   uint64
+
+	// Diagnostic counters for silent eviction analysis
+	allocCount             uint64 // FindVictim returned alloc=true (need to allocate new slot)
+	needEvictionCount      uint64 // alloc=true && needEviction=true (real eviction with sharers)
+	silentResetCount       uint64 // alloc=true && needEviction=false (Reset clears entry without inv)
+	defensiveCleanupCount  uint64 // "혹시 몰라서" loop in InvalidateAndUpdateEntry fired
+	invSentCount           uint64 // sendInvalidationRequest sent at least one inv message
+	invSkippedSelfOnlyCount uint64 // sendInvalidationRequest had no targets (only-self sharer)
+
+	// Per-action dispatch counts (counted when transaction successfully advances)
+	actNothing       uint64
+	actInsertNew     uint64
+	actUpdate        uint64
+	actEvictInsert   uint64
+	actInvalidateEnt uint64
+	actInvUpdate     uint64
+	actBypass        uint64
+
+	// Forwarding counts: how many requests actually reach L2 / RDMA
+	bottomSendCount uint64 // sendRequestToBottom returned true
+	mshrFwdCount    uint64 // mshrStage pushed a coalesced request to bottomSenderBuffer
+
+	// Stall cause counters (to diagnose high dir_avg_latency)
+	stallMSHRFull      uint64 // writeToBank returned false due to MSHR full
+	stallSubEntryLocked uint64 // doWriteHit returned false because sub-entry IsLocked
+	stallBankFull      uint64 // writeToBank returned false because bankBuf.CanPush() == false
+	totalDoWriteCalls  uint64 // every call into doWrite (successful or not)
 }
 
 func (c *Comp) AvgEvictUtilization() float64 {
@@ -105,6 +132,32 @@ func (c *Comp) AvgEvictUtilization() float64 {
 
 func (c *Comp) EvictCount() uint64 {
 	return c.evictEntryCount
+}
+
+// DiagCounts returns the silent-eviction diagnostic counters.
+func (c *Comp) DiagCounts() (alloc, needEvict, silentReset, defCleanup, invSent, invSkippedSelf uint64) {
+	return c.allocCount, c.needEvictionCount, c.silentResetCount,
+		c.defensiveCleanupCount, c.invSentCount, c.invSkippedSelfOnlyCount
+}
+
+// ActionCounts returns dispatch counts by transaction action type and the
+// total bottom-sender forwarding count and MSHR-stage forwarding count.
+func (c *Comp) ActionCounts() map[string]uint64 {
+	return map[string]uint64{
+		"act_Nothing":              c.actNothing,
+		"act_InsertNewEntry":       c.actInsertNew,
+		"act_UpdateEntry":          c.actUpdate,
+		"act_EvictAndInsertNew":    c.actEvictInsert,
+		"act_InvalidateEntry":      c.actInvalidateEnt,
+		"act_InvalidateAndUpdate":  c.actInvUpdate,
+		"act_BypassingDirectory":   c.actBypass,
+		"bottom_send_count":        c.bottomSendCount,
+		"mshr_forward_count":       c.mshrFwdCount,
+		"stall_mshr_full":          c.stallMSHRFull,
+		"stall_subentry_locked":    c.stallSubEntryLocked,
+		"stall_bank_full":          c.stallBankFull,
+		"total_dowrite_calls":      c.totalDoWriteCalls,
+	}
 }
 
 func (c *Comp) SetAddressToPortMapper(lmf mem.AddressToPortMapper) {

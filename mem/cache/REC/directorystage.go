@@ -133,11 +133,17 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 
 func (ds *directoryStage) doWrite(trans *transaction, isLocal bool) bool {
 	*ds.returnFalse += "[doWrite] "
+	ds.cache.totalDoWriteCalls++
 	// regionLen := ds.cache.log2BlockSize + uint64(ds.cache.log2NumSubEntry)
 	req := trans.accessReq()
 	// cachelineID, _ := getCacheLineID(req.GetAddress(), uint64(regionLen)) // 하위 영역은 0으로 지우기
 
-	mshrEntry := ds.cache.mshr.Query(req.GetPID(), req.GetAddress())
+	// MSHR is keyed at 64B granularity: the paper's REC design handles each
+	// incoming request with an immediate bitwise OR on position bits (§4.2),
+	// with no serialization between different sub-entries in the same 1KB block.
+	// Each sub-entry fetch is independent, so each 64B address gets its own entry.
+	cachelineID, _ := getCacheLineID(req.GetAddress(), ds.cache.log2BlockSize)
+	mshrEntry := ds.cache.mshr.Query(req.GetPID(), cachelineID)
 	if mshrEntry != nil {
 		if trans.write != nil { // write 인 경우, MSHR hit이 발생하면 처리 x
 			*ds.returnFalse += "MSHR hit for write request"
@@ -235,6 +241,7 @@ func (ds *directoryStage) doWriteHit(
 	subEntry := block.SubEntry[index]
 	if subEntry.IsLocked || subEntry.ReadCount > 0 {
 		*ds.returnFalse += "Subentry is being used"
+		ds.cache.stallSubEntryLocked++
 		return false
 	}
 
@@ -312,15 +319,19 @@ func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
 
 	if victim.IsLockedEntry() || victim.GetReadCount() > 0 {
 		*ds.returnFalse += "Victim is being used"
+		ds.cache.stallMSHRFull++ // repurpose: counts victim-locked stalls too
 		return false
 	}
 
+	ds.cache.allocCount++
 	if ds.needEviction(victim) {
+		ds.cache.needEvictionCount++
 		trans.action = EvictAndInsertNewEntry
 		trans.victim = *victim.DeepCopy()
 		trans.evictingAddr = victim.Tag
 		trans.evictingPID = victim.PID
 	} else {
+		ds.cache.silentResetCount++
 		trans.action = InsertNewEntry
 	}
 
@@ -357,11 +368,13 @@ func (ds *directoryStage) writeToBank(
 
 	if !bankBuf.CanPush() {
 		*ds.returnFalse += "Cannot push to bank buffer"
+		ds.cache.stallBankFull++
 		return false
 	}
 
 	if ds.cache.mshr.IsFull() {
 		*ds.returnFalse += "MSHR is full"
+		ds.cache.stallMSHRFull++
 		return false
 	}
 

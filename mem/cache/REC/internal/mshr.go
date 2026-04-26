@@ -39,10 +39,13 @@ type MSHR interface {
 	Reset()
 }
 
-// NewMSHR returns a new MSHR object
-func NewMSHR(capacity int) MSHR {
+// NewMSHR returns a new MSHR object. log2BlockSize is used to mask request
+// addresses so all lookups, inserts, and removals operate at sub-entry
+// (single block) granularity.
+func NewMSHR(capacity int, log2BlockSize int) MSHR {
 	m := new(mshrImpl)
 	m.capacity = capacity
+	m.log2BlockSize = log2BlockSize
 
 	return m
 }

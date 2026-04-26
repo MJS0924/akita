@@ -260,7 +260,7 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 		}
 	}
 
-	mshr := internal.NewMSHR(b.numMSHREntry)
+	mshr := internal.NewMSHR(b.numMSHREntry, int(b.log2BlockSize))
 	storage := mem.NewStorage(b.byteSize)
 
 	cacheModule.log2BlockSize = b.log2BlockSize

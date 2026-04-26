@@ -81,6 +81,7 @@ func (s *mshrStage) processOneReq() bool {
 		}
 
 		targetBuf.Push(t)
+		s.cache.mshrFwdCount++
 
 		// 처리 완료된 원소를 배열에서 안전하게 제거
 		trans.mshrEntry.Requests[0] = nil

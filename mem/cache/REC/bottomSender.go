@@ -135,6 +135,9 @@ func (bs *bottomSender) processBypassReq() bool {
 	trans.reqToBottom = append(trans.reqToBottom, &req)
 	trans.ack++
 
+	bs.cache.actBypass++
+	bs.cache.bottomSendCount++
+
 	tracing.AddTaskStep(tracing.MsgIDAtReceiver(trans.accessReq(), bs.cache), bs.cache, "BypassToLocalL2")
 	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
@@ -187,6 +190,22 @@ func (bs *bottomSender) processNewTransaction(trans *transaction, isLocal bool) 
 	default:
 		panic("unknown transaction action")
 	}
+	if progress {
+		switch trans.action {
+		case Nothing:
+			bs.cache.actNothing++
+		case InsertNewEntry:
+			bs.cache.actInsertNew++
+		case UpdateEntry:
+			bs.cache.actUpdate++
+		case EvictAndInsertNewEntry:
+			bs.cache.actEvictInsert++
+		case InvalidateEntry:
+			bs.cache.actInvalidateEnt++
+		case InvalidateAndUpdateEntry:
+			bs.cache.actInvUpdate++
+		}
+	}
 
 	// if progress {
 	// 	temp := bs.cache.bottomSenderBuffer.Pop().(*transaction)
@@ -237,6 +256,8 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 		bs.remoteInflightRequest = append(bs.remoteInflightRequest, trans)
 	}
 
+	bs.cache.bottomSendCount++
+
 	// 동일한 region에 속한 영역에 대해 read request 전송
 	if trans.read == nil {
 		return true
@@ -273,9 +294,13 @@ func (bs *bottomSender) sendInvalidationRequest(
 
 	// 2. [대상 선별] victim.SubEntry를 순회하며 실제로 무효화 메시지를 보낼 외부 노드가 있는지 검사
 	hasValidTargets := false
+	hasAnySharer := false
 	victim := &trans.victim
 	for i := 0; i < len(victim.SubEntry); i++ {
 		for _, sh := range victim.SubEntry[i].Sharer {
+			if sh != "" {
+				hasAnySharer = true
+			}
 			if sh != trans.accessReq().GetSrcRDMA() && sh != "" {
 				hasValidTargets = true
 				break
@@ -283,6 +308,14 @@ func (bs *bottomSender) sendInvalidationRequest(
 		}
 		if hasValidTargets {
 			break
+		}
+	}
+	if trans.action == EvictAndInsertNewEntry || trans.action == InvalidateAndUpdateEntry {
+		if hasValidTargets {
+			bs.cache.invSentCount++
+		} else if hasAnySharer {
+			// sharer existed but every one was the requester itself → silently dropped
+			bs.cache.invSkippedSelfOnlyCount++
 		}
 	}
 
@@ -444,6 +477,7 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 				WithPID(trans.write.PID).
 				WithReqFrom(trans.accessReq().Meta().ID).
 				WithDstRDMA(sh).
+				WithIsWriteInv(true).
 				Build()
 
 			bs.sendToTopQue = append(bs.sendToTopQue, req)
@@ -500,6 +534,7 @@ func (bs *bottomSender) processInvalidationReq() bool {
 		WithPID(req.PID).
 		WithAddress(addr).
 		WithReqFrom(req.Meta().ID).
+		WithIsWriteInv(req.IsWriteInv).
 		Build()
 	bs.sendToRemoteBottomQue = append(bs.sendToRemoteBottomQue, reqToBottom)
 

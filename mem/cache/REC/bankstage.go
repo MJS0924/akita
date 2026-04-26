@@ -353,6 +353,9 @@ func (s *bankStage) InvalidateAndUpdateEntry(trans *transaction, bottomSenderBuf
 			}
 
 			e := &blk.SubEntry[i]
+			if len(e.Sharer) > 0 {
+				s.cache.defensiveCleanupCount++
+			}
 			e.Sharer = e.Sharer[:0]
 			e.IsDirty = false
 			e.IsLocked = false
