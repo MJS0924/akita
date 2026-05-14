@@ -23,7 +23,13 @@ func (i dirPipelineItem) TaskID() string {
 type directoryStage struct {
 	cache    *Comp
 	pipeline pipelining.Pipeline
-	buf      sim.Buffer
+	// snoopPipeline carries invalidation requests through an extended
+	// (dirLatency + snoopLatency) stage chain so that wasted invalidations
+	// pay the same floor cost as productive ones. nil when snoopLatency==0,
+	// in which case invalidations share `pipeline` and behavior is
+	// indistinguishable from the historical implementation.
+	snoopPipeline pipelining.Pipeline
+	buf           sim.Buffer
 
 	lastReturnValue bool
 	returnFalse     string
@@ -35,6 +41,15 @@ func (ds *directoryStage) Tick() (madeProgress bool) {
 	madeProgress = ds.acceptNewTransaction() || madeProgress
 
 	madeProgress = ds.pipeline.Tick() || madeProgress
+
+	if ds.snoopPipeline != nil {
+		// Tick the snoop pipeline every cycle even when it currently holds
+		// no items; the pipelining package treats empty stages as a no-op
+		// and returns false, so this only contributes madeProgress while an
+		// inv is in flight. That guarantee is what keeps the cache from
+		// going to sleep before a deferred inv can fire.
+		madeProgress = ds.snoopPipeline.Tick() || madeProgress
+	}
 
 	madeProgress = ds.processTransaction() || madeProgress
 
@@ -95,17 +110,23 @@ func (ds *directoryStage) acceptNewTransaction() bool {
 	madeProgress := false
 
 	for i := 0; i < ds.cache.numReqPerCycle; i++ {
-		if !ds.pipeline.CanAccept() {
-			break
-		}
-
 		item := ds.cache.dirStageBuffer.Peek()
 		if item == nil {
 			break
 		}
 
 		trans := item.(*transaction)
-		ds.pipeline.Accept(dirPipelineItem{trans})
+
+		targetPipeline := ds.pipeline
+		if trans.invalidation != nil && ds.snoopPipeline != nil {
+			targetPipeline = ds.snoopPipeline
+		}
+
+		if !targetPipeline.CanAccept() {
+			break
+		}
+
+		targetPipeline.Accept(dirPipelineItem{trans})
 		ds.cache.dirStageBuffer.Pop()
 
 		madeProgress = true
@@ -116,6 +137,9 @@ func (ds *directoryStage) acceptNewTransaction() bool {
 
 func (ds *directoryStage) Reset() {
 	ds.pipeline.Clear()
+	if ds.snoopPipeline != nil {
+		ds.snoopPipeline.Clear()
+	}
 	ds.buf.Clear()
 	ds.cache.dirStageBuffer.Clear()
 }

@@ -131,30 +131,61 @@ func (s *mshrStage) processOneReq() bool {
 
 	// if trans.action == InvalidateAndUpdateEntry && trans.bankID != s.cache.numBanks-1 && len(trans.invalidationList) != 0 {
 	if trans.action == InvalidateAndUpdateEntry && trans.needToDemotion {
-		// mshr.Add는 regionLen[bankID]를 mask로 사용하므로, QueryWithMask도 동일한 값을 써야
-		// 충돌 검사가 일치한다. regionLen[bankID+1](하위 뱅크, 더 작은 값)을 쓰면 Add가
-		// 잡아내는 충돌을 QueryWithMask가 놓쳐 "entry already in mshr" panic이 발생한다.
-		list := s.cache.mshr.QueryWithMask(trans.mshrEntry.PID, trans.mshrEntry.Address, uint64(s.cache.regionLen[trans.bankID]))
-		if len(list) == 0 {
-			s.demotionQueue = append(s.demotionQueue, trans)
-
-			trans.block.SubEntry[trans.blockIdx].IsValid = false
-			s.updateBloomFilter(trans.mshrEntry.Address, trans.bankID, false)
-			entry := s.cache.mshr.Add(trans.mshrEntry.PID, trans.mshrEntry.Address, uint64(s.cache.regionLen[trans.bankID]), trans.bankID+1)
-			// demotion 이전 구간 길이로 entry를 생성하지 않으면 4개의 entry를 삽입해야 함..
-			entry.IsDemotion = true
-			trans.mshrEntry = entry
-
+		// H3e fix: if the source entry was itself created by a demote, skip the
+		// cascading demote and convert to invalidate-only. The triggering
+		// sub-entry has already been invalidated by bankStage.InvalidateAndUpdateEntry
+		// (Path B, sharer cleared, IsValid=false); the outbound invalidation
+		// messages to remote sharers are emitted independently from
+		// directoryStage / bottomSender via trans.invalidationList. Skipping
+		// the demote queue therefore preserves coherence while preventing
+		// a deeper bank descent. The lock is released so the next demote
+		// trigger on the same entry proceeds normally.
+		if !s.cache.disableDemoteLock && trans.block.DemoteLocked {
+			trans.block.DemoteLocked = false
+			s.cache.demoteLockHits++
 			if s.cache.debugPromotion {
-				fmt.Printf("[%s]\tStart Demotion: Addr %x, from local %t\n", s.cache.name, entry.Address, trans.fromLocal)
+				fmt.Printf("[%s]\tDemote skipped (lock): Addr %x, bank %d\n",
+					s.cache.name, trans.mshrEntry.Address, trans.bankID)
 			}
 		} else {
-			fmt.Printf("[%s]\t[WARNING] Waiting for mshr entry before demotion\n", s.cache.name)
+			// mshr.Add는 regionLen[bankID]를 mask로 사용하므로, QueryWithMask도 동일한 값을 써야
+			// 충돌 검사가 일치한다. regionLen[bankID+1](하위 뱅크, 더 작은 값)을 쓰면 Add가
+			// 잡아내는 충돌을 QueryWithMask가 놓쳐 "entry already in mshr" panic이 발생한다.
+			list := s.cache.mshr.QueryWithMask(trans.mshrEntry.PID, trans.mshrEntry.Address, uint64(s.cache.regionLen[trans.bankID]))
+			if len(list) == 0 {
+				s.demotionQueue = append(s.demotionQueue, trans)
+
+				trans.block.SubEntry[trans.blockIdx].IsValid = false
+				s.updateBloomFilter(trans.mshrEntry.Address, trans.bankID, false)
+				entry := s.cache.mshr.Add(trans.mshrEntry.PID, trans.mshrEntry.Address, uint64(s.cache.regionLen[trans.bankID]), trans.bankID+1)
+				// demotion 이전 구간 길이로 entry를 생성하지 않으면 4개의 entry를 삽입해야 함..
+				entry.IsDemotion = true
+				trans.mshrEntry = entry
+
+				if s.cache.debugPromotion {
+					fmt.Printf("[%s]\tStart Demotion: Addr %x, from local %t\n", s.cache.name, entry.Address, trans.fromLocal)
+				}
+			} else {
+				fmt.Printf("[%s]\t[WARNING] Waiting for mshr entry before demotion\n", s.cache.name)
+			}
 		}
 
-	} else if trans.block.AbleToPromotion() && trans.bankID != 0 {
+	} else if s.canPromote(trans.block) && trans.bankID != 0 {
 		list := s.cache.mshr.QueryWithMask(trans.mshrEntry.PID, trans.mshrEntry.Address, uint64(s.cache.regionLen[trans.bankID-1]))
 		if len(list) == 0 {
+			// Capture sharers BEFORE clearing IsValid. insertPromotionEntry
+			// runs in a later tick and would otherwise see all sub.IsValid=false,
+			// causing SharerUnion() to return [] and the promoted entry to be
+			// allocated with empty sharers.
+			var captured []sim.RemotePort
+			if s.cache.promoteRelaxed {
+				captured = trans.block.SharerUnion()
+			} else {
+				captured = trans.block.SubEntry[0].Sharer
+			}
+			trans.capturedPromoteSharers = make([]sim.RemotePort, len(captured))
+			copy(trans.capturedPromoteSharers, captured)
+
 			s.promotionQueue = append(s.promotionQueue, trans)
 
 			trans.block.IsValid = false
@@ -173,6 +204,18 @@ func (s *mshrStage) processOneReq() bool {
 	}
 
 	return progress
+}
+
+// canPromote selects the strict or relaxed promotion eligibility check
+// based on the runtime flag. Relaxed lets a coarsened block return to a
+// finer bank when most sub-entries agree on sharers (vs. strict's
+// all-must-be-identical), which is necessary to recover finer R after a
+// phase change.
+func (s *mshrStage) canPromote(blk *internal.CohEntry) bool {
+	if s.cache.promoteRelaxed {
+		return blk.AbleToPromotionRelaxed()
+	}
+	return blk.AbleToPromotion()
 }
 
 func (s *mshrStage) processOneReqAfterPromotion() bool {
@@ -253,9 +296,20 @@ func (s *mshrStage) processOneReqAfterPromotion() bool {
 		fmt.Printf("\n")
 	}
 
-	if trans.block.AbleToPromotion() && trans.bankID != 0 {
+	if s.canPromote(trans.block) && trans.bankID != 0 {
 		list := s.cache.mshr.QueryWithMask(trans.mshrEntry.PID, trans.mshrEntry.Address, uint64(s.cache.regionLen[trans.bankID-1]))
 		if len(list) == 0 {
+			// Capture sharers BEFORE clearing IsValid (same fix as in
+			// processOneReq — see comment there).
+			var captured []sim.RemotePort
+			if s.cache.promoteRelaxed {
+				captured = trans.block.SharerUnion()
+			} else {
+				captured = trans.block.SubEntry[0].Sharer
+			}
+			trans.capturedPromoteSharers = make([]sim.RemotePort, len(captured))
+			copy(trans.capturedPromoteSharers, captured)
+
 			s.promotionQueue = append(s.promotionQueue, trans)
 
 			trans.block.IsValid = false
@@ -404,7 +458,11 @@ func (s *mshrStage) insertPromotionEntry() bool {
 		return false
 	}
 
-	originalSharers := trans.block.SubEntry[0].Sharer
+	// Use sharers captured at queue-time (in processOneReq /
+	// processOneReqAfterPromotion) BEFORE the source block's sub.IsValid was
+	// cleared. Recomputing here via SharerUnion() would return [] because
+	// SharerUnion only iterates valid sub-entries.
+	originalSharers := trans.capturedPromoteSharers
 	copiedSharers := make([]sim.RemotePort, len(originalSharers))
 	copy(copiedSharers, originalSharers)
 

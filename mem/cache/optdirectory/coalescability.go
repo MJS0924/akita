@@ -477,3 +477,181 @@ func popcount64(x uint64) int {
 	}
 	return n
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Sharer heatmap (per-window cacheline × time visualization)
+//
+// When `sharerHeatmapEnabled` is true, every recordSharer{Read,Write} also
+// bumps `accessMaskWindow[blockID]`. The runner calls
+// `EmitWindowSharerHeatmap` at every instruction-window boundary, which:
+//   1. Iterates accessed blocks in sorted order
+//   2. Run-length-encodes consecutive blocks that have the same sharer set
+//   3. Writes one CSV row per uniform run
+//   4. Clears accessMaskWindow for the next window
+//
+// `EmitTopAccessCounts` is invoked once at simulation end and dumps each
+// block's cumulative access count so downstream analysis can pick top-K
+// hottest blocks for visualization.
+// ─────────────────────────────────────────────────────────────────────────
+
+// sharer heatmap CSV header. RLE rows describe the sharer set of every
+// block in [block_start, block_end] (inclusive).
+const sharerHeatmapHeader = "window_idx,block_start,block_end," +
+	"sharer_set,access_count,popcount\n"
+
+// SetSharerHeatmapEnabled wires the heatmap dump on/off after the Comp is
+// built. Called by the runner when -coalescability-heatmap is set.
+func (c *Comp) SetSharerHeatmapEnabled(enabled bool) {
+	c.sharerHeatmapEnabled = enabled
+	if enabled {
+		c.accessMaskWindow = make(map[uint64]uint32)
+		c.blockTotalAccess = make(map[uint64]uint64)
+	} else {
+		c.accessMaskWindow = nil
+		c.blockTotalAccess = nil
+	}
+}
+
+// SharerHeatmapEnabled reports whether sharer heatmap collection is on.
+func (c *Comp) SharerHeatmapEnabled() bool { return c.sharerHeatmapEnabled }
+
+// openSharerHeatmapCSV opens (lazily) the per-GPU heatmap CSV file. Path
+// is "<dir>/sharer_heatmap_GPU<deviceID>.csv".
+func (c *Comp) openSharerHeatmapCSV(dir string) error {
+	if c.heatmapCSVFile != nil {
+		return nil
+	}
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("sharer heatmap mkdir %s: %w", dir, err)
+	}
+	path := fmt.Sprintf("%s/sharer_heatmap_GPU%d.csv", dir, c.deviceID)
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("sharer heatmap create %s: %w", path, err)
+	}
+	if _, err := f.WriteString(sharerHeatmapHeader); err != nil {
+		f.Close()
+		return fmt.Errorf("sharer heatmap header write %s: %w", path, err)
+	}
+	c.heatmapCSVFile = f
+	return nil
+}
+
+// EmitWindowSharerHeatmap writes a RLE-compressed dump of the current
+// window's accessed blocks to the per-GPU heatmap CSV, then resets the
+// per-window access mask. Output dir is created on first call.
+//
+// RLE rule: consecutive blockIDs with identical sharerSet collapse into a
+// single row [block_start, block_end].
+//
+// Returns the number of (compressed) rows written.
+func (c *Comp) EmitWindowSharerHeatmap(windowID int, dir string) (int, error) {
+	if !c.sharerHeatmapEnabled {
+		return 0, nil
+	}
+	if err := c.openSharerHeatmapCSV(dir); err != nil {
+		return 0, err
+	}
+
+	if len(c.accessMaskWindow) == 0 {
+		c.heatmapWindowID = windowID + 1
+		return 0, nil
+	}
+
+	// Sort accessed blockIDs ascending so we can detect adjacency.
+	blocks := make([]uint64, 0, len(c.accessMaskWindow))
+	for b := range c.accessMaskWindow {
+		blocks = append(blocks, b)
+	}
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
+
+	rowsWritten := 0
+	i := 0
+	for i < len(blocks) {
+		startBlock := blocks[i]
+		startSharer := c.sharerSet[startBlock]
+		runAccessCount := uint64(c.accessMaskWindow[startBlock])
+
+		j := i + 1
+		for j < len(blocks) &&
+			blocks[j] == blocks[j-1]+1 &&
+			c.sharerSet[blocks[j]] == startSharer {
+			runAccessCount += uint64(c.accessMaskWindow[blocks[j]])
+			j++
+		}
+		endBlock := blocks[j-1]
+
+		_, err := fmt.Fprintf(c.heatmapCSVFile,
+			"%d,%d,%d,%d,%d,%d\n",
+			windowID, startBlock, endBlock,
+			startSharer, runAccessCount, popcount64(startSharer))
+		if err != nil {
+			return rowsWritten, fmt.Errorf("sharer heatmap write: %w", err)
+		}
+		rowsWritten++
+		i = j
+	}
+
+	// Reset per-window mask (block totals persist across run).
+	for k := range c.accessMaskWindow {
+		delete(c.accessMaskWindow, k)
+	}
+	c.heatmapWindowID = windowID + 1
+	return rowsWritten, nil
+}
+
+// EmitTopAccessCounts dumps cumulative per-block access counts to a
+// companion CSV ("<dir>/sharer_heatmap_GPU<id>_blocks.csv"). Called once
+// at simulation end so downstream tooling can pick top-K hottest blocks
+// without a second simulation pass.
+func (c *Comp) EmitTopAccessCounts(dir string) error {
+	if !c.sharerHeatmapEnabled {
+		return nil
+	}
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("block-access mkdir %s: %w", dir, err)
+	}
+	path := fmt.Sprintf("%s/sharer_heatmap_GPU%d_blocks.csv", dir, c.deviceID)
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("block-access create %s: %w", path, err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString("block_id,total_access_count,final_sharer_set,final_popcount\n"); err != nil {
+		return fmt.Errorf("block-access header: %w", err)
+	}
+
+	// Sort by access count descending so top-K is just head of file.
+	blocks := make([]uint64, 0, len(c.blockTotalAccess))
+	for b := range c.blockTotalAccess {
+		blocks = append(blocks, b)
+	}
+	sort.Slice(blocks, func(i, j int) bool {
+		return c.blockTotalAccess[blocks[i]] > c.blockTotalAccess[blocks[j]]
+	})
+
+	for _, b := range blocks {
+		if _, err := fmt.Fprintf(f, "%d,%d,%d,%d\n",
+			b, c.blockTotalAccess[b],
+			c.sharerSet[b], popcount64(c.sharerSet[b])); err != nil {
+			return fmt.Errorf("block-access row: %w", err)
+		}
+	}
+	return nil
+}
+
+// CloseSharerHeatmap flushes and closes the heatmap CSV. Safe to call
+// repeatedly; idempotent when no file is open.
+func (c *Comp) CloseSharerHeatmap() {
+	if c.heatmapCSVFile != nil {
+		c.heatmapCSVFile.Close()
+		c.heatmapCSVFile = nil
+	}
+}

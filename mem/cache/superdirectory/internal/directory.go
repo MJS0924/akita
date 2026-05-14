@@ -28,6 +28,12 @@ type CohEntry struct {
 	CacheAddress uint64
 	SubEntry     []CohSubEntry // length = 1 << log2NumSubEntry
 	IsValid      bool
+	// DemoteLocked is set true when this entry was created by a demote.
+	// While set, a subsequent demote trigger on this entry must skip the
+	// demote (invalidate-only) and reset the flag.
+	// Reset paths: Reset() (covers eviction, promote-source), explicit
+	// reset in directoryStage.doPromotion target, mshrStage demote-skip.
+	DemoteLocked bool
 	// lock을 subentry가 아니라 entry 단위로 걸어야 할 수도 있음
 }
 
@@ -106,6 +112,42 @@ func (c *CohEntry) AbleToPromotion() bool {
 	}
 
 	return true
+}
+
+// AbleToPromotionRelaxed permits promotion when at least one sub-entry is
+// valid with a non-empty sharer set. The promoted (coarser) entry must be
+// populated with the union of all valid sub-entries' sharers (see
+// SharerUnion); that is over-broad but coherence-safe (a writer to the
+// coarse region will invalidate all GPUs that may hold a copy in any
+// sub-region).
+func (c *CohEntry) AbleToPromotionRelaxed() bool {
+	if !c.IsValid {
+		return false
+	}
+	for i := range c.SubEntry {
+		if c.SubEntry[i].IsValid && len(c.SubEntry[i].Sharer) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// SharerUnion returns the deduplicated union of sharers across all valid
+// sub-entries. Used by relaxed promotion so the coarsened entry tracks
+// every GPU that may hold a copy in any sub-region.
+func (c *CohEntry) SharerUnion() []sim.RemotePort {
+	var union []sim.RemotePort
+	for i := range c.SubEntry {
+		if !c.SubEntry[i].IsValid {
+			continue
+		}
+		for _, sh := range c.SubEntry[i].Sharer {
+			if !Present(union, sh) {
+				union = append(union, sh)
+			}
+		}
+	}
+	return union
 }
 
 func Present(list []sim.RemotePort, sh sim.RemotePort) bool {
@@ -389,6 +431,7 @@ func (e *CohEntry) DeepCopy() *CohEntry {
 
 func (e *CohEntry) Reset() {
 	e.IsValid = false
+	e.DemoteLocked = false
 	for i := range e.SubEntry {
 		sub := &e.SubEntry[i]
 		sub.IsValid = false

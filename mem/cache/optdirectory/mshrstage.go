@@ -81,6 +81,11 @@ func (s *mshrStage) processOneReq() bool {
 
 	s.cache.mshr.Remove(s.processingTrans.mshrEntry.PID, s.processingTrans.mshrEntry.Address)
 
+	// local soft cap 카운터 반환: writeToBank에서 fromLocal=true일 때 증가했으므로 여기서 감소.
+	if s.isProcessingLocal {
+		s.cache.localMshrCount--
+	}
+
 	// [수정] 처리가 완료되었으므로 가져왔던 버퍼에서 Pop
 	if s.isProcessingLocal {
 		s.cache.localMshrStageBuffer.Pop()

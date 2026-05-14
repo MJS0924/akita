@@ -116,11 +116,40 @@ type Comp struct {
 	bottomSendCount uint64 // sendRequestToBottom returned true
 	mshrFwdCount    uint64 // mshrStage pushed a coalesced request to bottomSenderBuffer
 
-	// Stall cause counters (to diagnose high dir_avg_latency)
-	stallMSHRFull      uint64 // writeToBank returned false due to MSHR full
-	stallSubEntryLocked uint64 // doWriteHit returned false because sub-entry IsLocked
-	stallBankFull      uint64 // writeToBank returned false because bankBuf.CanPush() == false
-	totalDoWriteCalls  uint64 // every call into doWrite (successful or not)
+	// Stall cause counters (Method E — directory bottleneck analysis).
+	// Each counter increments when the named back-pressure forces the
+	// transaction to retry next cycle. Naming is shared with optdirectory
+	// so REC vs CD comparison is one-to-one.
+	stallMSHRFull       uint64 // writeToBank: mshr.IsFull()
+	stallSubEntryLocked uint64 // doWriteHit: sub-entry IsLocked or ReadCount > 0
+	stallBankFull       uint64 // writeToBank: bankBuf.CanPush() == false (alias: stallBankBufFull)
+	stallEvictingList   uint64 // processTransaction: addr in evictingList
+	stallVictimLocked   uint64 // doWriteMiss: victim entry locked (split from stallMSHRFull)
+	stallBottomBufFull  uint64 // fast-path push to bottomSenderBuffer rejected
+	stallMshrBufFull    uint64 // bankstage push to mshrStageBuffer rejected
+	stallInflightFetch  uint64 // bottomSender: tooManyInflightRequest
+	stallInflightInv    uint64 // bottomSender: tooManyInflightInvalidation
+	stallBottomPortBusy uint64 // bottomSender: bottomPort/RDMAPort can't send
+	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
+	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
+
+	// Queueing-delay accumulators (Method E2). Track per-trans wait time
+	// in two phases:
+	//   waitDir   = bottomEnterTime - enterTime (in dirStage + bank)
+	//   waitBottom = exitTime - bottomEnterTime (in bottomSender)
+	// Sum is in seconds (sim.VTimeInSec). For breakdown, separate sums by
+	// path category (bypass / fast / bank).
+	waitDirSum_bypass    sim.VTimeInSec
+	waitBottomSum_bypass sim.VTimeInSec
+	waitCount_bypass     uint64
+
+	waitDirSum_fast      sim.VTimeInSec
+	waitBottomSum_fast   sim.VTimeInSec
+	waitCount_fast       uint64
+
+	waitDirSum_bank      sim.VTimeInSec
+	waitBottomSum_bank   sim.VTimeInSec
+	waitCount_bank       uint64
 
 	// OP5 deviation regression slots (PHASE C-2). Increment sites are
 	// intentionally absent in the post-fix code: a non-zero value means
@@ -140,6 +169,50 @@ func (c *Comp) AvgEvictUtilization() float64 {
 
 func (c *Comp) EvictCount() uint64 {
 	return c.evictEntryCount
+}
+
+// CurrentValidEntryUtilization scans every directory entry that is
+// currently valid (IsValidEntry == true) and averages the per-entry
+// sub-entry utilization (validSubEntries / totalSubEntries). Invalid
+// entries are excluded from the average. Returns (avgUtil, validEntries)
+// where avgUtil ∈ [0,1] and validEntries is the count of valid entries
+// observed. Safe to call between simulation ticks (SerialEngine guarantee).
+//
+// REC stores entries directly under directory.GetSets() (no per-bank
+// nesting like SuperDirectory). SubEntry is a fixed-size [16]CohSubEntry.
+// Returns (avgUtil, validEntries, totalValidSubEntries). totalValidSubEntries
+// is the directory's cache-line coverage — each REC sub-entry tracks one
+// cache line within the region, so summing valid sub-entries gives the
+// number of cache lines currently covered.
+func (c *Comp) CurrentValidEntryUtilization() (float64, int, int) {
+	sets := c.directory.GetSets()
+	var sum float64
+	count := 0
+	totalValidSub := 0
+	for i := range sets {
+		for _, entry := range sets[i].CohEntries {
+			if entry == nil || !entry.IsValidEntry() {
+				continue
+			}
+			numSub := len(entry.SubEntry)
+			if numSub == 0 {
+				continue
+			}
+			validSub := 0
+			for k := 0; k < numSub; k++ {
+				if entry.SubEntry[k].IsValid {
+					validSub++
+				}
+			}
+			sum += float64(validSub) / float64(numSub)
+			count++
+			totalValidSub += validSub
+		}
+	}
+	if count == 0 {
+		return 0, 0, 0
+	}
+	return sum / float64(count), count, totalValidSub
 }
 
 // DiagCounts returns the silent-eviction diagnostic counters.
@@ -166,7 +239,26 @@ func (c *Comp) ActionCounts() map[string]uint64 {
 		"stall_mshr_full":          c.stallMSHRFull,
 		"stall_subentry_locked":    c.stallSubEntryLocked,
 		"stall_bank_full":          c.stallBankFull,
+		"stall_evicting_list":      c.stallEvictingList,
+		"stall_victim_locked":      c.stallVictimLocked,
+		"stall_bottom_buf_full":    c.stallBottomBufFull,
+		"stall_mshr_buf_full":      c.stallMshrBufFull,
+		"stall_inflight_fetch":     c.stallInflightFetch,
+		"stall_inflight_inv":       c.stallInflightInv,
+		"stall_bottom_port_busy":   c.stallBottomPortBusy,
+		"stall_top_port_busy":      c.stallTopPortBusy,
 		"total_dowrite_calls":      c.totalDoWriteCalls,
+		// Queueing-delay sums emitted in nanoseconds (for analysis;
+		// divide by *_count to get average per-trans dwell time).
+		"wait_dir_ns_bypass":       uint64(c.waitDirSum_bypass * 1e9),
+		"wait_bottom_ns_bypass":    uint64(c.waitBottomSum_bypass * 1e9),
+		"wait_count_bypass":        c.waitCount_bypass,
+		"wait_dir_ns_fast":         uint64(c.waitDirSum_fast * 1e9),
+		"wait_bottom_ns_fast":      uint64(c.waitBottomSum_fast * 1e9),
+		"wait_count_fast":          c.waitCount_fast,
+		"wait_dir_ns_bank":         uint64(c.waitDirSum_bank * 1e9),
+		"wait_bottom_ns_bank":      uint64(c.waitBottomSum_bank * 1e9),
+		"wait_count_bank":          c.waitCount_bank,
 		"op5a_shortcut_with_remote_sharer":   c.op5aShortcutWithRemoteSharer,
 		"op5b_remote_write_hit_cleared_writer": c.op5bRemoteWriteHitClearedWriter,
 	}

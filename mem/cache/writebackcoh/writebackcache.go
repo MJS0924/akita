@@ -37,6 +37,11 @@ type Comp struct {
 	cohDirStageBuffer        sim.Buffer
 	dirStageBuffer           sim.Buffer
 	remoteDirStageBuffer     sim.Buffer
+	// Phase F — separate priority ingress queue for InvReq. topparser
+	// routes incoming InvReq messages here; dirStage drains this buffer
+	// before processing the regular FIFO so that read/write requests
+	// stalled on bankBuf or MSHR cannot block invalidations behind them.
+	invStageBuffer           sim.Buffer
 	dirToBankBuffers         []sim.Buffer
 	writeBufferToBankBuffers []sim.Buffer
 	mshrStageBuffer          sim.Buffer
@@ -55,6 +60,22 @@ type Comp struct {
 	directory           internal.Directory
 	mshr                internal.MSHR
 	maxLocalMshr        int // [추가] Local 요청이 점유할 수 있는 최대 MSHR 개수 (예약 제어용): 전체의 75%로 설정
+	// MSHR 분포 추적 카운터 (deadlock 분석용).
+	mshrLocalAdded    uint64 // fromLocal=true 로 추가된 MSHR entry 총 횟수
+	mshrRemoteAdded   uint64 // fromLocal=false 로 추가된 MSHR entry 총 횟수
+	mshrLocalRemoved  uint64 // fromLocal=true MSHR entry 제거 총 횟수
+	mshrRemoteRemoved uint64 // fromLocal=false MSHR entry 제거 총 횟수
+	stallMSHRTotalFull uint64 // IsFull로 reject된 횟수 (모두에게 적용)
+	stallMSHRLocalCap  uint64 // local cap으로 reject된 횟수
+	// Deferred-invalidation counters. Armed: doInvalidation acked an
+	// InvReq on a still-locked block and set PendingInvalidation.
+	// Applied: bankStage.applyPendingInvalidation consumed the flag and
+	// zeroed the block. End-of-run should have armed ≈ applied (the
+	// difference is blocks that still have PendingInvalidation pending
+	// because their owning bank op never finalized — should be 0 in a
+	// healthy run, non-zero indicates the deadlock pattern returned).
+	deferredInvArmed   uint64
+	deferredInvApplied uint64
 	log2BlockSize       uint64
 	log2PageSize        uint64
 	log2UnitSize        uint64
@@ -65,13 +86,43 @@ type Comp struct {
 	shadowInFlightTransaction []*transaction
 	evictingList              map[uint64]bool
 
+	// Miss-reason tracking (Method D). seenAddrs is the set of cache-line
+	// keys this L2 has ever served; lastEvictionReason holds, for each
+	// key recently evicted, the cause (LRU vs invalidation) so the next
+	// re-fetch can be classified. Both maps grow with the working-set
+	// size, which is acceptable for analysis runs.
+	seenAddrs          map[missTrackerKey]struct{}
+	lastEvictionReason map[missTrackerKey]string
+
 	DirtyMask *[]map[vm.PID]map[uint64][]uint8
 	ReadMask  *[]map[vm.PID]map[uint64][]uint8
+
+	// eventCounts replaces high-frequency tracing.AddTaskStep calls with
+	// in-memory counters. Reduces akita_sim_*.sqlite trace size dramatically
+	// for events that report.go only reads as totals at the end of the run.
+	// See report.go's eventCountsProvider for consumption.
+	eventCounts map[string]uint64
 
 	returnValue   bool
 	debugProcess  bool
 	debugAddress0 uint64
 	debugAddress1 uint64
+}
+
+func (c *Comp) incEvent(name string) {
+	if c.eventCounts == nil {
+		c.eventCounts = make(map[string]uint64)
+	}
+	c.eventCounts[name]++
+}
+
+// EventCounts returns a copy of the in-memory event counters.
+func (c *Comp) EventCounts() map[string]uint64 {
+	out := make(map[string]uint64, len(c.eventCounts))
+	for k, v := range c.eventCounts {
+		out[k] = v
+	}
+	return out
 }
 
 // SetAddressToPortMapper sets the AddressToPortMapper used by the cache.
@@ -135,6 +186,7 @@ func (c *Comp) discardInflightTransactions() {
 		for _, block := range set.Blocks {
 			block.ReadCount = 0
 			block.IsLocked = false
+			block.PendingInvalidation = false
 		}
 	}
 

@@ -21,19 +21,107 @@ type writeBufferStage struct {
 	pendingEvictions []*transaction
 	inflightFetch    []*transaction
 	inflightEviction []*transaction
+
+	// Local/remote split mirrors the fetch quota in superdirectory's
+	// bottomSender (75% local / 25% remote). Without this split,
+	// remote-routed evictions (cross-GPU writebacks via SD/REC) and
+	// local DRAM evictions share one cap; a backpressure burst on
+	// the cross-GPU path can fill the cap and HoL-block local evictions
+	// (and vice versa), producing cross-GPU circular wait deadlocks
+	// observed under stencil2d SD.
+	numLocalInflightEviction  int
+	numRemoteInflightEviction int
+
+	// Typed sub-queues for bottomPort response handling. Without these,
+	// processDataReadyRsp may fail (writeBufferToBankBuffers cap full →
+	// returns false without RetrieveIncoming), leaving a DataReadyRsp
+	// stuck at bottomPort head. WriteDoneRsp behind it in the FIFO is
+	// then never observed, so inflightEviction never frees and the
+	// writeBuffer cap → write-through stall → cross-GPU cyclic deadlock
+	// (observed under CD coherence-unit-size=0 page-migration burst).
+	// Caps match the actual port buffer (4 each) so total cache buffer
+	// stays nearly unchanged — invalidation/write-through cost models
+	// are not affected.
+	pendingDataReady []*mem.DataReadyRsp
+	pendingWriteDone []*mem.WriteDoneRsp
 }
+
 
 func (wb *writeBufferStage) Tick() bool {
 	madeProgress := false
 
 	madeProgress = wb.write() || madeProgress
-	madeProgress = wb.processReturnRsp() || madeProgress
+
+	// Drain bottomPort head into type-classified sub-queues, then process
+	// each type from its own queue. Separates DataReadyRsp from
+	// WriteDoneRsp so a stuck DataReadyRsp (bankBuf full, processPrefetch
+	// retry, etc.) cannot HoL-block WriteDoneRsp behind it in the port
+	// FIFO. WriteDoneRsp processing must always make progress to free
+	// inflightEviction slots; otherwise the writeBuffer caps and the
+	// cross-GPU write-through cycle deadlocks.
+	madeProgress = wb.drainBottomTyped() || madeProgress
+	madeProgress = wb.processPendingDataReady() || madeProgress
+	madeProgress = wb.processPendingWriteDone() || madeProgress
+
 	madeProgress = wb.processNewTransaction() || madeProgress
 	// [FIX: head-of-line] writeBufferFetchBuffer(fetch 전용)를 writeBufferBuffer(eviction 전용)와
 	// 독립적으로 처리. fetch 블로킹이 eviction 진행을 막지 않도록 분리.
 	madeProgress = wb.processNewFetch() || madeProgress
 
 	return madeProgress
+}
+
+func (wb *writeBufferStage) drainBottomTyped() bool {
+	// Drain bottomPort head unconditionally into typed sub-queues. Caps
+	// are intentionally NOT applied here — capping the typed queue
+	// would re-introduce the same HoL behavior the queues are meant to
+	// eliminate (a stuck DataReadyRsp at port head behind which
+	// WriteDoneRsp cannot be observed). The typed queues are normally
+	// near-empty (drained the same cycle by processPending* helpers);
+	// they only grow during the rare downstream-stall window the fix
+	// is designed to break. No inflight cap is being raised — these
+	// are pure ingress sub-queues with no model semantics.
+	msg := wb.cache.bottomPort.PeekIncoming()
+	if msg == nil {
+		return false
+	}
+
+	switch m := msg.(type) {
+	case *mem.DataReadyRsp:
+		wb.pendingDataReady = append(wb.pendingDataReady, m)
+	case *mem.WriteDoneRsp:
+		wb.pendingWriteDone = append(wb.pendingWriteDone, m)
+	default:
+		panic("unknown msg type on bottomPort")
+	}
+
+	wb.cache.bottomPort.RetrieveIncoming()
+	return true
+}
+
+func (wb *writeBufferStage) processPendingDataReady() bool {
+	if len(wb.pendingDataReady) == 0 {
+		return false
+	}
+
+	head := wb.pendingDataReady[0]
+	if !wb.tryProcessDataReadyRsp(head) {
+		return false
+	}
+
+	wb.pendingDataReady = wb.pendingDataReady[1:]
+	return true
+}
+
+func (wb *writeBufferStage) processPendingWriteDone() bool {
+	if len(wb.pendingWriteDone) == 0 {
+		return false
+	}
+
+	head := wb.pendingWriteDone[0]
+	wb.applyWriteDoneRsp(head)
+	wb.pendingWriteDone = wb.pendingWriteDone[1:]
+	return true
 }
 
 func (wb *writeBufferStage) processNewTransaction() bool {
@@ -149,6 +237,11 @@ func (wb *writeBufferStage) sendFetchedDataToBank(
 	trans.action = bankWriteFetched
 	wb.combineData(trans.mshrEntry)
 
+	if trans.fromLocal {
+		wb.cache.mshrLocalRemoved++
+	} else {
+		wb.cache.mshrRemoteRemoved++
+	}
 	wb.cache.mshr.Remove(trans.mshrEntry.PID, trans.mshrEntry.Address)
 
 	bankBuf.Push(trans)
@@ -210,7 +303,7 @@ func (wb *writeBufferStage) fetchFromBottom(
 	} else {
 		what = "ToRemote"
 	}
-	tracing.AddTaskStep(read.ID, wb.cache, what)
+	wb.cache.incEvent(what)
 
 	if wb.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == wb.cache.debugAddress0 {
 		fmt.Printf("[%s] [writebufferstage]\tReceived req - 3.1.0: addr %x, action %d\n", wb.cache.name, trans.accessReq().GetAddress(), trans.action)
@@ -350,7 +443,8 @@ func (wb *writeBufferStage) write() bool {
 
 	trans := wb.pendingEvictions[0]
 
-	if wb.tooManyInflightEvictions() {
+	isLocal := wb.cache.toLocal(trans.evictingAddr)
+	if wb.tooManyInflightEvictions(isLocal) {
 		return false
 	}
 
@@ -375,8 +469,14 @@ func (wb *writeBufferStage) write() bool {
 	wb.cache.bottomPort.Send(write)
 
 	trans.evictionWriteReq = write
+	trans.evictionToLocal = isLocal
 	wb.pendingEvictions = wb.pendingEvictions[1:]
 	wb.inflightEviction = append(wb.inflightEviction, trans)
+	if isLocal {
+		wb.numLocalInflightEviction++
+	} else {
+		wb.numRemoteInflightEviction++
+	}
 
 	tracing.TraceReqInitiate(write, wb.cache,
 		tracing.MsgIDAtReceiver(write, wb.cache))
@@ -387,7 +487,7 @@ func (wb *writeBufferStage) write() bool {
 	} else {
 		what = "ToRemote"
 	}
-	tracing.AddTaskStep(write.ID, wb.cache, what)
+	wb.cache.incEvent(what)
 
 	// if trans.writeToHomeNode {
 	// 	fmt.Printf("[%s]\tWrite(%s -> %s) %x to %s\n",
@@ -405,20 +505,20 @@ func (wb *writeBufferStage) write() bool {
 	return true
 }
 
-func (wb *writeBufferStage) processReturnRsp() bool {
-	msg := wb.cache.bottomPort.PeekIncoming()
-	if msg == nil {
-		return false
-	}
+// tryProcessDataReadyRsp processes a DataReadyRsp already drained from
+// bottomPort. Returns true on success (dispatched to bank), false if it
+// must be retried later (downstream buffer full). The caller decides
+// whether to pop from pendingDataReady based on the return value.
+func (wb *writeBufferStage) tryProcessDataReadyRsp(
+	dataReady *mem.DataReadyRsp,
+) bool {
+	return wb.processDataReadyRsp(dataReady)
+}
 
-	switch msg := msg.(type) {
-	case *mem.DataReadyRsp:
-		return wb.processDataReadyRsp(msg)
-	case *mem.WriteDoneRsp:
-		return wb.processWriteDoneRsp(msg)
-	default:
-		panic("unknown msg type")
-	}
+// applyWriteDoneRsp processes a WriteDoneRsp already drained from
+// bottomPort. Always succeeds (only mutates internal state).
+func (wb *writeBufferStage) applyWriteDoneRsp(writeDone *mem.WriteDoneRsp) {
+	wb.processWriteDoneRsp(writeDone)
 }
 
 func (wb *writeBufferStage) processDataReadyRsp(
@@ -428,7 +528,6 @@ func (wb *writeBufferStage) processDataReadyRsp(
 
 	if trans != nil && trans.responsing { // 이미 응답이 도착하여 처리 중인 trans -> discard
 		wb.removeInflightFetch(trans)
-		wb.cache.bottomPort.RetrieveIncoming()
 		return true
 	}
 
@@ -453,12 +552,16 @@ func (wb *writeBufferStage) processDataReadyRsp(
 	// trans.responsing = true
 	wb.combineData(trans.mshrEntry)
 
+	if trans.fromLocal {
+		wb.cache.mshrLocalRemoved++
+	} else {
+		wb.cache.mshrRemoteRemoved++
+	}
 	wb.cache.mshr.Remove(trans.mshrEntry.PID, trans.mshrEntry.Address)
 
 	bankBuf.Push(trans)
 
 	wb.removeInflightFetch(trans)
-	wb.cache.bottomPort.RetrieveIncoming()
 
 	tracing.TraceReqFinalize(trans.fetchReadReq, wb.cache)
 
@@ -515,6 +618,19 @@ func (wb *writeBufferStage) findInflightFetchByFetchReadReqID(
 	// panic("inflight read not found")
 }
 
+// findInflightFetchByAddress fallback used when RspTo-based match fails.
+// If the response carries the expected fetch address, we can still
+// identify the right transaction even if the ID got mangled in the
+// RDMA→CD chain.
+func (wb *writeBufferStage) findInflightFetchByAddress(addr uint64) *transaction {
+	for _, t := range wb.inflightFetch {
+		if t.fetchAddress == addr {
+			return t
+		}
+	}
+	return nil
+}
+
 func (wb *writeBufferStage) removeInflightFetch(f *transaction) {
 	for i, trans := range wb.inflightFetch {
 		if trans == f {
@@ -560,11 +676,15 @@ func (wb *writeBufferStage) processPrefetch(
 		trans.mshrEntry.Data = rsp.Data
 		trans.fetchedData = rsp.Data
 		wb.combineData(trans.mshrEntry)
+		if trans.fromLocal {
+			wb.cache.mshrLocalRemoved++
+		} else {
+			wb.cache.mshrRemoteRemoved++
+		}
 		wb.cache.mshr.Remove(trans.mshrEntry.PID, trans.mshrEntry.Address)
 
 		bankBuf.Push(&trans)
 
-		wb.cache.bottomPort.RetrieveIncoming()
 
 		if trans.fetchReadReq != nil {
 			tracing.TraceReqFinalize(trans.fetchReadReq, wb.cache)
@@ -597,21 +717,12 @@ func (wb *writeBufferStage) processPrefetch(
 	}
 
 	tracing.TraceReqReceive(rsp, wb.cache)
-	tracing.AddTaskStep(
-		rsp.ID,
-		wb.cache,
-		"PrefetchStart",
-	)
+	wb.cache.incEvent("PrefetchStart")
 
 	if !wb.cache.dirStageBuffer.CanPush() {
 		// 1. 버리기
-		wb.cache.bottomPort.RetrieveIncoming()
 
-		tracing.AddTaskStep(
-			trans.prefetch.ID,
-			wb.cache,
-			"PrefetchDiscard - Busy",
-		)
+		wb.cache.incEvent("PrefetchDiscard - Busy")
 		tracing.TraceReqFinalize(trans.prefetch, wb.cache)
 
 		return true
@@ -625,7 +736,6 @@ func (wb *writeBufferStage) processPrefetch(
 	}
 
 	wb.cache.dirStageBuffer.Push(trans)
-	wb.cache.bottomPort.RetrieveIncoming()
 
 	if wb.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == wb.cache.debugAddress0 {
 		fmt.Printf("[%s] [writebufferstage]\tReceived read prefetch - 3.3: addr %x, action %d\n", wb.cache.name, trans.accessReq().GetAddress(), trans.action)
@@ -643,12 +753,16 @@ func (wb *writeBufferStage) processWriteDoneRsp(
 	for i := len(wb.inflightEviction) - 1; i >= 0; i-- {
 		e := wb.inflightEviction[i]
 		if e.evictionWriteReq.ID == writeDone.RespondTo {
+			if e.evictionToLocal {
+				wb.numLocalInflightEviction--
+			} else {
+				wb.numRemoteInflightEviction--
+			}
 			wb.inflightEviction = append(
 				wb.inflightEviction[:i],
 				wb.inflightEviction[i+1:]...,
 			)
-			wb.cache.bottomPort.RetrieveIncoming()
-			tracing.TraceReqFinalize(e.evictionWriteReq, wb.cache)
+				tracing.TraceReqFinalize(e.evictionWriteReq, wb.cache)
 
 			// log.Printf("%.10f, %s, wb write to bottom，
 			//  %s, %04X, %04X, (%d, %d), %v\n",
@@ -663,7 +777,6 @@ func (wb *writeBufferStage) processWriteDoneRsp(
 		}
 	}
 
-	wb.cache.bottomPort.RetrieveIncoming()
 	return true
 }
 
@@ -676,8 +789,23 @@ func (wb *writeBufferStage) tooManyInflightFetches() bool {
 	return len(wb.inflightFetch) >= wb.maxInflightFetch
 }
 
-func (wb *writeBufferStage) tooManyInflightEvictions() bool {
-	return len(wb.inflightEviction) >= wb.maxInflightEviction
+func (wb *writeBufferStage) tooManyInflightEvictions(isLocal bool) bool {
+	// Asymmetric soft cap: remote can use the full maxInflightEviction
+	// budget; local is bounded at 3/4 of it. The remaining 1/4 is
+	// always reserved for remote so local cannot starve cross-GPU
+	// traffic, while remote-dominant workloads (e.g., stencil2d on
+	// multi-GPU where all evictions go cross-GPU) can still use the
+	// full cap when local is idle. Total inflight is hard-capped by
+	// maxInflightEviction so the writeBuffer's accounting stays sound.
+	total := wb.numLocalInflightEviction + wb.numRemoteInflightEviction
+	if total >= wb.maxInflightEviction {
+		return true
+	}
+	if isLocal {
+		localLimit := wb.maxInflightEviction - wb.maxInflightEviction/4
+		return wb.numLocalInflightEviction >= localLimit
+	}
+	return false
 }
 
 func (wb *writeBufferStage) Reset() {
@@ -686,4 +814,8 @@ func (wb *writeBufferStage) Reset() {
 	wb.pendingEvictions = nil
 	wb.inflightFetch = nil
 	wb.inflightEviction = nil
+	wb.numLocalInflightEviction = 0
+	wb.numRemoteInflightEviction = 0
+	wb.pendingDataReady = nil
+	wb.pendingWriteDone = nil
 }

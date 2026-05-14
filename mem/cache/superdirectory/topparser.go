@@ -56,8 +56,9 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 	}
 
 	trans := &transaction{
-		id:        sim.GetIDGenerator().Generate(),
-		fromLocal: fromLocal, // 수신 포트 기반으로 결정: topPort→true, RDMAPort→false
+		id:          sim.GetIDGenerator().Generate(),
+		fromLocal:   fromLocal, // 수신 포트 기반으로 결정: topPort→true, RDMAPort→false
+		rsbHintBank: -1,
 	}
 
 	needsTracing := false
@@ -123,17 +124,9 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 			p.cache.localBypassBuffer.Push(trans)
 
 			tracing.TraceReqReceive(req, p.cache)
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(req, p.cache),
-				p.cache,
-				traceWhat0,
-			)
+			p.cache.incEvent(traceWhat0)
 			tracing.TraceReqReceive(req, p.cache)
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(req, p.cache),
-				p.cache,
-				traceWhat1,
-			)
+			p.cache.incEvent(traceWhat1)
 			return true
 		}
 
@@ -168,17 +161,9 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 			p.cache.localBypassBuffer.Push(trans)
 
 			tracing.TraceReqReceive(req, p.cache)
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(req, p.cache),
-				p.cache,
-				traceWhat0,
-			)
+			p.cache.incEvent(traceWhat0)
 			tracing.TraceReqReceive(req, p.cache)
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(req, p.cache),
-				p.cache,
-				traceWhat1,
-			)
+			p.cache.incEvent(traceWhat1)
 
 			return true
 		}
@@ -200,17 +185,9 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 
 	if needsTracing {
 		tracing.TraceReqReceive(req, p.cache)
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(req, p.cache),
-			p.cache,
-			traceWhat0,
-		)
+		p.cache.incEvent(traceWhat0)
 		tracing.TraceReqReceive(req, p.cache)
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(req, p.cache),
-			p.cache,
-			traceWhat1,
-		)
+		p.cache.incEvent(traceWhat1)
 	}
 
 	return true

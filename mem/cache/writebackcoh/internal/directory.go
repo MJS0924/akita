@@ -24,6 +24,13 @@ type Block struct {
 	Accessed       bool
 	HasBeenRead    bool
 	HasBeenWritten bool
+
+	// PendingInvalidation: an InvReq arrived while the block was IsLocked
+	// by an in-flight bank op. The InvRsp has already been sent upstream
+	// to free CohDir's inflightInvToBottom slot; bankStage finalize will
+	// zero the block when IsLocked clears. See directoryStage.doInvalidation
+	// and bankStage.applyPendingInvalidation.
+	PendingInvalidation bool
 }
 
 // A Set is a list of blocks where a certain piece memory can be stored at
@@ -145,6 +152,7 @@ func (d *DirectoryImpl) Reset() {
 			block.IsValid = false
 			block.IsLocked = false
 			block.Accessed = false
+			block.PendingInvalidation = false
 			block.SetID = i
 			block.WayID = j
 			block.CacheAddress = uint64(i*d.NumWays+j) * uint64(d.BlockSize)

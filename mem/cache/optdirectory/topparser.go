@@ -59,6 +59,7 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 	trans := &transaction{
 		id:        sim.GetIDGenerator().Generate(),
 		fromLocal: fromLocal, // 수신 포트 기반으로 결정: topPort→true, RDMAPort→false
+		enterTime: p.cache.Engine.CurrentTime(),
 	}
 
 	needsTracing := false
@@ -111,13 +112,23 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 			traceWhat1 = "FromLocal"
 		}
 
-		// 1. [Bypass 대상] Local에서 발생한 Local 데이터 Read 요청
-		if trans.fromLocal || !trans.toLocal {
+		// 1. [Bypass 대상] Local-origin requests only. Bypass is a fast-path
+		// for this GPU's own L1 traffic; external incoming (fromLocal=false)
+		// must take the directory path so its responses are correctly
+		// routed back to the sender's RDMA via sendToRemoteTopQue →
+		// sendRemoteRspToTop → RDMAPort. The previous condition
+		// (fromLocal || !toLocal) admitted external incoming with stale
+		// home mapping (post-page-migration window) into bypass, whose
+		// responses are forwarded only via topPort → never reach the
+		// sender GPU's RDMA → causing transactionsFromOutside to stuck.
+		if trans.fromLocal {
 			trans.action = BypassingDirectory
 			if !p.cache.localBypassBuffer.CanPush() {
 				p.returnFalse = "Cannot push to localBypassBuffer"
 				return false
 			}
+			trans.bottomEnterTime = p.cache.Engine.CurrentTime()
+			trans.pathCategory = "bypass"
 			p.cache.localBypassBuffer.Push(trans)
 
 			tracing.TraceReqReceive(req, p.cache)
@@ -160,12 +171,18 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 
 		trans.write = req
 
-		if !trans.toLocal { // remote data를 write 하는 경우는 directory 확인이 필요 없음
+		// Bypass only this GPU's own L1 writes to remote data (fast-path);
+		// external incoming writes (fromLocal=false) MUST take the
+		// directory path. See ReadReq comment above for the rationale —
+		// bypass response routing assumes local origin.
+		if trans.fromLocal && !trans.toLocal {
 			trans.action = BypassingDirectory
 			if !p.cache.localBypassBuffer.CanPush() {
 				p.returnFalse = "Cannot push to localBypassBuffer"
 				return false
 			}
+			trans.bottomEnterTime = p.cache.Engine.CurrentTime()
+			trans.pathCategory = "bypass"
 			p.cache.localBypassBuffer.Push(trans)
 
 			tracing.TraceReqReceive(req, p.cache)

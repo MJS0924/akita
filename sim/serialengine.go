@@ -21,6 +21,19 @@ type SerialEngine struct {
 	pauseLock    sync.Mutex
 
 	singleRunLock sync.Mutex
+
+	// OnStopHooks is a list of callbacks invoked exactly when Run()
+	// returns because no more events are scheduled (= deadlock or
+	// natural completion). Each callback can dump internal component
+	// state for post-mortem deadlock diagnosis. Registered by component
+	// builders.
+	OnStopHooks []func()
+}
+
+// RegisterStopHook registers a function to be called when the engine
+// stops due to no more events.
+func (e *SerialEngine) RegisterStopHook(f func()) {
+	e.OnStopHooks = append(e.OnStopHooks, f)
 }
 
 // NewSerialEngine creates a SerialEngine
@@ -71,6 +84,11 @@ func (e *SerialEngine) Run() error {
 
 	for {
 		if e.noMoreEvent() {
+			// Invoke deadlock dumps before printing the "No More Event"
+			// banner so the dump is co-located with the deadlock signal.
+			for _, h := range e.OnStopHooks {
+				h()
+			}
 			fmt.Printf("[Warning]\tNo More Event: %d %d\n", e.queue.Len(), e.secondaryQueue.Len())
 			return nil
 		}

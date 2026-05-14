@@ -211,12 +211,14 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 		mshrStageBuf = s.cache.remoteMshrStageBuffer
 	}
 
-	if !bottomSenderBuf.CanPush() || !mshrStageBuf.CanPush() {
-		if !bottomSenderBuf.CanPush() {
-			s.returnFalse0 = "Cannot push to bottomSenderBuffer"
-		} else {
-			s.returnFalse0 = "Cannot push to mshrStageBuffer"
-		}
+	if !bottomSenderBuf.CanPush() {
+		s.returnFalse0 = "Cannot push to bottomSenderBuffer"
+		s.cache.stallBottomBufFull++
+		return false
+	}
+	if !mshrStageBuf.CanPush() {
+		s.returnFalse0 = "Cannot push to mshrStageBuffer"
+		s.cache.stallMshrBufFull++
 		return false
 	}
 
@@ -226,6 +228,19 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 
 		// [수정] 각 Action 함수에 목적지 버퍼(bottomSenderBuf, mshrStageBuf)를 인자로 넘겨줍니다.
 		switch trans.action {
+		case Nothing:
+			// Defensive: directorystage now drops read-hit Nothing
+			// transactions before writeToBank. Reaching this case
+			// means a different code path failed to bypass — handle
+			// gracefully by unlocking the block and pushing to the
+			// bottom sender (same shape as UpdateEntry without
+			// sharer mutation).
+			if trans.block != nil {
+				trans.block.IsLocked = false
+			}
+			bottomSenderBuf.Push(trans)
+			mshrStageBuf.Push(trans)
+			done = true
 		case InsertNewEntry:
 			done = s.InsertNewEntry(trans, bottomSenderBuf, mshrStageBuf)
 		case EvictAndInsertNewEntry:
@@ -241,6 +256,9 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 		}
 
 		if done {
+			// Method E2: stamp bottomEnterTime for bank-path trans.
+			trans.bottomEnterTime = s.cache.Engine.CurrentTime()
+			trans.pathCategory = "bank"
 			postBuf.Remove(i)
 			if isLocal {
 				s.localInflightTransCount--

@@ -182,6 +182,16 @@ func (s *bankStage) finalizeTrans() bool {
 		done := false
 
 		switch trans.action {
+		case Nothing:
+			// Defensive Nothing handler: directorystage's doWriteHit
+			// fast-path drops Nothing transactions before writeToBank,
+			// so this case should not normally fire. Handle gracefully
+			// instead of panicking if any other path produces it.
+			if trans.block != nil {
+				trans.block.IsLocked = false
+			}
+			s.cache.bottomSenderBuffer.Push(trans)
+			done = true
 		case InsertNewEntry:
 			done = s.InsertNewEntry(trans)
 		case EvictAndInsertNewEntry:

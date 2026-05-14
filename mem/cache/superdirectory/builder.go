@@ -24,6 +24,10 @@ type Builder struct {
 	fetchSingleCacheLine bool // true이면 miss 시 64B(1 cacheline)만 fetch
 	disableRSB           bool
 	disableCBF           bool
+	disableDemoteLock    bool
+	promoteRelaxed       bool
+	useRsbHintAlloc      bool
+	recordSilentEvict    bool
 
 	interleaving          bool
 	numInterleavingBlock  int
@@ -37,6 +41,7 @@ type Builder struct {
 	writeBufferCapacity int
 	maxInflightFetch    int
 	maxInflightEviction int
+	maxInvEmitPerCycle  int
 
 	cohDirLatency int
 	dirLatency    int
@@ -64,7 +69,10 @@ func MakeBuilder() Builder {
 		numReqPerCycle:      1,
 		writeBufferCapacity: 1024,
 		maxInflightFetch:    128,
-		maxInflightEviction: 128,
+		// Phase F equivalent: cap 128 → 256 (2× headroom). Larger
+		// values (e.g. 1024) under-report inv cost by absorbing back-
+		// pressure that real hardware would propagate.
+		maxInflightEviction: 256,
 		bankLatency:         10,
 	}
 }
@@ -121,6 +129,26 @@ func (b Builder) WithDisableRSB(v bool) Builder {
 
 func (b Builder) WithDisableCBF(v bool) Builder {
 	b.disableCBF = v
+	return b
+}
+
+func (b Builder) WithDisableDemoteLock(v bool) Builder {
+	b.disableDemoteLock = v
+	return b
+}
+
+func (b Builder) WithPromoteRelaxed(v bool) Builder {
+	b.promoteRelaxed = v
+	return b
+}
+
+func (b Builder) WithUseRsbHintAlloc(v bool) Builder {
+	b.useRsbHintAlloc = v
+	return b
+}
+
+func (b Builder) WithRecordSilentEvict(v bool) Builder {
+	b.recordSilentEvict = v
 	return b
 }
 
@@ -184,6 +212,13 @@ func (b Builder) WithMaxInflightFetch(n int) Builder {
 // write buffer can write to a low-level module.
 func (b Builder) WithMaxInflightEviction(n int) Builder {
 	b.maxInflightEviction = n
+	return b
+}
+
+// WithMaxInvEmitPerCycle caps InvReq emission per output channel per cycle.
+// 0 (default) disables the cap. See cohdirectory.Builder.WithMaxInvEmitPerCycle.
+func (b Builder) WithMaxInvEmitPerCycle(n int) Builder {
+	b.maxInvEmitPerCycle = n
 	return b
 }
 
@@ -327,6 +362,11 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 
 	cacheModule.regionSizeBuffer = *internal.NewRegionSizeBuffer(64, b.log2PageSize, regionLen, b.disableRSB)
 
+	cacheModule.disableDemoteLock = b.disableDemoteLock
+	cacheModule.promoteRelaxed = b.promoteRelaxed
+	cacheModule.useRsbHintAlloc = b.useRsbHintAlloc
+	cacheModule.recordSilentEvict = b.recordSilentEvict
+
 	if b.eventLogger != nil {
 		cacheModule.eventLogger = b.eventLogger
 	} else {
@@ -379,10 +419,12 @@ func (b *Builder) createInternalStages(cache *Comp) {
 	cache.mshrStage = &mshrStage{cache: cache}
 	cache.flusher = &flusher{cache: cache}
 	cache.bottomSender = &bottomSender{
-		cache:                   cache,
-		writeBufferCapacity:     b.writeBufferCapacity,
-		maxInflightRequest:      b.maxInflightFetch,
-		maxInflightInvalidation: b.maxInflightEviction,
+		cache:                    cache,
+		writeBufferCapacity:      b.writeBufferCapacity,
+		maxInflightRequest:       b.maxInflightFetch,
+		maxInflightInvalidation:  b.maxInflightEviction,
+		maxInvEmitPerCycle:       b.maxInvEmitPerCycle,
+		maxInflightBypassRequest: 1024,
 	}
 }
 

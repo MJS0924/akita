@@ -114,6 +114,7 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 		cacheLineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize+uint64(ds.cache.log2NumSubEntry))
 
 		if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
+			ds.cache.stallEvictingList++
 			break
 		}
 
@@ -246,13 +247,39 @@ func (ds *directoryStage) doWriteHit(
 	}
 
 	if trans.isReadTrans() && !trans.read.FetchForWriteMiss {
-		if ds.readPermission(trans, subEntry.Sharer) {
-			trans.action = Nothing
-		} else {
-			trans.action = UpdateEntry
+		// Read-hit fast-path. Both branches (already-sharer / new-sharer)
+		// avoid writeToBank because the directory state mutation is a
+		// trivial sharer-list append (no MSHR, no sub-entry lock, no
+		// bank-pipeline traversal). Without this path, the per-sub-entry
+		// tracking required by REC inflates dir_avg_latency to ~78ns.
+		targetBuffer := ds.cache.localBottomSenderBuffer
+		if !isLocal {
+			targetBuffer = ds.cache.remoteBottomSenderBuffer
+		}
+		if !targetBuffer.CanPush() {
+			*ds.returnFalse += "Cannot push to bottom sender buffer (read-hit fast-path)"
+			ds.cache.stallBottomBufFull++
+			return false
 		}
 
-		return ds.writeToBank(trans, block, index, isLocal)
+		if ds.readPermission(trans, subEntry.Sharer) {
+			// Position/sharer bits already set — no mutation needed.
+			trans.action = Nothing
+		} else {
+			// Append sharer atomically here; bottomSender forwards the
+			// read to L2 with action=UpdateEntry so the existing
+			// per-action accounting still works.
+			ds.cache.directory.Visit(block)
+			block.SubEntry[index].Sharer = appendSharerInline(
+				block.SubEntry[index].Sharer,
+				trans.accessReq().GetSrcRDMA(),
+			)
+			trans.action = UpdateEntry
+		}
+		trans.bottomEnterTime = ds.cache.Engine.CurrentTime()
+		trans.pathCategory = "fast"
+		targetBuffer.Push(trans)
+		return true
 	}
 
 	if ds.writePermission(trans, subEntry.Sharer) {
@@ -290,9 +317,12 @@ func (ds *directoryStage) doWriteHit(
 	if trans.action == Nothing {
 		if !targetBuffer.CanPush() {
 			*ds.returnFalse += "Cannot push to target bottom sender buffer"
+			ds.cache.stallBottomBufFull++
 			return false
 		}
 
+		trans.bottomEnterTime = ds.cache.Engine.CurrentTime()
+		trans.pathCategory = "fast"
 		targetBuffer.Push(trans)
 		return true
 	}
@@ -310,14 +340,18 @@ func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
 		trans.action = Nothing
 		if !targetBuffer.CanPush() {
 			*ds.returnFalse += "Cannot push to bottom sender buffer"
+			ds.cache.stallBottomBufFull++
 			return false
 		}
+		trans.bottomEnterTime = ds.cache.Engine.CurrentTime()
+		trans.pathCategory = "fast"
 		targetBuffer.Push(trans)
 		return true
 	}
 
 	if ds.cache.mshr.IsFull() {
 		*ds.returnFalse += "MSHR is full"
+		ds.cache.stallMSHRFull++
 		return false
 	}
 
@@ -338,7 +372,7 @@ func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
 
 	if victim.IsLockedEntry() || victim.GetReadCount() > 0 {
 		*ds.returnFalse += "Victim is being used"
-		ds.cache.stallMSHRFull++ // repurpose: counts victim-locked stalls too
+		ds.cache.stallVictimLocked++
 		return false
 	}
 
@@ -392,7 +426,7 @@ func (ds *directoryStage) writeToBank(
 	}
 
 	if ds.cache.mshr.IsFull() {
-		*ds.returnFalse += "MSHR is full"
+		*ds.returnFalse += "MSHR is full (writeToBank)"
 		ds.cache.stallMSHRFull++
 		return false
 	}
@@ -438,8 +472,17 @@ func (ds *directoryStage) needEviction(victim *internal.CohEntry) bool {
 
 func (ds *directoryStage) readPermission(trans *transaction, sharer []sim.RemotePort) bool {
 	if !trans.fromLocal { // remote access
+		// Sharer entries are recorded as the requester's *RDMA* port
+		// (see bankstage.UpdateEntry: appendSharer uses GetSrcRDMA()).
+		// The previous code compared against Meta().Src (the immediate
+		// sender, e.g. the RDMA engine port), which never matched the
+		// stored RDMA port — so this branch always returned false and
+		// the action=Nothing fast-path in doWriteHit never fired.
+		// Re-fetches by an existing sharer therefore traversed the full
+		// writeToBank → bank → mshrStage pipeline unnecessarily.
+		src := trans.accessReq().GetSrcRDMA()
 		for _, sh := range sharer {
-			if sh == trans.accessReq().Meta().Src {
+			if sh == src {
 				return true
 			}
 		}
@@ -450,6 +493,21 @@ func (ds *directoryStage) readPermission(trans *transaction, sharer []sim.Remote
 	}
 }
 
+// appendSharerInline appends sh to the sharer list if not already present.
+// Used by the read-hit fast-path (UpdateEntry) which mutates the directory
+// state in directorystage instead of routing through the bank pipeline.
+// The check uses string formatting to match bankstage.sharerExist's
+// equality semantics across nominally-different RemotePort instances.
+func appendSharerInline(list []sim.RemotePort, sh sim.RemotePort) []sim.RemotePort {
+	target := fmt.Sprintf("%s", sh)
+	for _, e := range list {
+		if fmt.Sprintf("%s", e) == target {
+			return list
+		}
+	}
+	return append(list, sh)
+}
+
 func (ds *directoryStage) writePermission(trans *transaction, sharer []sim.RemotePort) bool {
 	if !trans.fromLocal { // remote access
 		// 1. Sharer가 없거나(0명) 여러 명(2명 이상)인 경우 권한 없음
@@ -458,7 +516,10 @@ func (ds *directoryStage) writePermission(trans *transaction, sharer []sim.Remot
 		}
 
 		// 2. Sharer가 딱 1명이지만, 그게 요청자 본인이 아닌 경우 권한 없음
-		if sharer[0] != trans.accessReq().Meta().Src {
+		// Sharer is stored as the requester's RDMA port (GetSrcRDMA),
+		// not Meta().Src. See readPermission() for the matching fix
+		// rationale.
+		if sharer[0] != trans.accessReq().GetSrcRDMA() {
 			return false
 		}
 

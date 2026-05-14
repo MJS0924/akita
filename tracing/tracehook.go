@@ -7,8 +7,16 @@ import (
 	"github.com/sarchlab/akita/v4/sim"
 )
 
-// CollectTrace let the tracer to collect trace from a domain
+// CollectTrace let the tracer to collect trace from a domain.
+// Passing a nil tracer is a no-op so callers (e.g. component builders that
+// receive an optional VisTracer) do not need to wrap each call in a nil
+// check — a nil interface here would otherwise be installed as a traceHook
+// and panic at the first StartTask invocation.
 func CollectTrace(domain NamedHookable, tracer Tracer) {
+	if tracer == nil {
+		return
+	}
+
 	hooks := domain.Hooks()
 	for _, hook := range hooks {
 		hook, ok := hook.(*traceHook)

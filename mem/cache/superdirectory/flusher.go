@@ -121,9 +121,10 @@ func (f *flusher) processFlush() bool {
 		WithAddress(block.Tag).
 		Build()
 	trans := &transaction{
-		read:   dummyRead,
-		action: InvalidateEntry,
-		victim: *block,
+		read:        dummyRead,
+		action:      InvalidateEntry,
+		victim:      *block,
+		rsbHintBank: -1,
 		// 나중에: bankId 잘 넣어야 됨
 	}
 	bankBuf.Push(trans)

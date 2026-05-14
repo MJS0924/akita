@@ -37,6 +37,7 @@ type Builder struct {
 	cohDirLatency int
 	dirLatency    int
 	bankLatency   int
+	snoopLatency  int
 
 	addressMapperType string
 
@@ -171,6 +172,22 @@ func (b Builder) WithDirectoryLatency(n int) Builder {
 // read/write operation.
 func (b Builder) WithBankLatency(n int) Builder {
 	b.bankLatency = n
+	return b
+}
+
+// WithSnoopLatency sets the number of additional cycles an invalidation
+// request spends in the directory stage before being acted on. This models
+// the per-snoop tag-array lookup, state-bit write, and snoop response cost
+// that a real L2 pays regardless of whether the targeted line is present.
+//
+// When set to 0 (default), invalidations share the regular directory
+// pipeline and behavior is identical to the historical implementation.
+// When set to n > 0, invalidations are routed through a dedicated snoop
+// pipeline of (dirLatency + n) stages so they incur the floor cost on top
+// of the normal directory traversal time. The pipeline width matches
+// numReqPerCycle, so per-cycle inv processing throughput is unchanged.
+func (b Builder) WithSnoopLatency(n int) Builder {
+	b.snoopLatency = n
 	return b
 }
 
@@ -313,11 +330,24 @@ func (b *Builder) buildDirectoryStage(cache *Comp) {
 		WithPipelineWidth(b.numReqPerCycle).
 		WithPostPipelineBuffer(buf).
 		Build(cache.Name() + ".Dir.Pipeline")
+
+	var snoopPipeline pipelining.Pipeline
+	if b.snoopLatency > 0 {
+		snoopPipeline = pipelining.
+			MakeBuilder().
+			WithCyclePerStage(1).
+			WithNumStage(b.dirLatency + b.snoopLatency).
+			WithPipelineWidth(b.numReqPerCycle).
+			WithPostPipelineBuffer(buf).
+			Build(cache.Name() + ".Snoop.Pipeline")
+	}
+
 	cache.dirStage = &directoryStage{
-		cache:       cache,
-		pipeline:    pipeline,
-		buf:         buf,
-		returnFalse: "",
+		cache:         cache,
+		pipeline:      pipeline,
+		snoopPipeline: snoopPipeline,
+		buf:           buf,
+		returnFalse:   "",
 	}
 }
 

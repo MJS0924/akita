@@ -10,9 +10,11 @@ import (
 
 // Builder can be used to build a simulation.
 type Builder struct {
-	parallelEngine bool
-	monitorOn      bool
-	outputFileName string
+	parallelEngine    bool
+	monitorOn         bool
+	outputFileName    string
+	traceVisEnabled   bool
+	traceVisEnabledOK bool // distinguishes "default" from "explicit false"
 }
 
 // MakeBuilder creates a new builder.
@@ -38,6 +40,20 @@ func (b Builder) WithoutMonitoring() Builder {
 // WithOutputFileName sets the custom output file name for the data recorder.
 func (b Builder) WithOutputFileName(filename string) Builder {
 	b.outputFileName = filename
+	return b
+}
+
+// WithTraceVisEnabled controls whether the visualization-trace DBTracer is
+// attached to the simulation's data recorder. When false, GetVisTracer()
+// returns nil and per-message StartTask/EndTask calls (via TraceReqReceive,
+// TraceReqComplete, etc.) do NOT write rows to the trace SQLite tables —
+// they still drive in-memory tracers (BusyTimeTracer, AverageTimeTracer,
+// StepCountTracer) so cache-latency / RDMA-count / kernel-time metrics
+// remain intact. Default: true (preserves existing behaviour for callers
+// that do not opt out).
+func (b Builder) WithTraceVisEnabled(enabled bool) Builder {
+	b.traceVisEnabled = enabled
+	b.traceVisEnabledOK = true
 	return b
 }
 
@@ -67,7 +83,13 @@ func (b Builder) Build() *Simulation {
 		s.monitor.StartServer()
 	}
 
-	s.visTracer = tracing.NewDBTracer(s.engine, s.dataRecorder)
+	traceVisEnabled := true
+	if b.traceVisEnabledOK {
+		traceVisEnabled = b.traceVisEnabled
+	}
+	if traceVisEnabled {
+		s.visTracer = tracing.NewDBTracer(s.engine, s.dataRecorder)
+	}
 
 	return s
 }

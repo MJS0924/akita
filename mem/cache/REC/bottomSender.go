@@ -17,6 +17,14 @@ type bottomSender struct {
 	maxInflightRequest       int
 	maxInflightInvalidation  int
 
+	// Phase 2 inv-emit budget (see cohdirectory/bottomSender.go for
+	// rationale). Filtered by message type when draining the shared
+	// queues: only InvReqs count against the cap.
+	maxInvEmitPerCycle          int
+	invEmittedToRDMAThisCycle   int
+	invEmittedToBottomThisCycle int
+	lastEmitCycleTime           sim.VTimeInSec
+
 	localInflightRequest       []*transaction
 	localInflightBypassRequest []*transaction
 	remoteInflightRequest      []*transaction
@@ -24,10 +32,20 @@ type bottomSender struct {
 	inflightInvToOutside []*transaction
 	inflightInvToBottom  []*invTrans
 
-	pendingWriteAfterInv []*transaction // write transactions waiting for L2 after all InvRsps received
+	// Split pendingWriteAfterInv by trans.fromLocal direction to avoid
+	// head-of-line stall under asymmetric soft cap (see superdirectory
+	// for full rationale).
+	pendingLocalWriteAfterInv  []*transaction
+	pendingRemoteWriteAfterInv []*transaction
 
 	sendToBottomQue       []sim.Msg
 	sendToRemoteBottomQue []sim.Msg
+	// Phase F equivalent for REC path. Inv send queue separated from
+	// read/write so a backpressure burst on the data path cannot
+	// HoL-block invalidation traffic. processInvalidationReq() pushes
+	// here; sendToBottom() drains this BEFORE sendToRemoteBottomQue so
+	// invalidations preempt regular requests at the egress.
+	sendToRemoteBottomInvQue []sim.Msg
 	sendToTopQue          []sim.Msg
 	sendToRemoteTopQue    []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
 	sendToDirQue          []*transaction
@@ -38,7 +56,28 @@ type bottomSender struct {
 	returnFalse2 string
 }
 
+func (bs *bottomSender) refreshEmitBudget() {
+	now := bs.cache.Engine.CurrentTime()
+	if now > bs.lastEmitCycleTime {
+		bs.invEmittedToRDMAThisCycle = 0
+		bs.invEmittedToBottomThisCycle = 0
+		bs.lastEmitCycleTime = now
+	}
+}
+
+func (bs *bottomSender) canEmitInvToRDMA() bool {
+	return bs.maxInvEmitPerCycle <= 0 ||
+		bs.invEmittedToRDMAThisCycle < bs.maxInvEmitPerCycle
+}
+
+func (bs *bottomSender) canEmitInvToBottom() bool {
+	return bs.maxInvEmitPerCycle <= 0 ||
+		bs.invEmittedToBottomThisCycle < bs.maxInvEmitPerCycle
+}
+
 func (bs *bottomSender) Tick() bool {
+	bs.refreshEmitBudget()
+
 	madeProgress := false
 
 	// madeProgress = bs.processReturnRsp() || madeProgress
@@ -108,8 +147,13 @@ func (bs *bottomSender) Tick() bool {
 
 // [추가] Bypass 전용 처리 함수
 func (bs *bottomSender) processBypassReq() bool {
-	// [FIX] bypass 경로에도 inflight 제한 적용
-	if len(bs.localInflightBypassRequest) >= bs.maxInflightRequest {
+	// [FIX] bypass 경로에도 inflight 제한 적용 — but use the dedicated
+	// bypass cap (1024 in builder), not the fetch cap (128). Previously
+	// this used maxInflightRequest=128, which throttled bypass to ~100x
+	// of the intended bandwidth and accounted for the entire ~78ns
+	// dir_avg_latency vs CD's 1ns (Method E2 wait-tracker confirmed).
+	// CD's processBypassReq has no such cap.
+	if len(bs.localInflightBypassRequest) >= bs.maxInflightBypassRequest {
 		return false // L2가 느릴 때 backpressure 전파
 	}
 
@@ -139,6 +183,16 @@ func (bs *bottomSender) processBypassReq() bool {
 	bs.cache.bottomSendCount++
 
 	tracing.AddTaskStep(tracing.MsgIDAtReceiver(trans.accessReq(), bs.cache), bs.cache, "BypassToLocalL2")
+
+	// Method E2: queueing-delay accounting for bypass trans.
+	// For bypass, bottomEnterTime is stamped at topparser push to
+	// localBypassBuffer, so waitDir is essentially the buffer-residency
+	// before processBypassReq picks it up.
+	now := bs.cache.Engine.CurrentTime()
+	bs.cache.waitDirSum_bypass += trans.bottomEnterTime - trans.enterTime
+	bs.cache.waitBottomSum_bypass += now - trans.bottomEnterTime
+	bs.cache.waitCount_bypass++
+
 	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
@@ -227,6 +281,7 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 	isLocal bool,
 ) bool {
 	if bs.tooManyInflightRequest(trans.fromLocal) {
+		bs.cache.stallInflightFetch++
 		return false
 	}
 
@@ -279,6 +334,22 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 		what,
 	)
 
+	// Method E2: queueing-delay accumulation. pathCategory is "fast" or
+	// "bank" depending on whether the trans came from directorystage's
+	// fast-path or via the bank pipeline. For "bypass" trans this site
+	// is not reached (they go through processBypassReq).
+	now := bs.cache.Engine.CurrentTime()
+	switch trans.pathCategory {
+	case "fast":
+		bs.cache.waitDirSum_fast += trans.bottomEnterTime - trans.enterTime
+		bs.cache.waitBottomSum_fast += now - trans.bottomEnterTime
+		bs.cache.waitCount_fast++
+	case "bank":
+		bs.cache.waitDirSum_bank += trans.bottomEnterTime - trans.enterTime
+		bs.cache.waitBottomSum_bank += now - trans.bottomEnterTime
+		bs.cache.waitCount_bank++
+	}
+
 	tracing.TraceReqComplete(trans.accessReq(), bs.cache)
 	tracing.TraceReqFinalize(trans.accessReq(), bs.cache)
 
@@ -290,27 +361,39 @@ func (bs *bottomSender) sendInvalidationRequest(
 	isLocal bool,
 ) bool {
 	// 1. [사전 검사] Bottom으로 요청을 내려보내야 하는 액션인데 여유 공간이 없다면 조기 리턴 (트랜잭션 증발 방지)
-	if trans.action == EvictAndInsertNewEntry && bs.tooManyInflightRequest(isLocal) {
+	// Cross-variant fairness: match CD (optdirectory)'s strict
+	// semantics — every non-InvalidateEntry action is throttled by the
+	// shared fetch-cap. Previously REC throttled only
+	// EvictAndInsertNewEntry, letting InvalidateAndUpdateEntry slip
+	// through and hide inv pressure on the fetch path.
+	if trans.action != InvalidateEntry && bs.tooManyInflightRequest(isLocal) {
+		bs.cache.stallInflightFetch++
 		return false
 	}
 
 	if bs.tooManyInflightInvalidation() {
+		bs.cache.stallInflightInv++
 		return false
 	}
 
-	// 2. [대상 선별] victim.SubEntry를 순회하며 실제로 무효화 메시지를 보낼 외부 노드가 있는지 검사
+	// 2. [대상 선별] victim.SubEntry를 순회하며 실제로 무효화 메시지를 보낼 외부 노드가 있는지 검사.
+	// Self-filter는 write-driven inv (InvalidateAndUpdateEntry)에만 적용.
+	// evict-driven inv는 self 포함 모든 sharer가 invalidate해야 함.
+	isWriteDriven := trans.action == InvalidateAndUpdateEntry
 	hasValidTargets := false
 	hasAnySharer := false
 	victim := &trans.victim
 	for i := 0; i < len(victim.SubEntry); i++ {
 		for _, sh := range victim.SubEntry[i].Sharer {
-			if sh != "" {
-				hasAnySharer = true
+			if sh == "" {
+				continue
 			}
-			if sh != trans.accessReq().GetSrcRDMA() && sh != "" {
-				hasValidTargets = true
-				break
+			hasAnySharer = true
+			if isWriteDriven && sh == trans.accessReq().GetSrcRDMA() {
+				continue
 			}
+			hasValidTargets = true
+			break
 		}
 		if hasValidTargets {
 			break
@@ -370,7 +453,10 @@ func (bs *bottomSender) sendInvalidationRequest(
 			for j := 0; j < len(e.Sharer); j++ {
 				sh := e.Sharer[j]
 
-				if sh == trans.accessReq().GetSrcRDMA() || sh == "" {
+				if sh == "" {
+					continue
+				}
+				if isWriteDriven && sh == trans.accessReq().GetSrcRDMA() {
 					continue
 				}
 
@@ -432,8 +518,16 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 	trans *transaction,
 	isLocal bool,
 ) bool {
+	// Cross-variant fairness: write-induced inv path also respects the
+	// fetch cap (matches CD strict semantics).
+	if bs.tooManyInflightRequest(isLocal) {
+		bs.cache.stallInflightFetch++
+		return false
+	}
+
 	// 1. Inflight Invalidation 제한 검사
 	if bs.tooManyInflightInvalidation() {
+		bs.cache.stallInflightInv++
 		return false
 	}
 
@@ -505,7 +599,11 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 		// validTargets == 0이면 transaction이 버퍼에서 pop된 뒤 소멸되어
 		// WriteDoneRsp가 영원히 돌아오지 않는 데드락이 발생한다.
 		trans.action = Nothing
-		bs.pendingWriteAfterInv = append(bs.pendingWriteAfterInv, trans)
+		if trans.fromLocal {
+			bs.pendingLocalWriteAfterInv = append(bs.pendingLocalWriteAfterInv, trans)
+		} else {
+			bs.pendingRemoteWriteAfterInv = append(bs.pendingRemoteWriteAfterInv, trans)
+		}
 	}
 
 	// 5. 메시지 생성이 모두 끝났으므로 invalidationList 비움
@@ -525,6 +623,7 @@ func (bs *bottomSender) processInvalidationReq() bool {
 	}
 
 	if bs.tooManyInflightInvalidationToBottom() {
+		bs.cache.stallInflightInv++
 		return false
 	}
 
@@ -542,7 +641,9 @@ func (bs *bottomSender) processInvalidationReq() bool {
 		WithReqFrom(req.Meta().ID).
 		WithIsWriteInv(req.IsWriteInv).
 		Build()
-	bs.sendToRemoteBottomQue = append(bs.sendToRemoteBottomQue, reqToBottom)
+	// Phase F equivalent: dedicated inv egress queue, drained before
+	// sendToRemoteBottomQue to avoid HoL block by data-path stalls.
+	bs.sendToRemoteBottomInvQue = append(bs.sendToRemoteBottomInvQue, reqToBottom)
 
 	tr.ack++
 
@@ -852,24 +953,41 @@ func (bs *bottomSender) processInvRsp(rsp *mem.InvRsp) bool {
 		// 모든 InvRsp 수신 완료 후 실제 write를 L2로 전송해야 함
 		if trans.write != nil {
 			trans.action = Nothing
-			bs.pendingWriteAfterInv = append(bs.pendingWriteAfterInv, trans)
+			if trans.fromLocal {
+				bs.pendingLocalWriteAfterInv = append(bs.pendingLocalWriteAfterInv, trans)
+			} else {
+				bs.pendingRemoteWriteAfterInv = append(bs.pendingRemoteWriteAfterInv, trans)
+			}
 		}
 	}
 
 	return true
 }
 
+// processPendingWriteAfterInv tries to drain BOTH local and remote
+// pending queues each Tick (see superdirectory equivalent for full
+// rationale: avoids HoL stall when one fromLocal direction's quota
+// is saturated under the asymmetric soft cap).
 func (bs *bottomSender) processPendingWriteAfterInv() bool {
-	if len(bs.pendingWriteAfterInv) == 0 {
-		return false
+	madeProgress := false
+
+	if len(bs.pendingLocalWriteAfterInv) > 0 {
+		trans := bs.pendingLocalWriteAfterInv[0]
+		if bs.sendRequestToBottom(trans, true) {
+			bs.pendingLocalWriteAfterInv = bs.pendingLocalWriteAfterInv[1:]
+			madeProgress = true
+		}
 	}
 
-	trans := bs.pendingWriteAfterInv[0]
-	if bs.sendRequestToBottom(trans, trans.fromLocal) {
-		bs.pendingWriteAfterInv = bs.pendingWriteAfterInv[1:]
-		return true
+	if len(bs.pendingRemoteWriteAfterInv) > 0 {
+		trans := bs.pendingRemoteWriteAfterInv[0]
+		if bs.sendRequestToBottom(trans, false) {
+			bs.pendingRemoteWriteAfterInv = bs.pendingRemoteWriteAfterInv[1:]
+			madeProgress = true
+		}
 	}
-	return false
+
+	return madeProgress
 }
 
 func (bs *bottomSender) sendBypassRspToTop() bool {
@@ -878,6 +996,7 @@ func (bs *bottomSender) sendBypassRspToTop() bool {
 	}
 
 	if !bs.cache.topPort.CanSend() {
+		bs.cache.stallTopPortBusy++
 		return false
 	}
 
@@ -902,6 +1021,7 @@ func (bs *bottomSender) sendRemoteRspToTop() bool {
 	}
 
 	if !bs.cache.RDMAPort.CanSend() {
+		bs.cache.stallTopPortBusy++
 		return false
 	}
 
@@ -936,6 +1056,7 @@ func (bs *bottomSender) sendToTop() bool {
 		}
 
 		if !port.CanSend() {
+			bs.cache.stallTopPortBusy++
 			if isRDMADataPort {
 				continue // safe to skip: RDMAPort(데이터 채널) WriteDoneRsp만 건너뜀
 			}
@@ -958,29 +1079,69 @@ func (bs *bottomSender) sendToTop() bool {
 func (bs *bottomSender) sendToBottom() bool {
 	madeProgress := false
 
+	// Phase F equivalent: drain dedicated inv egress queue FIRST so
+	// data-path backpressure cannot starve invalidation traffic. All
+	// entries are *mem.InvReq by construction.
+	if len(bs.sendToRemoteBottomInvQue) > 0 {
+		head := bs.sendToRemoteBottomInvQue[0]
+		if !bs.canEmitInvToRDMA() {
+			// budget exhausted; defer to next cycle
+		} else if bs.cache.remoteBottomPort.CanSend() {
+			err := bs.cache.remoteBottomPort.Send(head)
+			if err == nil {
+				bs.sendToRemoteBottomInvQue[0] = nil
+				bs.sendToRemoteBottomInvQue = bs.sendToRemoteBottomInvQue[1:]
+				bs.invEmittedToRDMAThisCycle++
+				madeProgress = true
+			}
+		} else {
+			bs.cache.stallBottomPortBusy++
+		}
+	}
+
 	// 1. Remote Bottom 전송 (우선)
+	// Phase 2: per-cycle inv-emit budget. When head of queue is an
+	// InvReq AND the channel's budget is exhausted, defer to next
+	// cycle (HoL: non-inv messages behind cannot pass — models the
+	// directory's outgoing channel serialization).
 	if len(bs.sendToRemoteBottomQue) > 0 {
-		if bs.cache.remoteBottomPort.CanSend() {
-			msg := bs.sendToRemoteBottomQue[0]
-			err := bs.cache.remoteBottomPort.Send(msg)
+		head := bs.sendToRemoteBottomQue[0]
+		_, headIsInv := head.(*mem.InvReq)
+		if headIsInv && !bs.canEmitInvToRDMA() {
+			// budget exhausted; defer to next cycle
+		} else if bs.cache.remoteBottomPort.CanSend() {
+			err := bs.cache.remoteBottomPort.Send(head)
 			if err == nil {
 				bs.sendToRemoteBottomQue[0] = nil
 				bs.sendToRemoteBottomQue = bs.sendToRemoteBottomQue[1:]
+				if headIsInv {
+					bs.invEmittedToRDMAThisCycle++
+				}
 				madeProgress = true
 			}
+		} else {
+			bs.cache.stallBottomPortBusy++
 		}
 	}
 
 	// 2. Local Bottom 전송
 	if len(bs.sendToBottomQue) > 0 {
-		if bs.cache.bottomPort.CanSend() {
-			msg := bs.sendToBottomQue[0]
-			err := bs.cache.bottomPort.Send(msg)
+		head := bs.sendToBottomQue[0]
+		_, headIsInv := head.(*mem.InvReq)
+		if headIsInv && !bs.canEmitInvToBottom() {
+			// budget exhausted; defer to next cycle
+		} else if bs.cache.bottomPort.CanSend() {
+			err := bs.cache.bottomPort.Send(head)
 			if err == nil {
 				bs.sendToBottomQue[0] = nil
 				bs.sendToBottomQue = bs.sendToBottomQue[1:]
+				if headIsInv {
+					bs.invEmittedToBottomThisCycle++
+				}
 				madeProgress = true
 			}
+		} else {
+			bs.cache.stallBottomPortBusy++
 		}
 	}
 
@@ -1003,15 +1164,22 @@ func (bs *bottomSender) sendToDir() bool {
 	return true
 }
 
+// Asymmetric soft cap: remote can use the full maxInflightRequest
+// budget; local is bounded at 3/4. Total inflight is hard-capped at
+// maxInflightRequest. The 1/4 reserve protects remote from being
+// starved by a local burst, while remote-dominant workloads can
+// use the full budget when local is idle. Mirrors the writebackcoh
+// L2 writeBufferStage tooManyInflightEvictions scheme.
 func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
-	if isLocal {
-		// Local 요청은 전체 쿼터의 75%
-		limit := bs.maxInflightRequest - (bs.maxInflightRequest / 4)
-		return len(bs.localInflightRequest) >= limit
+	total := len(bs.localInflightRequest) + len(bs.remoteInflightRequest)
+	if total >= bs.maxInflightRequest {
+		return true
 	}
-	// Remote 요청은 전체 쿼터의 25%
-	limit := bs.maxInflightRequest / 4
-	return len(bs.remoteInflightRequest) >= limit
+	if isLocal {
+		localLimit := bs.maxInflightRequest - bs.maxInflightRequest/4
+		return len(bs.localInflightRequest) >= localLimit
+	}
+	return false
 }
 
 func (bs *bottomSender) tooManyInflightInvalidation() bool {
@@ -1032,11 +1200,13 @@ func (bs *bottomSender) Reset() {
 
 	bs.inflightInvToBottom = nil
 	bs.inflightInvToOutside = nil
-	bs.pendingWriteAfterInv = nil
+	bs.pendingLocalWriteAfterInv = nil
+	bs.pendingRemoteWriteAfterInv = nil
 	bs.sendToTopQue = nil
 	bs.sendToRemoteTopQue = nil
 	bs.sendToBottomQue = nil
 	bs.sendToRemoteBottomQue = nil
+	bs.sendToRemoteBottomInvQue = nil
 	bs.sendToDirQue = nil
 	bs.bypassRspQue = nil
 }

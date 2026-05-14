@@ -18,7 +18,11 @@ type RegionSizeBuffer struct {
 func NewRegionSizeBuffer(numEntries uint64, pageSize uint64, regionLen []int, disabled bool) *RegionSizeBuffer {
 	return &RegionSizeBuffer{
 		numEntries:   numEntries,
-		entries:      make([]RegionSizeBufferEntry, numEntries),
+		// Empty slice (cap=numEntries). Previously initialized with length=
+		// numEntries which left numEntries dummy zero-valued entries
+		// (Addr=0, RegionID=0) — these spuriously matched Search queries to
+		// addr 0 and routed to bank 0.
+		entries:      make([]RegionSizeBufferEntry, 0, numEntries),
 		log2PageSize: pageSize,
 		regionLen:    regionLen,
 		disabled:     disabled,
@@ -26,7 +30,7 @@ func NewRegionSizeBuffer(numEntries uint64, pageSize uint64, regionLen []int, di
 }
 
 func (b *RegionSizeBuffer) Reset() {
-	b.entries = make([]RegionSizeBufferEntry, b.numEntries)
+	b.entries = b.entries[:0]
 }
 
 func (b *RegionSizeBuffer) Search(addr uint64) RegionSizeBufferEntry {
@@ -85,6 +89,31 @@ func (b *RegionSizeBuffer) Update(addr uint64, regionID int) {
 
 func (b *RegionSizeBuffer) GetEntries() *[]RegionSizeBufferEntry {
 	return &b.entries
+}
+
+// InvalidateAddr removes any RSB entry whose stored address matches addr at
+// the entry's own RegionID granularity, regardless of which bank the entry
+// points to. Called whenever a new directory entry is created/updated at any
+// bank — the addr is now *present* there, so per RSB design intent (only
+// "absent" addrs may be hinted) no RSB entry should match it. Without this
+// cleanup, a stale hint pointing to a bank where the data is no longer
+// located will mis-route a future access into doWriteMiss at that bank,
+// allocating a parallel entry that violates the single-owner invariant.
+func (b *RegionSizeBuffer) InvalidateAddr(addr uint64) {
+	if b.disabled {
+		return
+	}
+	pageAddr := addr >> b.log2PageSize
+	n := 0
+	for _, e := range b.entries {
+		mask := b.regionLen[e.RegionID]
+		if e.Addr>>mask == pageAddr>>mask {
+			continue
+		}
+		b.entries[n] = e
+		n++
+	}
+	b.entries = b.entries[:n]
 }
 
 // InvalidateForPromotion removes stale RSB entries that would mis-route requests

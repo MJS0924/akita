@@ -42,8 +42,14 @@ func (s *Simulation) GetMonitor() *monitoring.Monitor {
 	return s.monitor
 }
 
-// GetVisTracer returns the tracer used in the simulation.
-func (s *Simulation) GetVisTracer() *tracing.DBTracer {
+// GetVisTracer returns the tracer used in the simulation. Returns an
+// untyped nil interface when visualization tracing is disabled (see
+// Builder.WithTraceVisEnabled), so callers can safely pass the result to
+// `WithVisTracer` setters that nil-check via interface equality.
+func (s *Simulation) GetVisTracer() tracing.Tracer {
+	if s.visTracer == nil {
+		return nil
+	}
 	return s.visTracer
 }
 

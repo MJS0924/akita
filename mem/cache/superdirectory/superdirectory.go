@@ -105,6 +105,55 @@ type Comp struct {
 	doWriteMissCount   uint64 // diagnostic: how many times doWriteMiss is reached
 	doWriteMissRemote  uint64 // diagnostic: doWriteMiss with fromLocal=false
 
+	// Stall cause counters (Method E — mirrors REC/optdirectory for
+	// one-to-one comparison). Each increments when the named back-pressure
+	// forces the transaction to retry next cycle.
+	stallMSHRFull       uint64 // writeToBank: mshr.IsFull()
+	stallSubEntryLocked uint64 // doWriteHit: sub-entry IsLocked or ReadCount > 0
+	stallBankFull       uint64 // writeToBank: bankBuf.CanPush() == false
+	stallEvictingList   uint64 // processTransaction: addr in evictingList
+	stallVictimLocked   uint64 // doWriteMiss: victim entry locked
+	stallBottomBufFull  uint64 // fast-path push to bottomSenderBuffer rejected
+	stallMshrBufFull    uint64 // bankstage push to mshrStageBuffer rejected
+	stallInflightFetch  uint64 // bottomSender: tooManyInflightRequest
+	stallInflightInv    uint64 // bottomSender: tooManyInflightInvalidation
+	stallBottomPortBusy uint64 // bottomSender: bottomPort/RDMAPort can't send
+	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
+	stallWriteToBankPreflight uint64 // writeToBank: MSHR cross-granularity conflict caught before mutation
+	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
+
+	// H3e fix counter: number of demote triggers that hit a DemoteLocked
+	// entry and were converted to invalidate-only. Reports cascade-prevention
+	// work performed by the demote-lock fix.
+	demoteLockHits uint64
+
+	// disableDemoteLock bypasses the demote-lock skip in mshrStage so every
+	// demote trigger goes down the cascading path. Used for A/B comparison
+	// against the lock-on default. The DemoteLocked flag itself is still
+	// set/cleared as usual so the diagnostic counter remains comparable.
+	disableDemoteLock bool
+
+	// promoteRelaxed switches the promotion eligibility check from the strict
+	// AbleToPromotion (all sub-entries valid AND all sharer sets equal) to
+	// AbleToPromotionRelaxed (any valid sub-entry, sharer = union of valid
+	// sub-entry sharers). Lets entries return to a finer region after
+	// coarsening; gated for A/B comparison.
+	promoteRelaxed bool
+
+	// useRsbHintAlloc makes doWriteMiss honor the RSB hint (carried on the
+	// transaction) when allocating a new entry, instead of always defaulting
+	// to the finest bank. Closes the RSB feedback loop: previously RSB hits
+	// were consumed by lookup-only and the allocation always landed at finest.
+	useRsbHintAlloc bool
+
+	// recordSilentEvict makes the directory write its non-finest victim's
+	// bank into RSB on every eviction (write-miss / promotion / demotion
+	// target replacements), not just on eviction-with-sharers. Without this,
+	// RSB.Update only fires from processInvRsp which requires invalidation
+	// responses — for workloads with little cross-GPU sharing, RSB stays
+	// effectively empty even though evictions are common.
+	recordSilentEvict bool
+
 	// OP5 deviation regression slots (PHASE C-2). Increment sites are
 	// intentionally absent in the post-fix code: a non-zero value means
 	// either (a) a future change reintroduced the buggy branch and wired
@@ -116,6 +165,27 @@ type Comp struct {
 	// cross_model_op5_audit.md C1.3). This counter records the "writer
 	// cleared at finest bank" case only, which should never fire.
 	op5bWriterClearedAtFinestBank uint64
+
+	// eventCounts replaces high-frequency tracing.AddTaskStep calls with
+	// in-memory counters to keep akita_sim_*.sqlite trace files small.
+	// report.go's eventCountsProvider reads this map at simulation end.
+	eventCounts map[string]uint64
+}
+
+func (c *Comp) incEvent(name string) {
+	if c.eventCounts == nil {
+		c.eventCounts = make(map[string]uint64)
+	}
+	c.eventCounts[name]++
+}
+
+// EventCounts returns a copy of the in-memory event counters.
+func (c *Comp) EventCounts() map[string]uint64 {
+	out := make(map[string]uint64, len(c.eventCounts))
+	for k, v := range c.eventCounts {
+		out[k] = v
+	}
+	return out
 }
 
 // ActionCounts returns the diagnostic counters in a uniform map for
@@ -128,6 +198,20 @@ func (c *Comp) ActionCounts() map[string]uint64 {
 		"remote_accept_count":  c.remoteAcceptCount,
 		"do_write_miss":        c.doWriteMissCount,
 		"do_write_miss_remote": c.doWriteMissRemote,
+		"stall_mshr_full":          c.stallMSHRFull,
+		"stall_subentry_locked":    c.stallSubEntryLocked,
+		"stall_bank_full":          c.stallBankFull,
+		"stall_evicting_list":      c.stallEvictingList,
+		"stall_victim_locked":      c.stallVictimLocked,
+		"stall_bottom_buf_full":    c.stallBottomBufFull,
+		"stall_mshr_buf_full":      c.stallMshrBufFull,
+		"stall_inflight_fetch":     c.stallInflightFetch,
+		"stall_inflight_inv":       c.stallInflightInv,
+		"stall_bottom_port_busy":   c.stallBottomPortBusy,
+		"stall_top_port_busy":      c.stallTopPortBusy,
+		"stall_write_to_bank_preflight": c.stallWriteToBankPreflight,
+		"total_dowrite_calls":      c.totalDoWriteCalls,
+		"demote_lock_hits":         c.demoteLockHits,
 		"op5a_shortcut_with_remote_sharer":     c.op5aShortcutWithRemoteSharer,
 		"op5b_writer_cleared_at_finest_bank":   c.op5bWriterClearedAtFinestBank,
 	}
@@ -138,6 +222,67 @@ func (c *Comp) AvgEvictUtilization() float64 {
 		return 0
 	}
 	return c.evictEntryUtilSum / float64(c.evictEntryCount)
+}
+
+// CurrentValidEntryUtilization scans every directory entry that is
+// currently valid (IsValidEntry == true) and averages the per-entry
+// sub-entry utilization (validSubEntries / totalSubEntries). Invalid
+// entries are excluded from the average. Returns (avgUtil, validEntries)
+// where avgUtil ∈ [0,1] and validEntries is the count of valid entries
+// observed. Safe to call between simulation ticks (SerialEngine guarantee).
+//
+// Use case: per-window snapshot wants the live utilization of the
+// directory at every checkpoint — not just the eviction-time samples
+// recorded by AvgEvictUtilization.
+//
+// Returns (avgUtil, validEntries, totalCacheLines). totalCacheLines is
+// the directory's cache-line coverage capacity. UNLIKE REC, each SD
+// sub-entry covers a region of size 2^regionLen[bankID] bytes — the
+// number of cache lines a sub-entry can cover therefore depends on
+// which bank the parent entry sits in:
+//
+//	cachelines_per_subentry(bankID) = 1 << (regionLen[bankID] - log2BlockSize)
+//
+// builder.go sets regionLen = {14,12,10,8,6} (bank 0 coarsest .. bank 4
+// finest at log2BlockSize=6,log2NumSubEntry=2), so coverage per valid
+// sub-entry ranges from 1 cacheline (finest) up to 256 cachelines
+// (coarsest). Earlier versions of this method counted each valid
+// sub-entry as 1 cacheline irrespective of bank, which under-reports
+// coverage by a factor of up to 256× for coarse banks.
+func (c *Comp) CurrentValidEntryUtilization() (float64, int, int) {
+	banks := c.directory.GetBanks()
+	var sum float64
+	count := 0
+	totalCacheLines := 0
+	for bankIdx, bank := range banks {
+		// 1 << (regionLen[bankIdx] - log2BlockSize) cache lines per
+		// valid sub-entry in this bank.
+		cachelinesPerSub := 1 << (c.regionLen[bankIdx] - int(c.log2BlockSize))
+		for _, set := range bank {
+			for _, entry := range set.CohEntries {
+				if entry == nil || !entry.IsValidEntry() {
+					continue
+				}
+				numSub := len(entry.SubEntry)
+				if numSub == 0 {
+					continue
+				}
+				validSub := 0
+				for k := 0; k < numSub; k++ {
+					if entry.SubEntry[k].IsValid {
+						validSub++
+					}
+				}
+				sum += float64(validSub) / float64(numSub)
+				count++
+				totalCacheLines += validSub * cachelinesPerSub
+			}
+		}
+	}
+	if count == 0 {
+		return 0, 0, 0
+	}
+	return sum / float64(count), count, totalCacheLines
 }
 
 func (c *Comp) EvictCount() uint64 {

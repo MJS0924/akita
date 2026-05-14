@@ -65,7 +65,13 @@ type transaction struct {
 
 	entryProcessingPromotion bool
 	sharers                  []sim.RemotePort
-	needToDemotion           bool
+	// capturedPromoteSharers holds the source block's sharer set captured at
+	// the moment promotion is queued (in processOneReq), BEFORE IsValid is
+	// cleared on the source's sub-entries. insertPromotionEntry uses this
+	// instead of recomputing SharerUnion, which would otherwise return []
+	// because all sub.IsValid have been cleared by then.
+	capturedPromoteSharers []sim.RemotePort
+	needToDemotion         bool
 
 	// bfEagerInserted is set true when acceptNewTransaction eagerly called
 	// InsertBloomfilter before the transaction enters the bank pipeline.
@@ -73,6 +79,11 @@ type transaction struct {
 	bfEagerInserted bool
 
 	utilRecorded bool // set true once evict-utilization has been sampled for this transaction
+
+	// rsbHintBank carries the RSB hint forward to doWriteMiss so allocation
+	// honors the recorded "this address used to be at bank X" rather than
+	// always defaulting to the finest bank. -1 means "no hint" (RSB miss).
+	rsbHintBank int
 }
 
 func (t transaction) accessReq() mem.AccessReq {
@@ -141,6 +152,11 @@ func (t *transaction) DeepCopy() *transaction {
 	if t.sharers != nil {
 		newTrans.sharers = make([]sim.RemotePort, len(t.sharers))
 		copy(newTrans.sharers, t.sharers)
+	}
+
+	if t.capturedPromoteSharers != nil {
+		newTrans.capturedPromoteSharers = make([]sim.RemotePort, len(t.capturedPromoteSharers))
+		copy(newTrans.capturedPromoteSharers, t.capturedPromoteSharers)
 	}
 
 	// 3. 값 타입(Value)인 victim 깊은 복사

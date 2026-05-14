@@ -30,7 +30,7 @@ func (m *mockSuperDirectory) Lookup(_ int, _ vm.PID, _ uint64) (*internal.CohEnt
 	panic("not implemented")
 }
 func (m *mockSuperDirectory) GetSet(_ int, _ uint64) (*internal.CohSet, int) {
-	panic("not implemented")
+	return &internal.CohSet{CohEntries: nil}, 0
 }
 func (m *mockSuperDirectory) GetBanks() [][]internal.CohSet { panic("not implemented") }
 func (m *mockSuperDirectory) FindVictim(_ int, _ vm.PID, _ uint64) (*internal.CohEntry, bool) {
@@ -84,6 +84,8 @@ func newTestDirStage(dir *mockSuperDirectory, rsbRegionID int) *directoryStage {
 		directory:        dir,
 		regionSizeBuffer: *rsb,
 		numBanks:         testNumBanks,
+		regionLen:        testRegionLen,
+		mshr:             &mockMSHR{},
 	}
 	return &directoryStage{cache: comp}
 }
@@ -118,7 +120,7 @@ func buildDummyRead(addr uint64) *mem.ReadReq {
 // (a) RSB hit, BF empty → normal sub-case: bankID=RSB, bankList=nil, bfEager=true
 func TestSelectBank_RSBHit_BFEmpty(t *testing.T) {
 	ds := newTestDirStage(newMockDir(nil), 2)
-	sel := ds.selectBank(testAddr)
+	sel := ds.selectBank(vm.PID(0), testAddr)
 	if sel.bankID != 2 {
 		t.Errorf("bankID: want 2, got %d", sel.bankID)
 	}
@@ -136,7 +138,7 @@ func TestSelectBank_RSBHit_BFEmpty(t *testing.T) {
 // (b) RSB=1, BF=[3,2] (bfList[last]=2 > 1) → non-stale → bankID=1, bankList=nil
 func TestSelectBank_RSBHit_BFNonStale(t *testing.T) {
 	ds := newTestDirStage(newMockDir([]int{3, 2}), 1)
-	sel := ds.selectBank(testAddr)
+	sel := ds.selectBank(vm.PID(0), testAddr)
 	if sel.bankID != 1 {
 		t.Errorf("bankID: want 1, got %d", sel.bankID)
 	}
@@ -151,7 +153,7 @@ func TestSelectBank_RSBHit_BFNonStale(t *testing.T) {
 // (c) RSB=2, BF=[4,0] (bfList[last]=0 < 2) → stale → bankID=4, bankList=[0], bfEager=false
 func TestSelectBank_RSBHit_BFStale(t *testing.T) {
 	ds := newTestDirStage(newMockDir([]int{4, 0}), 2)
-	sel := ds.selectBank(testAddr)
+	sel := ds.selectBank(vm.PID(0), testAddr)
 	if sel.bankID != 4 {
 		t.Errorf("bankID: want 4, got %d", sel.bankID)
 	}
@@ -166,7 +168,7 @@ func TestSelectBank_RSBHit_BFStale(t *testing.T) {
 // (d) RSB miss, BF=[3,1] → bankID=3, bankList=[1]
 func TestSelectBank_RSBMiss_BFNonEmpty(t *testing.T) {
 	ds := newTestDirStage(newMockDir([]int{3, 1}), -1)
-	sel := ds.selectBank(testAddr)
+	sel := ds.selectBank(vm.PID(0), testAddr)
 	if sel.bankID != 3 {
 		t.Errorf("bankID: want 3, got %d", sel.bankID)
 	}
@@ -181,7 +183,7 @@ func TestSelectBank_RSBMiss_BFNonEmpty(t *testing.T) {
 // (e) RSB miss, BF empty → bankID=numBanks-1=4, bankList=nil
 func TestSelectBank_RSBMiss_BFEmpty(t *testing.T) {
 	ds := newTestDirStage(newMockDir(nil), -1)
-	sel := ds.selectBank(testAddr)
+	sel := ds.selectBank(vm.PID(0), testAddr)
 	if sel.bankID != testNumBanks-1 {
 		t.Errorf("bankID: want %d, got %d", testNumBanks-1, sel.bankID)
 	}
@@ -197,7 +199,7 @@ func TestSelectBank_CommitSafe_S1_BeforeOnCommit(t *testing.T) {
 	dir := newMockDir(nil)
 	ds := newTestDirStage(dir, 2)
 
-	_ = ds.selectBank(testAddr) // state must NOT change here
+	_ = ds.selectBank(vm.PID(0), testAddr) // state must NOT change here
 
 	if got := ds.cache.regionSizeBuffer.Search(testAddr); got.RegionID != 2 {
 		t.Errorf("RSB must not be deleted before onCommit: got RegionID=%d", got.RegionID)
@@ -212,7 +214,7 @@ func TestSelectBank_CommitSafe_S1_AfterOnCommit(t *testing.T) {
 	dir := newMockDir(nil)
 	ds := newTestDirStage(dir, 2)
 
-	sel := ds.selectBank(testAddr)
+	sel := ds.selectBank(vm.PID(0), testAddr)
 	if sel.onCommit == nil {
 		t.Fatal("onCommit must be non-nil for normal RSB hit")
 	}
@@ -235,12 +237,12 @@ func TestSelectBank_Race_BFInsertPreventsDefaultRouting(t *testing.T) {
 
 	// Commit X1's onCommit (RSB deleted, BF[2] inserted conceptually).
 	ds1 := newTestDirStage(dir, 2)
-	sel1 := ds1.selectBank(testAddr)
+	sel1 := ds1.selectBank(vm.PID(0), testAddr)
 	sel1.onCommit() // RSB deleted; real BF updated (mock records the call)
 
 	// X2 arrives on same Comp (RSB now empty, BF returns [2]).
 	ds2 := &directoryStage{cache: ds1.cache}
-	sel2 := ds2.selectBank(testAddr)
+	sel2 := ds2.selectBank(vm.PID(0), testAddr)
 	if sel2.bankID != 2 {
 		t.Errorf("X2 bankID: want 2 (BF-guided), got %d", sel2.bankID)
 	}
@@ -249,7 +251,7 @@ func TestSelectBank_Race_BFInsertPreventsDefaultRouting(t *testing.T) {
 // Stale path must not set bfEager=true (would suppress the allocation-path BF insert).
 func TestSelectBank_Stale_BFEagerFalse(t *testing.T) {
 	ds := newTestDirStage(newMockDir([]int{4, 0}), 2)
-	sel := ds.selectBank(testAddr)
+	sel := ds.selectBank(vm.PID(0), testAddr)
 	if sel.bfEager {
 		t.Error("stale sub-case must not set bfEager=true")
 	}

@@ -51,6 +51,12 @@ type transaction struct {
 	// evictionWriteReq  *mem.WriteReq
 
 	mshrEntry *internal.MSHREntry
+
+	// Per-stage timestamps for queueing-delay analysis (Method E2).
+	// Mirrors REC's transaction layout for one-to-one comparison.
+	enterTime       sim.VTimeInSec
+	bottomEnterTime sim.VTimeInSec
+	pathCategory    string // "bypass" / "fast" / "bank"
 }
 
 func (t transaction) accessReq() mem.AccessReq {

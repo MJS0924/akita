@@ -206,7 +206,12 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 		mshrStageBuf = s.cache.remoteMshrStageBuffer
 	}
 
-	if !bottomSenderBuf.CanPush() || !mshrStageBuf.CanPush() {
+	if !bottomSenderBuf.CanPush() {
+		s.cache.stallBottomBufFull++
+		return false
+	}
+	if !mshrStageBuf.CanPush() {
+		s.cache.stallMshrBufFull++
 		return false
 	}
 

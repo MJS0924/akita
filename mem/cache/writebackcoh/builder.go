@@ -38,6 +38,7 @@ type Builder struct {
 	cohDirLatency int
 	dirLatency    int
 	bankLatency   int
+	snoopLatency  int
 
 	addressMapperType string
 
@@ -181,6 +182,33 @@ func (b Builder) WithBankLatency(n int) Builder {
 	return b
 }
 
+// WithSnoopLatency sets the number of *additional* cycles an invalidation
+// request spends in the directory stage on top of the regular dirLatency.
+// This models the per-snoop tag-array lookup, state-bit write, and snoop
+// response generation cost a real L2 pays regardless of whether the
+// targeted line is present (i.e., wasted invalidations cost the same as
+// productive ones).
+//
+// Default: 0 — invalidations share the regular local/remote pipelines and
+// behavior is byte-identical to the historical implementation.
+//
+// When n > 0, two dedicated snoop pipelines (local + remote) of
+// (dirLatency + n) stages each are created. acceptNewTransaction routes
+// InvReq items into them; the existing local/remote post-pipeline buffers
+// are reused as the merge point, so processTransaction is unchanged.
+// Pipeline width matches numReqPerCycle, so the per-cycle inv processing
+// throughput cap is unchanged — only the latency floor is added.
+//
+// Deadlock safety: the pipelining package keeps madeProgress=true while a
+// stage's cycleLeft countdown is in flight, which keeps the cache ticking
+// until any deferred inv reaches the post-buffer. There is no extra
+// queue or shared resource introduced beyond the pipelines themselves,
+// so no new HoL blocking path is created.
+func (b Builder) WithSnoopLatency(n int) Builder {
+	b.snoopLatency = n
+	return b
+}
+
 func (b Builder) WithAddressMapperType(t string) Builder {
 	b.addressMapperType = t
 	return b
@@ -264,7 +292,16 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.numReqPerCycle = b.numReqPerCycle
 	cacheModule.directory = directory
 	cacheModule.mshr = mshr
-	cacheModule.maxLocalMshr = b.numMSHREntry * 3 / 4
+	// 50/50 split between fromLocal (this GPU's L1) and fromRemote
+	// (external GPU's incoming via RDMA). Previously 75/25; under CD_0
+	// (cache-line granularity invalidation) the 25% remote reserve was
+	// too small — cross-GPU cyclic fetch dependency stalled when every
+	// GPU's outgoing fetches saturated their 75% and incoming WriteReq
+	// from peers couldn't allocate the last 25%. With 50/50, each GPU
+	// remote 요청은 MSHR 전체(numMSHREntry)를 사용 가능, local 요청은 항상 16개 슬롯을 remote용으로 예약.
+	// numMSHREntry/2(=32) 정책은 bypass 요청이 많을 때 local soft cap에 너무 빨리 도달해
+	// remote 요청이 진행되지 못하는 deadlock을 유발함.
+	cacheModule.maxLocalMshr = b.numMSHREntry - 16
 	cacheModule.storage = storage
 
 	if b.addressToPortMapper == nil {
@@ -277,6 +314,10 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.addressToPortMapper = b.addressToPortMapper
 	cacheModule.state = cacheStateRunning
 	cacheModule.evictingList = make(map[uint64]bool)
+
+	// Method D: miss-reason tracking — initialize empty.
+	cacheModule.seenAddrs = make(map[missTrackerKey]struct{})
+	cacheModule.lastEvictionReason = make(map[missTrackerKey]string)
 
 	cacheModule.DirtyMask = b.DirtyMask
 	cacheModule.ReadMask = b.ReadMask
@@ -345,16 +386,60 @@ func (b *Builder) buildDirectoryStage(cache *Comp) {
 		WithPostPipelineBuffer(remoteBuf).
 		Build(cache.Name() + ".Dir.RemotePipeline")
 
-	// 3. directoryStage 구조체 초기화 및 할당
+	// 3. (Optional) Snoop pipelines for InvReq with extended latency.
+	// Built only when snoopLatency > 0; otherwise nil and invalidations
+	// flow through localPipeline/remotePipeline as before. Pipelines feed
+	// the same localBuf/remoteBuf so the downstream commit loop is
+	// unchanged. Their total stage count is dirLatency+snoopLatency so
+	// the snoop latency adds *on top of* the regular tag-access time.
+	var localSnoopPipeline, remoteSnoopPipeline pipelining.Pipeline
+	if b.snoopLatency > 0 {
+		localSnoopPipeline = pipelining.
+			MakeBuilder().
+			WithCyclePerStage(1).
+			WithNumStage(b.dirLatency + b.snoopLatency).
+			WithPipelineWidth(b.numReqPerCycle).
+			WithPostPipelineBuffer(localBuf).
+			Build(cache.Name() + ".Dir.LocalSnoopPipeline")
+		remoteSnoopPipeline = pipelining.
+			MakeBuilder().
+			WithCyclePerStage(1).
+			WithNumStage(b.dirLatency + b.snoopLatency).
+			WithPipelineWidth(b.numReqPerCycle).
+			WithPostPipelineBuffer(remoteBuf).
+			Build(cache.Name() + ".Dir.RemoteSnoopPipeline")
+	}
+
+	// 4. Phase F dedicated InvReq pipeline. ingress: invStageBuffer → invPipeline
+	// (same dirLatency stages so tag lookup time is honored), post-pipeline:
+	// invBuf. processTransaction drains invBuf BEFORE local/remote bufs so
+	// invs preempt stalled read/write at the commit stage.
+	invBuf := sim.NewBuffer(
+		cache.Name()+".InvDirectoryStageInternalBuffer",
+		b.numReqPerCycle,
+	)
+	invPipeline := pipelining.
+		MakeBuilder().
+		WithCyclePerStage(1).
+		WithNumStage(b.dirLatency).
+		WithPipelineWidth(b.numReqPerCycle).
+		WithPostPipelineBuffer(invBuf).
+		Build(cache.Name() + ".Dir.InvPipeline")
+
+	// 5. directoryStage 구조체 초기화 및 할당
 	cache.dirStage = &directoryStage{
-		cache:          cache,
-		localPipeline:  localPipeline,
-		remotePipeline: remotePipeline,
-		localBuf:       localBuf,
-		remoteBuf:      remoteBuf,
-		activeBuf:      localBuf, // [추가] 현재 활성화된 버퍼를 가리키는 포인터 (Local이 기본)
-		returnFalse0:   "",
-		returnFalse1:   "",
+		cache:               cache,
+		localPipeline:       localPipeline,
+		remotePipeline:      remotePipeline,
+		localSnoopPipeline:  localSnoopPipeline,
+		remoteSnoopPipeline: remoteSnoopPipeline,
+		invPipeline:         invPipeline,
+		localBuf:            localBuf,
+		remoteBuf:           remoteBuf,
+		invBuf:              invBuf,
+		activeBuf:           localBuf, // [추가] 현재 활성화된 버퍼를 가리키는 포인터 (Local이 기본)
+		returnFalse0:        "",
+		returnFalse1:        "",
 	}
 }
 
@@ -398,6 +483,14 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 	cache.remoteDirStageBuffer = sim.NewBuffer( // coherence directoy to directory
 		cache.Name()+".RemoteDirStageBuffer",
 		cache.numReqPerCycle,
+	)
+	// Phase F priority queue for InvReq. Capacity = numReqPerCycle*4 to
+	// absorb burst (a single eviction at home directory can fan out to
+	// multiple sharers; bursts of evict-driven invs are common). dirStage
+	// drains this BEFORE the regular FIFO each Tick.
+	cache.invStageBuffer = sim.NewBuffer(
+		cache.Name()+".InvStageBuffer",
+		cache.numReqPerCycle*4,
 	)
 	cache.dirToBankBuffers = make([]sim.Buffer, 1)
 	cache.dirToBankBuffers[0] = sim.NewBuffer(

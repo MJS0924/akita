@@ -3,6 +3,7 @@ package optdirectory
 import (
 	"fmt"
 	"log"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
@@ -103,6 +104,14 @@ type Comp struct {
 	cumulativeSnapshots []coalescabilitySnapshot
 	currentKernelID     int
 
+	// --- Sharer heatmap (per-window cacheline × time visualization) ---
+	// All zero-cost when sharerHeatmapEnabled is false.
+	sharerHeatmapEnabled bool
+	accessMaskWindow     map[uint64]uint32 // blockID → access count this window
+	blockTotalAccess     map[uint64]uint64 // cumulative across whole run
+	heatmapCSVFile       *os.File          // per-GPU sharer heatmap CSV
+	heatmapWindowID      int
+
 	// --- Exp-W: write workload tracking ---
 	writeEventCountKernel     int               // total write events in current kernel
 	sharerSetChurnCountKernel int               // times sharerSet[blockID] changed value this kernel
@@ -119,13 +128,41 @@ type Comp struct {
 	actInvUpdate     uint64
 	actBypass        uint64
 	bottomSendCount  uint64
+	// remoteBottomPort/bottomPort 별도 사용량 추적 (deadlock 분석용).
+	localSendCount        uint64 // sendRequestToBottom/sendMultipleRequest with isLocal=true
+	remoteSendCount       uint64 // sendRequestToBottom/sendMultipleRequest with isLocal=false
+	bypassSendCount       uint64 // processBypassReq sends (always local)
 	mshrFwdCount     uint64
 
-	// Stall cause counters (mirrors REC for comparison)
-	stallMSHRFull       uint64
-	stallBlockLocked    uint64
-	stallBankFull       uint64
-	totalDoWriteCalls   uint64
+	// MSHR local/remote soft cap (mirrors writebackcoh L2 정책):
+	// remote 요청은 전체 numMSHREntry 사용 가능; local 요청은 항상 16개 슬롯을 예약.
+	maxLocalMshr   int // numMSHREntry - 16
+	localMshrCount int // 현재 in-flight local MSHR entry 수
+
+	// Stall cause counters (Method E — mirrors REC for one-to-one comparison).
+	stallMSHRFull       uint64 // writeToBank: mshr.IsFull() or local soft cap
+	stallBlockLocked    uint64 // doWriteHit: block IsLocked or ReadCount > 0
+	stallBankFull       uint64 // writeToBank: bankBuf.CanPush() == false
+	stallEvictingList   uint64 // processTransaction: addr in evictingList
+	stallVictimLocked   uint64 // doWriteMiss: victim entry locked
+	stallBottomBufFull  uint64 // fast-path push to bottomSenderBuffer rejected
+	stallMshrBufFull    uint64 // bankstage push to mshrStageBuffer rejected
+	stallInflightFetch  uint64 // bottomSender: tooManyInflightRequest
+	stallInflightInv    uint64 // bottomSender: tooManyInflightInvalidation
+	stallBottomPortBusy uint64 // bottomSender: bottomPort/RDMAPort can't send
+	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
+	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
+
+	// Queueing-delay accumulators (Method E2). See REC Comp for naming.
+	waitDirSum_bypass    sim.VTimeInSec
+	waitBottomSum_bypass sim.VTimeInSec
+	waitCount_bypass     uint64
+	waitDirSum_fast      sim.VTimeInSec
+	waitBottomSum_fast   sim.VTimeInSec
+	waitCount_fast       uint64
+	waitDirSum_bank      sim.VTimeInSec
+	waitBottomSum_bank   sim.VTimeInSec
+	waitCount_bank       uint64
 
 	// OP5 deviation regression slots (PHASE C-2). Increment sites are
 	// intentionally absent in the post-fix code: a non-zero value means
@@ -154,7 +191,24 @@ func (c *Comp) ActionCounts() map[string]uint64 {
 		"stall_mshr_full":          c.stallMSHRFull,
 		"stall_block_locked":       c.stallBlockLocked,
 		"stall_bank_full":          c.stallBankFull,
+		"stall_evicting_list":      c.stallEvictingList,
+		"stall_victim_locked":      c.stallVictimLocked,
+		"stall_bottom_buf_full":    c.stallBottomBufFull,
+		"stall_mshr_buf_full":      c.stallMshrBufFull,
+		"stall_inflight_fetch":     c.stallInflightFetch,
+		"stall_inflight_inv":       c.stallInflightInv,
+		"stall_bottom_port_busy":   c.stallBottomPortBusy,
+		"stall_top_port_busy":      c.stallTopPortBusy,
 		"total_dowrite_calls":      c.totalDoWriteCalls,
+		"wait_dir_ns_bypass":       uint64(c.waitDirSum_bypass * 1e9),
+		"wait_bottom_ns_bypass":    uint64(c.waitBottomSum_bypass * 1e9),
+		"wait_count_bypass":        c.waitCount_bypass,
+		"wait_dir_ns_fast":         uint64(c.waitDirSum_fast * 1e9),
+		"wait_bottom_ns_fast":      uint64(c.waitBottomSum_fast * 1e9),
+		"wait_count_fast":          c.waitCount_fast,
+		"wait_dir_ns_bank":         uint64(c.waitDirSum_bank * 1e9),
+		"wait_bottom_ns_bank":      uint64(c.waitBottomSum_bank * 1e9),
+		"wait_count_bank":          c.waitCount_bank,
 		"op5a_shortcut_with_remote_sharer":     c.op5aShortcutWithRemoteSharer,
 		"op5b_remote_write_hit_cleared_writer": c.op5bRemoteWriteHitClearedWriter,
 	}
@@ -208,19 +262,24 @@ func (m *middleware) Tick() bool {
 	}
 
 	m.returnValue = madeProgress
+
 	return madeProgress
 }
 
 func (m *middleware) runPipeline() bool {
 	madeProgress := false
 
-	temp := m.runStage(m.bottomSender)
+	// Cross-variant fairness: tick mshrStage BEFORE bottomSender to
+	// match SD/REC ordering. With CD's previous order, an mshr-merged
+	// transaction could not be sent to bottom in the same cycle —
+	// adding a 1-cycle skew that doesn't exist in SD/REC.
+	temp := m.runStage(m.mshrStage)
 	madeProgress = temp || madeProgress
 	if m.printReturn {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.1: %v\n", m.deviceID, temp)
 	}
 
-	temp = m.runStage(m.mshrStage)
+	temp = m.runStage(m.bottomSender)
 	madeProgress = temp || madeProgress
 	if m.printReturn {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.2: %v\n", m.deviceID, temp)
@@ -375,8 +434,11 @@ func (c *Comp) toLocal(addr uint64) bool {
 func (c *Comp) recordAccessMask(addr uint64, srcPort sim.RemotePort) {
 	src := fmt.Sprintf("%s", srcPort)
 	id := srcToGPUID(src)
-	if id == 999 {
-		fmt.Printf("[%s][recordAccessMask]\tImpossible GPU ID\n", c.name)
+	// Guard: 999 = unparseable, <2 = driver/host-side access. Both produce
+	// `1 << (id-2)` with negative shift -> runtime panic on some Go versions
+	// (observed with xor/dnn workloads where trainer.go drives the directory).
+	if id == 999 || id < 2 {
+		return
 	}
 
 	blockID := addr >> c.log2BlockSize
@@ -464,6 +526,10 @@ func (c *Comp) recordSharerRead(blockID uint64, gpuBit uint) {
 	c.sharerSet[blockID] |= uint64(1) << gpuBit
 	c.cohState[blockID] = 1
 	c.accessMaskKernel[blockID] = true
+	if c.sharerHeatmapEnabled {
+		c.accessMaskWindow[blockID]++
+		c.blockTotalAccess[blockID]++
+	}
 }
 
 // recordSharerWrite is called on a write access (InvalidateAndUpdateEntry).
@@ -483,6 +549,10 @@ func (c *Comp) recordSharerWrite(blockID uint64, gpuBit uint) {
 	c.writeMaskKernel[blockID] = true
 	c.accessMaskKernel[blockID] = true
 	c.writeEventCountKernel++
+	if c.sharerHeatmapEnabled {
+		c.accessMaskWindow[blockID]++
+		c.blockTotalAccess[blockID]++
+	}
 
 	// Exp-W: false invalidation detection (HMG 4-CL basis).
 	// A false invalidation occurs when two different GPUs write to different
@@ -502,6 +572,14 @@ func (c *Comp) recordSharerWrite(blockID uint64, gpuBit uint) {
 func (c *Comp) recordSharerInvalidate(blockID uint64) {
 	c.sharerSet[blockID] = 0
 	c.cohState[blockID] = 0
+	if c.sharerHeatmapEnabled {
+		// Mark this block as "touched this window" so the per-window
+		// dump emits a row with sharer=0. Without this, downstream
+		// forward-fill would carry the pre-invalidation sharer set
+		// across the gap, overestimating sharer presence.
+		c.accessMaskWindow[blockID]++
+		c.blockTotalAccess[blockID]++
+	}
 }
 
 // gpuBitFromPort returns the bit position (gpuID-2) for a given remote port.

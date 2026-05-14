@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
 
@@ -15,6 +16,20 @@ type bottomSender struct {
 	maxInflightRequest      int
 	maxInflightInvalidation int
 
+	// Phase 2 inv-emit budget. When maxInvEmitPerCycle > 0, the
+	// directory caps InvReq emission per output channel per cycle to
+	// model the directory controller's per-channel serialization (real
+	// hardware can't blast all sharers' invs in a single cycle even
+	// when the outgoing buffer has room). Two separate counters
+	// because the RDMA-bound (topPort -> rdmaEngine -> remote GPUs)
+	// and local-L2-bound (bottomPort -> local L2) paths use distinct
+	// physical output channels in real silicon.
+	// 0 (default) disables the cap, preserving baseline behavior.
+	maxInvEmitPerCycle          int
+	invEmittedToRDMAThisCycle   int
+	invEmittedToBottomThisCycle int
+	lastEmitCycleTime           sim.VTimeInSec
+
 	inflightRequest      []*transaction
 	inflightInvToOutside []*transaction
 	inflightInvToBottom  []*mem.InvReq
@@ -24,7 +39,32 @@ type bottomSender struct {
 	returnFalse2 string
 }
 
+// refreshEmitBudget resets per-cycle inv emit counters when the engine
+// has advanced into a new cycle. runStage may invoke Tick numReqPerCycle
+// times within one cycle (same engine time across all calls), so the
+// counters legitimately persist across those repeated invocations.
+func (bs *bottomSender) refreshEmitBudget() {
+	now := bs.cache.Engine.CurrentTime()
+	if now > bs.lastEmitCycleTime {
+		bs.invEmittedToRDMAThisCycle = 0
+		bs.invEmittedToBottomThisCycle = 0
+		bs.lastEmitCycleTime = now
+	}
+}
+
+func (bs *bottomSender) canEmitInvToRDMA() bool {
+	return bs.maxInvEmitPerCycle <= 0 ||
+		bs.invEmittedToRDMAThisCycle < bs.maxInvEmitPerCycle
+}
+
+func (bs *bottomSender) canEmitInvToBottom() bool {
+	return bs.maxInvEmitPerCycle <= 0 ||
+		bs.invEmittedToBottomThisCycle < bs.maxInvEmitPerCycle
+}
+
 func (bs *bottomSender) Tick() bool {
+	bs.refreshEmitBudget()
+
 	madeProgress := false
 
 	madeProgress = bs.processReturnRsp() || madeProgress
@@ -117,9 +157,18 @@ func (bs *bottomSender) sendRequestToBottom(
 func (bs *bottomSender) sendInvalidationRequest(
 	trans *transaction,
 ) bool {
-	// if bs.tooManyInflightInvalidation() {
-	// 	return false
-	// }
+	// Phase 2: enforce in-flight inv cap to match SD/REC variants.
+	// Only blocks the *initial* admission of a new transaction (when
+	// it isn't yet in inflightInvToOutside). Already-in-flight
+	// transactions continue draining their invalidationList so the
+	// directory can finish what it started — required to avoid
+	// holding tags in inflight indefinitely.
+	if bs.findInvTransactionByID(
+		trans.accessReq().Meta().ID, bs.inflightInvToOutside) == -1 &&
+		bs.tooManyInflightInvalidation() {
+		bs.returnFalse1 = "[sendInvalidationRequest] tooManyInflightInvalidation"
+		return false
+	}
 
 	progress := false
 
@@ -136,6 +185,17 @@ func (bs *bottomSender) sendInvalidationRequest(
 			trans.invalidationList = append(trans.invalidationList[:i], trans.invalidationList[i+1:]...)
 			i--
 			continue
+		}
+
+		// Phase 2: per-cycle RDMA-bound inv emit budget. If exceeded,
+		// pause the broadcast loop and resume next Tick. The trans
+		// stays referenced via inflightInvToOutside so progress is
+		// preserved across ticks.
+		if !bs.canEmitInvToRDMA() {
+			if !progress {
+				bs.returnFalse1 = "[sendInvalidationRequest] inv-emit budget exhausted (RDMA)"
+			}
+			return progress
 		}
 
 		if !bs.cache.topPort.CanSend() {
@@ -164,6 +224,7 @@ func (bs *bottomSender) sendInvalidationRequest(
 
 			return progress
 		}
+		bs.invEmittedToRDMAThisCycle++
 		trans.invalidationList = append(trans.invalidationList[:i], trans.invalidationList[i+1:]...)
 		i--
 		trans.pendingEviction = append(trans.pendingEviction, sh)
@@ -198,6 +259,20 @@ func (bs *bottomSender) sendInvalidationRequest(
 }
 
 func (bs *bottomSender) sendInvReqToBottom(req *mem.InvReq) bool {
+	// Phase 2: in-flight cap on local-L2-bound invs (matches SD/REC's
+	// tooManyInflightInvalidationToBottom). Prevents the directory
+	// from issuing unbounded local invs when L2s are slow to respond.
+	if bs.tooManyInflightInvalidationToBottom() {
+		bs.returnFalse1 = "[sendInvReqToBottom] tooManyInflightInvalidationToBottom"
+		return false
+	}
+
+	// Phase 2: per-cycle local-L2-bound inv emit budget.
+	if !bs.canEmitInvToBottom() {
+		bs.returnFalse1 = "[sendInvReqToBottom] inv-emit budget exhausted (local L2)"
+		return false
+	}
+
 	if !bs.cache.bottomPort.CanSend() {
 		bs.returnFalse1 = "[sendInvReqToBottom] Cannot send to bottomPort"
 		return false
@@ -219,6 +294,7 @@ func (bs *bottomSender) sendInvReqToBottom(req *mem.InvReq) bool {
 		return false
 	}
 
+	bs.invEmittedToBottomThisCycle++
 	bs.cache.bottomSenderBuffer.Pop()
 
 	return true
@@ -405,6 +481,12 @@ func (bs *bottomSender) tooManyInflightRequest() bool {
 
 func (bs *bottomSender) tooManyInflightInvalidation() bool {
 	return len(bs.inflightInvToOutside) >= bs.maxInflightInvalidation
+}
+
+// tooManyInflightInvalidationToBottom mirrors SD/REC's same-named helper —
+// caps the number of local-L2-bound InvReqs the directory is waiting on.
+func (bs *bottomSender) tooManyInflightInvalidationToBottom() bool {
+	return len(bs.inflightInvToBottom) >= bs.maxInflightInvalidation
 }
 
 func (bs *bottomSender) Reset() {

@@ -58,6 +58,7 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 	trans := &transaction{
 		id:        sim.GetIDGenerator().Generate(),
 		fromLocal: fromLocal, // 수신 포트 기반으로 결정: topPort→true, RDMAPort→false
+		enterTime: p.cache.Engine.CurrentTime(),
 	}
 
 	needsTracing := false
@@ -120,6 +121,8 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 				p.returnFalse = "Cannot push to localBypassBuffer"
 				return false
 			}
+			trans.bottomEnterTime = p.cache.Engine.CurrentTime()
+			trans.pathCategory = "bypass"
 			p.cache.localBypassBuffer.Push(trans)
 
 			tracing.TraceReqReceive(req, p.cache)
@@ -165,6 +168,8 @@ func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 				p.returnFalse = "Cannot push to localBypassBuffer"
 				return false
 			}
+			trans.bottomEnterTime = p.cache.Engine.CurrentTime()
+			trans.pathCategory = "bypass"
 			p.cache.localBypassBuffer.Push(trans)
 
 			tracing.TraceReqReceive(req, p.cache)

@@ -30,6 +30,13 @@ const (
 	writeBufferFlush
 
 	invalidation
+
+	// bankInvalidate routes an InvReq through the bank stage so that
+	// invalidations consume bank-pipeline slots and tag-lookup
+	// bandwidth, rather than completing entirely inside the directory
+	// stage. The bank just verifies the line and sends InvRsp; no data
+	// movement.
+	bankInvalidate
 )
 
 type transaction struct {
@@ -55,6 +62,7 @@ type transaction struct {
 	writeToHomeNode   bool
 	fromLocal         bool
 	toLocal           bool
+	evictionToLocal   bool
 
 	prefetch    *mem.DataReadyRsp
 	responsing  bool

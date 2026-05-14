@@ -26,8 +26,27 @@ type directoryStage struct {
 	// Pipeline 및 Buffer를 Local과 Remote로 완전 분리
 	localPipeline  pipelining.Pipeline
 	remotePipeline pipelining.Pipeline
-	localBuf       sim.Buffer
-	remoteBuf      sim.Buffer
+	// Optional snoop-latency pipelines for InvReq. When the builder's
+	// snoopLatency knob is 0 these are nil and invalidations share the
+	// regular local/remote pipelines (historical behavior). When > 0
+	// each is a (dirLatency + snoopLatency)-stage pipeline whose post
+	// buffer is the same localBuf/remoteBuf — so the downstream commit
+	// loop is oblivious to whether an item arrived via the regular or
+	// the snoop path. The pipelining package keeps madeProgress=true
+	// while items are in flight, which guarantees the cache stays
+	// awake until any deferred inv reaches the commit point (no extra
+	// queue or shared resource is introduced, hence no new HoL path).
+	localSnoopPipeline  pipelining.Pipeline
+	remoteSnoopPipeline pipelining.Pipeline
+	// Phase F: dedicated InvReq pipeline + post-buffer. ingress is
+	// cache.invStageBuffer (separate from dirStageBuffer/remoteDirStageBuffer
+	// to avoid HoL blocking by stalled read/write at the queue head).
+	// processTransaction drains invBuf BEFORE the regular local/remote
+	// bufs every Tick.
+	invPipeline pipelining.Pipeline
+	localBuf    sim.Buffer
+	remoteBuf   sim.Buffer
+	invBuf      sim.Buffer
 
 	activeBuf sim.Buffer // 현재 처리 중인 버퍼를 가리키는 내부 포인터
 
@@ -49,6 +68,22 @@ func (ds *directoryStage) Tick() (madeProgress bool) {
 	madeProgress = ds.localPipeline.Tick() || madeProgress
 	madeProgress = ds.remotePipeline.Tick() || madeProgress
 
+	// Tick the optional snoop pipelines every cycle. Empty stages are
+	// no-ops that return false, so this only contributes madeProgress
+	// while a deferred inv is in flight — exactly the behavior needed
+	// to keep the cache awake without spurious wakeups.
+	if ds.localSnoopPipeline != nil {
+		madeProgress = ds.localSnoopPipeline.Tick() || madeProgress
+	}
+	if ds.remoteSnoopPipeline != nil {
+		madeProgress = ds.remoteSnoopPipeline.Tick() || madeProgress
+	}
+
+	// Phase F: dedicated InvReq pipeline. Same dirLatency stages so
+	// inv pays tag-lookup time. Items emerge into invBuf which is
+	// drained by processTransaction with priority over local/remote.
+	madeProgress = ds.invPipeline.Tick() || madeProgress
+
 	madeProgress = ds.processTransaction() || madeProgress
 
 	ds.lastReturnValue = madeProgress
@@ -56,19 +91,121 @@ func (ds *directoryStage) Tick() (madeProgress bool) {
 	return madeProgress
 }
 
+// invCostInSlots is how many numReqPerCycle slots a single
+// invalidation commit consumes in the directory stage. Reads and
+// writes consume 1 slot. Invalidations consume more to model the
+// extra bank tag-lookup that a real L2 controller would perform on
+// an InvReq. We keep invalidations inline (not routed through the
+// bank pipeline) to avoid the shared-buffer/port deadlock that
+// happens during bursty promotion/demotion-driven InvReq storms in
+// SuperDirectory; the cost is captured here as additional commit
+// budget instead.
+const invCostInSlots = 2
+
 func (ds *directoryStage) processTransaction() bool {
 	madeProgress := false
 
-	// [이식 완료] 1순위: Remote 버퍼 우선 처리 (교착 상태 방지)
-	ds.activeString = &ds.returnFalse0
-	madeProgress = ds.processSpecificBuffer(ds.remoteBuf) || madeProgress
-	// [이식 완료] 2순위: Local 버퍼 처리
-	ds.activeString = &ds.returnFalse1
-	madeProgress = ds.processSpecificBuffer(ds.localBuf) || madeProgress
+	// Unified per-cycle budget across both pipelines. Each iteration
+	// commits at most one transaction. Reads/writes cost 1 slot each;
+	// invalidations cost invCostInSlots. The dispatcher peeks remote
+	// first to enforce remote-priority arbitration (deadlock
+	// avoidance). Loop ends when budget is exhausted, when nothing
+	// can commit this cycle, or when both buffers are empty.
+	totalBudget := ds.cache.numReqPerCycle
+	used := 0
+	for used < totalBudget {
+		// Phase F: drain invBuf first (preempts read/write so that
+		// stalled R/W head in localBuf/remoteBuf cannot block inv
+		// processing → cache coherence response always proceeds).
+		ds.activeString = &ds.returnFalse0
+		ds.activeBuf = ds.invBuf
+		ok, cost := ds.processOne()
+		if ok {
+			used += cost
+			madeProgress = true
+			continue
+		}
+		// Try remote.
+		ds.activeString = &ds.returnFalse0
+		ds.activeBuf = ds.remoteBuf
+		ok, cost = ds.processOne()
+		if ok {
+			used += cost
+			madeProgress = true
+			continue
+		}
+		// Then local.
+		ds.activeString = &ds.returnFalse1
+		ds.activeBuf = ds.localBuf
+		ok, cost = ds.processOne()
+		if ok {
+			used += cost
+			madeProgress = true
+			continue
+		}
+		break
+	}
 
 	return madeProgress
 }
 
+// processOne handles a single transaction from ds.activeBuf. Returns
+// (success, cost) where cost is the number of numReqPerCycle slots the
+// committed transaction consumed. Cost is meaningful only when
+// success is true; on failure the caller treats it as zero.
+func (ds *directoryStage) processOne() (bool, int) {
+	item := ds.activeBuf.Peek()
+	if item == nil {
+		return false, 0
+	}
+
+	trans := item.(dirPipelineItem).trans
+
+	addr := uint64(0)
+	if trans.invalidation != nil {
+		addr = trans.invalidation.Address
+	} else if trans.accessReq() != nil {
+		addr = trans.accessReq().GetAddress()
+	} else {
+		addr = trans.fetchAddress
+	}
+
+	cacheLineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize)
+
+	// Invalidations bypass the evictingList check. Rationale: when
+	// evictingList[cacheLineID] is set, the directory has already been
+	// updated to the new tag (see updateVictimBlockMetaData) and the
+	// old cacheline is in transit through bankStage. doInvalidation's
+	// directory.Lookup returns nil for the old tag and acks the inv
+	// without state mutation — safe.  Blocking inv here on
+	// evictingList creates a deadlock cycle: writeBuffer full →
+	// bankStage can't drain → evictingList lingers → inv stuck at
+	// invBuf head → directory's inflightInvToBottom hits cap →
+	// directory backpressures L2 evictions → goto start.
+	if trans.invalidation != nil {
+		return ds.doInvalidation(trans), invCostInSlots
+	}
+
+	if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
+		return false, 0
+	}
+
+	if trans.read != nil {
+		return ds.doRead(trans), 1
+	}
+	if trans.write != nil {
+		return ds.doWrite(trans), 1
+	}
+	if trans.prefetch != nil {
+		return ds.doPrefetch(trans), 1
+	}
+	panic("unknown transaction type in processOne")
+}
+
+// processSpecificBuffer is kept for backward compatibility with any
+// remaining callers but is now unused by processTransaction (which
+// uses the unified-budget loop above). Left in place to avoid
+// breaking other pieces of the codebase that may still reference it.
 func (ds *directoryStage) processSpecificBuffer(targetBuf sim.Buffer) bool {
 	madeProgress := false
 	ds.activeBuf = targetBuf // 현재 처리 중인 버퍼 설정
@@ -98,13 +235,15 @@ func (ds *directoryStage) processSpecificBuffer(targetBuf sim.Buffer) bool {
 
 		cacheLineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize)
 
-		if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
-			break
-		}
-
+		// Invalidations bypass the evictingList check (cycle-breaker;
+		// see processOne for rationale).
 		if trans.invalidation != nil {
 			madeProgress = ds.doInvalidation(trans) || madeProgress
 			continue
+		}
+
+		if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
+			break
 		}
 
 		if trans.read != nil {
@@ -137,35 +276,68 @@ func (ds *directoryStage) processSpecificBuffer(targetBuf sim.Buffer) bool {
 func (ds *directoryStage) acceptNewTransaction() bool {
 	madeProgress := false
 
-	// [이식 완료] 1순위: 외부(Remote) 요청 최우선 파이프라인 진입
+	// [Phase F] 0순위: InvReq 전용 ingress (invStageBuffer) → invPipeline.
+	// 분리된 큐를 두어 head-of-line blocking 제거. 정규 큐의 read/write가
+	// stall되어도 inv는 자기 큐에서 정상 진행.
 	for i := 0; i < ds.cache.numReqPerCycle; i++ {
-		if !ds.remotePipeline.CanAccept() {
+		item := ds.cache.invStageBuffer.Peek()
+		if item == nil {
 			break
 		}
-		item := ds.cache.remoteDirStageBuffer.Peek() // Comp에 해당 버퍼가 존재해야 함
+		if !ds.invPipeline.CanAccept() {
+			break
+		}
+		trans := item.(*transaction)
+		ds.invPipeline.Accept(dirPipelineItem{trans})
+		ds.cache.invStageBuffer.Pop()
+		madeProgress = true
+	}
+
+	// [이식 완료] 1순위: 외부(Remote) 요청 최우선 파이프라인 진입.
+	// InvReq는 snoopLatency>0인 경우 remoteSnoopPipeline으로 우회.
+	// Snoop pipeline이 가득 차면 break — 이 경우 같은 head를 다음
+	// 사이클에 다시 시도하므로 deadlock-free (기존 break 패턴과 동일).
+	for i := 0; i < ds.cache.numReqPerCycle; i++ {
+		item := ds.cache.remoteDirStageBuffer.Peek()
 		if item == nil {
 			break
 		}
 
 		trans := item.(*transaction)
-		ds.remotePipeline.Accept(dirPipelineItem{trans})
+
+		targetPipeline := ds.remotePipeline
+		if trans.invalidation != nil && ds.remoteSnoopPipeline != nil {
+			targetPipeline = ds.remoteSnoopPipeline
+		}
+
+		if !targetPipeline.CanAccept() {
+			break
+		}
+
+		targetPipeline.Accept(dirPipelineItem{trans})
 		ds.cache.remoteDirStageBuffer.Pop()
 		madeProgress = true
 	}
 
-	// [이식 완료] 2순위: 내부(Local) 요청 파이프라인 진입
+	// [이식 완료] 2순위: 내부(Local) 요청 파이프라인 진입.
 	for i := 0; i < ds.cache.numReqPerCycle; i++ {
-		if !ds.localPipeline.CanAccept() {
-			break
-		}
-
 		item := ds.cache.dirStageBuffer.Peek()
 		if item == nil {
 			break
 		}
 
 		trans := item.(*transaction)
-		ds.localPipeline.Accept(dirPipelineItem{trans})
+
+		targetPipeline := ds.localPipeline
+		if trans.invalidation != nil && ds.localSnoopPipeline != nil {
+			targetPipeline = ds.localSnoopPipeline
+		}
+
+		if !targetPipeline.CanAccept() {
+			break
+		}
+
+		targetPipeline.Accept(dirPipelineItem{trans})
 		ds.cache.dirStageBuffer.Pop()
 		madeProgress = true
 	}
@@ -176,10 +348,19 @@ func (ds *directoryStage) acceptNewTransaction() bool {
 func (ds *directoryStage) Reset() {
 	ds.localPipeline.Clear()
 	ds.remotePipeline.Clear()
+	if ds.localSnoopPipeline != nil {
+		ds.localSnoopPipeline.Clear()
+	}
+	if ds.remoteSnoopPipeline != nil {
+		ds.remoteSnoopPipeline.Clear()
+	}
+	ds.invPipeline.Clear()
 	ds.localBuf.Clear()
 	ds.remoteBuf.Clear()
+	ds.invBuf.Clear()
 	ds.cache.dirStageBuffer.Clear()
 	ds.cache.remoteDirStageBuffer.Clear() // Comp 구조체에 remoteDirStageBuffer 추가 필요
+	ds.cache.invStageBuffer.Clear()
 }
 
 func (ds *directoryStage) doPrefetch(trans *transaction) bool {
@@ -202,11 +383,7 @@ func (ds *directoryStage) doPrefetch(trans *transaction) bool {
 		ds.activeBuf.Pop()
 		*ds.activeString = *ds.activeString + "block is hit"
 
-		tracing.AddTaskStep(
-			trans.prefetch.ID,
-			ds.cache,
-			"PrefetchDiscard - Hit",
-		)
+		ds.cache.incEvent("PrefetchDiscard - Hit")
 		tracing.TraceReqFinalize(trans.prefetch, ds.cache)
 
 		return true
@@ -341,12 +518,9 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 	block := ds.cache.directory.Lookup(req.PID, cachelineID)
 	mshrEntry := ds.cache.mshr.Query(req.PID, cachelineID)
 
-	// 1. 블록 상태 확인 및 통계 정보 사전 추출 (초기화 전 미리 백업)
-	suffix := ""
+	suffix := "-Evict"
 	if req.IsWriteInv {
 		suffix = "-Write"
-	} else {
-		suffix = "-Evict"
 	}
 	what := "InvalidateInvalidBlock" + suffix
 	var pid vm.PID
@@ -355,22 +529,42 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 	hasBeenRead := false
 	hasBeenWritten := false
 
-	if mshrEntry == nil && block != nil { // mshrEntry에 있는 경우는 block이 현재 cache에 없다는 것이므로 바로 response 전송
-		if block.IsValid && (block.IsLocked || block.ReadCount > 0) {
-			*ds.activeString += fmt.Sprintf("Block %x is being used, isLocked %v, readCnt %d",
-				block.Tag, block.IsLocked, block.ReadCount)
-			trans.returnFalse = *ds.activeString
+	// deferred: when true, the InvRsp is sent now (to free CohDir's
+	// inflightInvToBottom slot) but the block zero-out is deferred to
+	// bankStage finalize, which clears IsLocked under the in-flight bank
+	// op's natural completion path. Breaks the lenet_CD_8 / relu_CD_0
+	// class of deadlock where doInvalidation returning false on
+	// IsLocked blocks closes a cross-GPU cycle (L2.invStageBuffer →
+	// CohDir.RemoteBottomPort.OutgoingBuf → CohDir.inflightInvToBottom
+	// cap → CohDir.RDMAInvPort.IncomingBuf → upstream CohDir jam).
+	deferred := false
 
-			// temp := ds.activeBuf.Pop()
-			// ds.activeBuf.Push(temp)
+	if mshrEntry == nil && block != nil {
+		if block.IsValid && block.ReadCount > 0 {
+			// Active readers — cannot defer-invalidate without
+			// dropping an in-flight read. Keep blocking semantics for
+			// this case. The observed deadlock is the IsLocked path,
+			// not this one.
+			*ds.activeString += fmt.Sprintf(
+				"Block %x has active readers, readCnt %d",
+				block.Tag, block.ReadCount)
+			trans.returnFalse = *ds.activeString
 			return false
 		}
-
+		if block.IsValid && block.IsLocked {
+			// Cycle-breaker: arm deferred invalidation. InvRsp is
+			// still sent below; bank finalize will zero the block
+			// when IsLocked clears.
+			deferred = true
+		}
 		if block.IsValid {
 			what = "InvalidateValidBlock" + suffix
+			reason := evictReasonInvEvict
+			if req.IsWriteInv {
+				reason = evictReasonInvWrite
+			}
+			ds.cache.recordEviction(block.PID, block.Tag, reason)
 		}
-
-		// 블록이 지워지기 전에 필요한 정보들을 안전하게 추출
 		pid = block.PID
 		vAddr = block.VAddr
 		if block.Accessed {
@@ -380,68 +574,73 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 		hasBeenWritten = block.HasBeenWritten
 	}
 
-	// 2. 패킷 전송 가능 여부 확인 (블록을 지우기 "전"에 검사해야 상태 오염이 안 생김)
-	port := ds.cache.topPort
-	if ds.activeBuf == ds.remoteBuf {
-		port = ds.cache.remoteTopPort
+	// Latent coherence bug fix: previously the mshrEntry != nil branch
+	// sent InvRsp but never zeroed the block (the zero-block below was
+	// gated by mshrEntry == nil). When fetch completed the block went
+	// IsValid=true while CohDir believed we held no copy. Arm deferred
+	// invalidation so bank finalize zeros the block at fetch-complete
+	// time.
+	if mshrEntry != nil && block != nil {
+		deferred = true
 	}
 
+	// InvRsp는 InvReq가 도착한 port의 짝으로 돌려보내야 함. InvReq는
+	// 항상 remote path (directory의 remoteBottomPort → L2의 remoteTopPort)로
+	// 들어오므로 invBuf에서 처리되는 inv는 반드시 remoteTopPort로 응답.
+	// 기존 remoteBuf check는 read/write 응답 분기와 호환 위해 유지.
+	port := ds.cache.topPort
+	if ds.activeBuf == ds.remoteBuf || ds.activeBuf == ds.invBuf {
+		port = ds.cache.remoteTopPort
+	}
 	if !port.CanSend() {
 		*ds.activeString += "Cannot send to topPort"
 		trans.returnFalse = *ds.activeString
 		return false
 	}
 
-	// 3. 응답 패킷 생성 및 전송
 	rsp := mem.InvRspBuilder{}.
 		WithSrc(port.AsRemote()).
 		WithDst(req.Src).
 		WithRspTo(req.ReqFrom).
 		Build()
-
 	if accessedCount > 0 {
 		rsp.Accessed = 1
 	}
-
-	err := port.Send(rsp)
-	if err != nil {
+	if err := port.Send(rsp); err != nil {
 		*ds.activeString += "Failed to send to topPort"
 		trans.returnFalse = *ds.activeString
 		return false
 	}
 
-	// 4. 전송 성공이 보장된 후 실제 블록 상태 업데이트 및 MSHR 정리
-	if mshrEntry == nil && block != nil {
-		newBlk := &internal.Block{
-			WayID:        block.WayID,
-			SetID:        block.SetID,
-			CacheAddress: block.CacheAddress,
+	if block != nil {
+		if deferred {
+			// Defer the zero-out to bankStage finalize. InvRsp has been
+			// sent above so CohDir's inflight-inv slot is already freed.
+			block.PendingInvalidation = true
+			ds.cache.deferredInvArmed++
+			ds.cache.incEvent("DeferredInvArmed")
+		} else if mshrEntry == nil {
+			newBlk := &internal.Block{
+				WayID:        block.WayID,
+				SetID:        block.SetID,
+				CacheAddress: block.CacheAddress,
+			}
+			*block = *newBlk
+			ds.cache.eraseCacheLineFromRWMask(pid, vAddr)
 		}
-		*block = *newBlk // 이제 안전하게 덮어씌움
-
-		ds.cache.eraseCacheLineFromRWMask(pid, vAddr)
 	}
 
 	ds.activeBuf.Pop()
 	ds.cache.mshrStage.removeTransaction(trans)
 
-	// 5. Tracing 기록 (미리 뽑아둔 accessedCount 등 활용)
 	if mshrEntry == nil && block != nil {
-		whatUsage := fmt.Sprintf("Usage: %d/%d", accessedCount, 1<<(ds.cache.log2BlockSize-6))
-		tracing.AddTaskStep(tracing.MsgIDAtReceiver(req, ds.cache), ds.cache, whatUsage)
-		whatUsage = fmt.Sprintf("RW: %t/%t", hasBeenRead, hasBeenWritten)
-		tracing.AddTaskStep(tracing.MsgIDAtReceiver(req, ds.cache), ds.cache, whatUsage)
+		ds.cache.incEvent(fmt.Sprintf("Usage: %d/%d",
+			accessedCount, 1<<(ds.cache.log2BlockSize-6)))
+		ds.cache.incEvent(fmt.Sprintf("RW: %t/%t",
+			hasBeenRead, hasBeenWritten))
 	}
-
-	tracing.AddTaskStep(tracing.MsgIDAtReceiver(req, ds.cache), ds.cache, what)
+	ds.cache.incEvent(what)
 	tracing.TraceReqComplete(req, ds.cache)
-
-	if ds.cache.debugProcess && trans.invalidation.Address == ds.cache.debugAddress0 {
-		fmt.Printf("[%s] [directoryStage]\tInvalidation - 1.1: addr %x, ID %s\n", ds.cache.name, trans.invalidation.Address, req.ReqFrom)
-	}
-	if ds.cache.debugProcess && trans.invalidation.Address == ds.cache.debugAddress1 {
-		fmt.Printf("[%s] [directoryStage]\tInvalidation - 1.1: addr %x, ID %s\n", ds.cache.name, trans.invalidation.Address, req.ReqFrom)
-	}
 
 	ds.cache.InvokeHook(sim.HookCtx{
 		Domain: ds.cache,
@@ -503,17 +702,9 @@ func (ds *directoryStage) handleReadMSHRHit(
 
 	ds.activeBuf.Pop()
 
-	tracing.AddTaskStep(
-		tracing.MsgIDAtReceiver(trans.read, ds.cache),
-		ds.cache,
-		"read-mshr-hit",
-	)
+	ds.cache.incEvent("read-mshr-hit")
 	if !trans.toLocal {
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(trans.read, ds.cache),
-			ds.cache,
-			"remote-read-mshr-hit",
-		)
+		ds.cache.incEvent("remote-read-mshr-hit")
 	}
 
 	return true
@@ -544,17 +735,9 @@ func (ds *directoryStage) handleReadHit(
 
 	progress := ds.readFromBank(trans, block)
 	if progress {
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(trans.read, ds.cache),
-			ds.cache,
-			"read-hit",
-		)
+		ds.cache.incEvent("read-hit")
 		if !trans.toLocal {
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.read, ds.cache),
-				ds.cache,
-				"remote-read-hit",
-			)
+			ds.cache.incEvent("remote-read-hit")
 		}
 	}
 
@@ -601,25 +784,12 @@ func (ds *directoryStage) handleReadMiss(trans *transaction) bool {
 	if ds.needEviction(victim) {
 		ok := ds.evict(trans, victim)
 		if ok {
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.read, ds.cache),
-				ds.cache,
-				"read-miss",
-			)
-
+			ds.cache.incEvent("read-miss")
 			if !trans.toLocal {
-				tracing.AddTaskStep(
-					tracing.MsgIDAtReceiver(trans.read, ds.cache),
-					ds.cache,
-					"remote-read-miss",
-				)
+				ds.cache.incEvent("remote-read-miss")
 			}
-
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.read, ds.cache),
-				ds.cache,
-				what,
-			)
+			ds.cache.incEvent(what)
+			ds.emitMissReason(trans, cacheLineID)
 		}
 
 		return ok
@@ -627,28 +797,30 @@ func (ds *directoryStage) handleReadMiss(trans *transaction) bool {
 
 	ok := ds.fetch(trans, victim)
 	if ok {
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(trans.read, ds.cache),
-			ds.cache,
-			"read-miss",
-		)
-
+		ds.cache.incEvent("read-miss")
 		if !trans.toLocal {
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.read, ds.cache),
-				ds.cache,
-				"remote-read-miss",
-			)
+			ds.cache.incEvent("remote-read-miss")
 		}
-
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(trans.read, ds.cache),
-			ds.cache,
-			what,
-		)
+		ds.cache.incEvent(what)
+		ds.emitMissReason(trans, cacheLineID)
 	}
 
 	return ok
+}
+
+// emitMissReason classifies the read miss at (pid, cacheLineID) as cold /
+// capacity / coh-write / coh-evict / other and emits one (or two) trace
+// steps so the metric can be aggregated like read-miss/remote-read-miss.
+//
+// Names emitted:
+//   read-miss-<reason>
+//   remote-read-miss-<reason>   (only when trans.toLocal == false)
+func (ds *directoryStage) emitMissReason(trans *transaction, cacheLineID uint64) {
+	reason := ds.cache.classifyAndRecordReadMiss(trans.read.PID, cacheLineID)
+	ds.cache.incEvent("read-miss-" + reason)
+	if !trans.toLocal {
+		ds.cache.incEvent("remote-read-miss-" + reason)
+	}
 }
 
 func (ds *directoryStage) doWrite(trans *transaction) bool {
@@ -666,17 +838,9 @@ func (ds *directoryStage) doWrite(trans *transaction) bool {
 
 		ok := ds.doWriteMSHRHit(trans, mshrEntry)
 		if ok {
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.write, ds.cache),
-				ds.cache,
-				"write-mshr-hit",
-			)
+			ds.cache.incEvent("write-mshr-hit")
 			if !trans.toLocal {
-				tracing.AddTaskStep(
-					tracing.MsgIDAtReceiver(trans.write, ds.cache),
-					ds.cache,
-					"remote-write-mshr-hit",
-				)
+				ds.cache.incEvent("remote-write-mshr-hit")
 			}
 		}
 
@@ -687,17 +851,9 @@ func (ds *directoryStage) doWrite(trans *transaction) bool {
 	if block != nil {
 		ok := ds.doWriteHit(trans, block)
 		if ok {
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.write, ds.cache),
-				ds.cache,
-				"write-hit",
-			)
+			ds.cache.incEvent("write-hit")
 			if !trans.toLocal {
-				tracing.AddTaskStep(
-					tracing.MsgIDAtReceiver(trans.write, ds.cache),
-					ds.cache,
-					"remote-write-hit",
-				)
+				ds.cache.incEvent("remote-write-hit")
 			}
 			ds.cache.InvokeHook(sim.HookCtx{
 				Domain: ds.cache,
@@ -711,17 +867,9 @@ func (ds *directoryStage) doWrite(trans *transaction) bool {
 
 	ok := ds.doWriteMiss(trans)
 	if ok {
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(trans.write, ds.cache),
-			ds.cache,
-			"write-miss",
-		)
+		ds.cache.incEvent("write-miss")
 		if !trans.toLocal {
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.write, ds.cache),
-				ds.cache,
-				"remote-write-miss",
-			)
+			ds.cache.incEvent("remote-write-miss")
 		}
 		ds.cache.InvokeHook(sim.HookCtx{
 			Domain: ds.cache,
@@ -826,11 +974,7 @@ func (ds *directoryStage) writeFullLineMiss(trans *transaction) bool {
 	if ds.needEviction(victim) {
 		progress := ds.evict(trans, victim)
 		if progress {
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.write, ds.cache),
-				ds.cache,
-				what,
-			)
+			ds.cache.incEvent(what)
 		}
 
 		return progress
@@ -838,11 +982,7 @@ func (ds *directoryStage) writeFullLineMiss(trans *transaction) bool {
 
 	progress := ds.writeToBank(trans, victim)
 	if progress {
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(trans.write, ds.cache),
-			ds.cache,
-			what,
-		)
+		ds.cache.incEvent(what)
 	}
 
 	return progress
@@ -887,11 +1027,7 @@ func (ds *directoryStage) writePartialLineMiss(trans *transaction) bool {
 	if ds.needEviction(victim) {
 		progress := ds.evict(trans, victim)
 		if progress {
-			tracing.AddTaskStep(
-				tracing.MsgIDAtReceiver(trans.write, ds.cache),
-				ds.cache,
-				what,
-			)
+			ds.cache.incEvent(what)
 		}
 
 		return progress
@@ -899,11 +1035,7 @@ func (ds *directoryStage) writePartialLineMiss(trans *transaction) bool {
 
 	progress := ds.fetch(trans, victim)
 	if progress {
-		tracing.AddTaskStep(
-			tracing.MsgIDAtReceiver(trans.write, ds.cache),
-			ds.cache,
-			what,
-		)
+		ds.cache.incEvent(what)
 	}
 
 	return progress
@@ -958,6 +1090,15 @@ func (ds *directoryStage) writeToBank(
 
 	addr := trans.write.Address
 	cachelineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize)
+
+	// Method D: writeToBank repurposes a victim slot. If the victim
+	// previously held a valid line that doesn't match the new key, it
+	// is being silently overwritten (the dirty-eviction case goes
+	// through evict() instead, which records on its own path). Stamp
+	// the LRU reason here for the silent-overwrite case only.
+	if block.IsValid && (block.Tag != cachelineID || block.PID != trans.write.PID) {
+		ds.cache.recordEviction(block.PID, block.Tag, evictReasonLRU)
+	}
 
 	ds.cache.directory.Visit(block)
 	block.IsLocked = true
@@ -1031,6 +1172,14 @@ func (ds *directoryStage) evict(
 		// cacheline의 사용량 조사
 	}
 
+	// Method D: stamp the victim's pre-overwrite identity as LRU-evicted so
+	// a future re-fetch of the same line can be classified as a capacity
+	// miss. Must run BEFORE updateVictimBlockMetaData (which overwrites
+	// victim.Tag with cacheLineID).
+	if victim.IsValid {
+		ds.cache.recordEviction(victim.PID, victim.Tag, evictReasonLRU)
+	}
+
 	ds.updateTransForEviction(trans, victim, pid, cacheLineID)
 	ds.updateVictimBlockMetaData(victim, cacheLineID, pid)
 
@@ -1050,19 +1199,8 @@ func (ds *directoryStage) evict(
 	// ds.cache.printRWMask(victim.PID, victim.VAddr)
 	ds.cache.eraseCacheLineFromRWMask(victim.PID, victim.VAddr)
 
-	what := fmt.Sprintf("Usage: %d/%d", count, 1<<(ds.cache.log2BlockSize-6))
-	tracing.AddTaskStep(
-		tracing.MsgIDAtReceiver(trans.accessReq(), ds.cache),
-		ds.cache,
-		what,
-	)
-
-	what = fmt.Sprintf("RW: %t/%t", hasBeenRead, hasBeenWritten)
-	tracing.AddTaskStep(
-		tracing.MsgIDAtReceiver(trans.accessReq(), ds.cache),
-		ds.cache,
-		what,
-	)
+	ds.cache.incEvent(fmt.Sprintf("Usage: %d/%d", count, 1<<(ds.cache.log2BlockSize-6)))
+	ds.cache.incEvent(fmt.Sprintf("RW: %t/%t", hasBeenRead, hasBeenWritten))
 
 	return true
 }
@@ -1114,6 +1252,11 @@ func (ds *directoryStage) updateTransForEviction(
 		trans.fetchPID = pid
 		trans.fetchAddress = cacheLineID
 		trans.action = bankEvictAndFetch
+		if trans.fromLocal {
+			ds.cache.mshrLocalAdded++
+		} else {
+			ds.cache.mshrRemoteAdded++
+		}
 	} else {
 		trans.action = bankEvictAndWrite
 	}
@@ -1172,7 +1315,19 @@ func (ds *directoryStage) fetch(
 		return false
 	}
 
+	// Method D: if the slot held a valid (clean) line, this fetch
+	// silently evicts it (needEviction=false skips evict()). Record the
+	// LRU eviction so a future re-fetch is classified as capacity.
+	if block.IsValid {
+		ds.cache.recordEviction(block.PID, block.Tag, evictReasonLRU)
+	}
+
 	mshrEntry := ds.cache.mshr.Add(pid, cacheLineID)
+	if trans.fromLocal {
+		ds.cache.mshrLocalAdded++
+	} else {
+		ds.cache.mshrRemoteAdded++
+	}
 	trans.mshrEntry = mshrEntry
 	trans.block = block
 	block.IsLocked = true
@@ -1185,11 +1340,7 @@ func (ds *directoryStage) fetch(
 	block.HasBeenWritten = false // fetch 이후 아직 사용하진 않은
 	ds.cache.directory.Visit(block)
 
-	tracing.AddTaskStep(
-		tracing.MsgIDAtReceiver(req, ds.cache),
-		ds.cache,
-		fmt.Sprintf("add-mshr-entry-0x%x-0x%x", mshrEntry.Address, block.Tag),
-	)
+	ds.cache.incEvent(fmt.Sprintf("add-mshr-entry-0x%x-0x%x", mshrEntry.Address, block.Tag))
 
 	ds.cache.InvokeHook(sim.HookCtx{
 		Domain: ds.cache,
@@ -1245,6 +1396,7 @@ func (ds *directoryStage) needEviction(victim *internal.Block) bool {
 
 func (ds *directoryStage) isMSHRAvailable(trans *transaction) bool {
 	if ds.cache.mshr.IsFull() {
+		ds.cache.stallMSHRTotalFull++
 		return false
 	}
 
@@ -1258,6 +1410,7 @@ func (ds *directoryStage) isMSHRAvailable(trans *transaction) bool {
 		}
 
 		if count >= ds.cache.maxLocalMshr {
+			ds.cache.stallMSHRLocalCap++
 			return false
 		}
 	}

@@ -205,7 +205,12 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 		mshrStageBuf = s.cache.remoteMshrStageBuffer
 	}
 
-	if !bottomSenderBuf.CanPush() || !mshrStageBuf.CanPush() {
+	if !bottomSenderBuf.CanPush() {
+		s.cache.stallBottomBufFull++
+		return false
+	}
+	if !mshrStageBuf.CanPush() {
+		s.cache.stallMshrBufFull++
 		return false
 	}
 
@@ -223,6 +228,21 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 		done := false
 
 		switch trans.action {
+		case Nothing:
+			// Defensive handler: the directorystage fast-path now drops
+			// read-hit Nothing transactions before writeToBank (see
+			// directorystage.go doWriteHit). Reaching this case means a
+			// new code path forgot to bypass — handle gracefully by
+			// pushing to bottom sender and unlocking, matching the
+			// behavior of UpdateEntry without sharer mutation.
+			blk := trans.block
+			if blk != nil {
+				entry := &blk.SubEntry[trans.blockIdx]
+				entry.IsLocked = false
+			}
+			bottomSenderBuf.Push(trans)
+			mshrStageBuf.Push(trans)
+			done = true
 		case InsertNewEntry:
 			done = s.InsertNewEntry(trans, bottomSenderBuf, mshrStageBuf)
 		case EvictAndInsertNewEntry:
@@ -240,6 +260,11 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 		}
 
 		if done {
+			// Stamp bottomEnterTime for bank-path trans that just got
+			// pushed to bottomSenderBuffer by the action handler. This
+			// closes the "in dirStage+bank" interval for waitDir.
+			trans.bottomEnterTime = s.cache.Engine.CurrentTime()
+			trans.pathCategory = "bank"
 			postBuf.Remove(i)
 			if isLocal {
 				s.localInflightTransCount--

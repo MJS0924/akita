@@ -125,14 +125,29 @@ func (e bankPipelineElem) TaskID() string {
 }
 
 func (s *bankStage) Tick() (madeProgress bool) {
+	// Commit-only budget for finalize: each iteration consumes one
+	// slot ONLY when a transaction actually commits out of the
+	// post-pipeline buffer. If no item in postPipelineBuf can finalize
+	// this cycle, the loop terminates early — a stalled head item
+	// shouldn't keep burning per-cycle budget.
 	for i := 0; i < s.cache.numReqPerCycle; i++ {
-		madeProgress = s.finalizeTrans() || madeProgress
+		if !s.finalizeTrans() {
+			break
+		}
+		madeProgress = true
 	}
 
 	madeProgress = s.pipeline.Tick() || madeProgress
 
+	// Commit-only budget for pull: pullFromBuf already arbitrates
+	// between writeBufferToBankBuffers (upward, priority) and
+	// dirToBankBuffers (downward) internally and returns true only on
+	// commit. If both queues are empty/blocked this cycle, terminate.
 	for i := 0; i < s.cache.numReqPerCycle; i++ {
-		madeProgress = s.pullFromBuf() || madeProgress
+		if !s.pullFromBuf() {
+			break
+		}
+		madeProgress = true
 	}
 
 	return madeProgress
@@ -392,6 +407,12 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		}
 	}
 
+	// Deferred-invalidation: an InvReq arrived while this block was
+	// IsLocked by the write-hit op. It has already been acked upstream;
+	// the writeToHomeNode flush above (if any) has already captured
+	// block metadata, so zero the local copy now.
+	s.applyPendingInvalidation(block)
+
 	tracing.TraceReqComplete(write, s.cache)
 
 	// log.Printf("%.10f, %s, bank write hit finalize， "+
@@ -472,6 +493,12 @@ func (s *bankStage) finalizeBankWriteFetched(
 		trans.action = writeBufferFlush
 		s.cache.writeBufferBuffer.Push(trans)
 	}
+
+	// Deferred-invalidation: see directoryStage.doInvalidation. The
+	// L1 read miss responder has already been served via mshrStage drain;
+	// the home-node flush above (if any) has captured block metadata.
+	// Safe to zero the local L2 copy now.
+	s.applyPendingInvalidation(block)
 
 	if s.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == s.cache.debugAddress0 {
 		fmt.Printf("[%s] [bankStage]\tReceived rsp - 2.2: addr %x, action %d, writeToHomenode %t\n",
@@ -573,13 +600,36 @@ func (s *bankStage) finalizeBankWritePrefetched(
 		fmt.Printf("[%s] [bankStage]\tReceived rsp - 2.3: addr %x, action %d\n", s.cache.name, trans.accessReq().GetAddress(), trans.action)
 	}
 
-	tracing.AddTaskStep(
-		trans.prefetch.ID,
-		s.cache,
-		what,
-	)
+	// Deferred-invalidation: prefetched data was never returned to any
+	// L1, so dropping the local L2 copy here is invisible to consumers.
+	// For bankEvictAndPrefetch, the OLD victim was already pushed to
+	// writeBufferBuffer above so its flush is unaffected.
+	s.applyPendingInvalidation(block)
+
+	s.cache.incEvent(what)
 	tracing.TraceReqFinalize(trans.prefetch, s.cache)
 	return true
+}
+
+// applyPendingInvalidation finalizes a deferred InvReq that was acked
+// upstream by directoryStage.doInvalidation while this block was still
+// IsLocked. The InvRsp has already been sent; CohDir considers this L2
+// a non-sharer. Must be called AFTER the bank op consumes any block
+// metadata it needs (e.g. PID/Tag/DirtyMask for the writeToHomeNode
+// flush) and AFTER IsLocked has been cleared.
+func (s *bankStage) applyPendingInvalidation(block *internal.Block) {
+	if !block.PendingInvalidation {
+		return
+	}
+	s.cache.eraseCacheLineFromRWMask(block.PID, block.VAddr)
+	newBlk := &internal.Block{
+		WayID:        block.WayID,
+		SetID:        block.SetID,
+		CacheAddress: block.CacheAddress,
+	}
+	*block = *newBlk
+	s.cache.deferredInvApplied++
+	s.cache.incEvent("DeferredInvApplied")
 }
 
 func (s *bankStage) removeTransaction(trans *transaction) {

@@ -32,6 +32,7 @@ type Builder struct {
 	writeBufferCapacity int
 	maxInflightFetch    int
 	maxInflightEviction int
+	maxInvEmitPerCycle  int
 
 	cohDirLatency int
 	dirLatency    int
@@ -144,6 +145,15 @@ func (b Builder) WithWriteBufferSize(n int) Builder {
 // cache can issue at the same time.
 func (b Builder) WithMaxInflightFetch(n int) Builder {
 	b.maxInflightFetch = n
+	return b
+}
+
+// WithMaxInvEmitPerCycle caps the number of InvReq messages the directory
+// may emit per output channel per cycle. Two separate counters (RDMA-bound
+// and local-L2-bound) each obey this cap. 0 (default) disables the cap and
+// preserves the historical "as fast as port buffer allows" behavior.
+func (b Builder) WithMaxInvEmitPerCycle(n int) Builder {
+	b.maxInvEmitPerCycle = n
 	return b
 }
 
@@ -312,6 +322,7 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		writeBufferCapacity:     b.writeBufferCapacity,
 		maxInflightRequest:      b.maxInflightFetch,
 		maxInflightInvalidation: b.maxInflightEviction,
+		maxInvEmitPerCycle:      b.maxInvEmitPerCycle,
 	}
 }
 

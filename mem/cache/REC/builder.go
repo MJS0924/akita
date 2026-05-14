@@ -34,12 +34,15 @@ type Builder struct {
 	writeBufferCapacity int
 	maxInflightFetch    int
 	maxInflightEviction int
+	maxInvEmitPerCycle  int
 
 	cohDirLatency int
 	dirLatency    int
 	bankLatency   int
 
 	addressMapperType string
+
+	halfSet bool
 
 	ToRDMA sim.RemotePort
 
@@ -59,7 +62,10 @@ func MakeBuilder() Builder {
 		numReqPerCycle:      1,
 		writeBufferCapacity: 1024,
 		maxInflightFetch:    128,
-		maxInflightEviction: 128,
+		// Phase F equivalent: cap 128 → 256 (2× headroom). Larger
+		// values (e.g. 1024) under-report inv cost by absorbing back-
+		// pressure that real hardware would propagate.
+		maxInflightEviction: 256,
 		bankLatency:         10,
 	}
 }
@@ -162,6 +168,13 @@ func (b Builder) WithMaxInflightEviction(n int) Builder {
 	return b
 }
 
+// WithMaxInvEmitPerCycle caps InvReq emission per output channel per cycle.
+// 0 (default) disables the cap. See cohdirectory.Builder.WithMaxInvEmitPerCycle.
+func (b Builder) WithMaxInvEmitPerCycle(n int) Builder {
+	b.maxInvEmitPerCycle = n
+	return b
+}
+
 // WithDirectoryLatency sets the number of cycles required to access the
 // directory.
 func (b Builder) WithCoherenceDirectoryLatency(n int) Builder {
@@ -185,6 +198,13 @@ func (b Builder) WithBankLatency(n int) Builder {
 
 func (b Builder) WithAddressMapperType(t string) Builder {
 	b.addressMapperType = t
+	return b
+}
+
+// WithHalfSet halves the number of sets to reflect REC's 2x entry-size
+// hardware overhead relative to a baseline directory.
+func (b Builder) WithHalfSet(v bool) Builder {
+	b.halfSet = v
 	return b
 }
 
@@ -246,8 +266,11 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.deviceID = b.deviceID
 	blockSize := 1 << b.log2BlockSize
 	vimctimFinder := internal.NewLRUVictimFinder()
-	numSet := int(b.byteSize / uint64(b.wayAssociativity*blockSize)) // REC는 entry 크기가 baseline에 비해 2배정도 크기 때문에 set 크기를 절반으로 줄임
-	// numSet := int(b.byteSize/uint64(b.wayAssociativity*blockSize)) / 2 // REC는 entry 크기가 baseline에 비해 2배정도 크기 때문에 set 크기를 절반으로 줄임
+	// REC entry는 baseline 대비 약 2배 크기 → halfSet=true이면 set 수를 절반으로 줄여 하드웨어 overhead를 반영
+	numSet := int(b.byteSize / uint64(b.wayAssociativity*blockSize))
+	if b.halfSet {
+		numSet /= 2
+	}
 	directory := internal.NewRECDirectory(
 		numSet, b.wayAssociativity, blockSize, int(b.log2NumSubEntry), int(b.log2BlockSize), vimctimFinder)
 
@@ -336,6 +359,7 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		maxInflightRequest:       b.maxInflightFetch,
 		maxInflightInvalidation:  b.maxInflightEviction,
 		maxInflightBypassRequest: 1024,
+		maxInvEmitPerCycle:       b.maxInvEmitPerCycle,
 	}
 }
 

@@ -75,6 +75,15 @@ type transaction struct {
 	sharers                  []sim.RemotePort // 하위 뱅크에서 응답받은 sharer들 누적
 
 	utilRecorded bool // set true once evict-utilization has been sampled for this transaction
+
+	// Per-stage timestamps for queueing-delay analysis (Method E2).
+	// stamps are sim.VTimeInSec (seconds, float64). Zero means "not stamped".
+	enterTime       sim.VTimeInSec // received at topparser
+	bottomEnterTime sim.VTimeInSec // pushed to bottomSenderBuffer / localBypassBuffer
+	// pathCategory: "bypass" / "fast" / "bank" — discriminator for
+	// per-path queueing-delay accumulators in bottomSender. Stamped at
+	// the same push site as bottomEnterTime.
+	pathCategory string
 }
 
 func (t transaction) accessReq() mem.AccessReq {

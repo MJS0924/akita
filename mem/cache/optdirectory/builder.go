@@ -34,6 +34,7 @@ type Builder struct {
 	writeBufferCapacity int
 	maxInflightFetch    int
 	maxInflightEviction int
+	maxInvEmitPerCycle  int
 
 	cohDirLatency int
 	dirLatency    int
@@ -63,7 +64,13 @@ func MakeBuilder() Builder {
 		numReqPerCycle:      1,
 		writeBufferCapacity: 1024,
 		maxInflightFetch:    128,
-		maxInflightEviction: 128,
+		// Phase F equivalent: cap raised from 128 (which deadlocked on
+		// matrixtranspose CD_8) to 256 — 2× headroom, while keeping inv
+		// cost modeling realistic. Combined with the dedicated inv
+		// egress queue + drain priority, this should absorb broadcast
+		// invalidation bursts without artificially nullifying back-
+		// pressure (cap 1024 was found to under-report inv cost).
+		maxInflightEviction: 256,
 		bankLatency:         1,
 	}
 }
@@ -171,6 +178,13 @@ func (b Builder) WithMaxInflightFetch(n int) Builder {
 // write buffer can write to a low-level module.
 func (b Builder) WithMaxInflightEviction(n int) Builder {
 	b.maxInflightEviction = n
+	return b
+}
+
+// WithMaxInvEmitPerCycle caps InvReq emission per output channel per cycle.
+// 0 (default) disables the cap. See cohdirectory.Builder.WithMaxInvEmitPerCycle.
+func (b Builder) WithMaxInvEmitPerCycle(n int) Builder {
+	b.maxInvEmitPerCycle = n
 	return b
 }
 
@@ -301,6 +315,9 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.directory = directory
 	cacheModule.mshr = mshr
 	cacheModule.storage = storage
+	// local soft cap: remote 요청을 위해 항상 16개 슬롯 예약 (writebackcoh L2와 동일 정책).
+	cacheModule.maxLocalMshr = b.numMSHREntry - 16
+	cacheModule.localMshrCount = 0
 
 	if b.addressToPortMapper == nil {
 		// panic(
@@ -375,10 +392,12 @@ func (b *Builder) createInternalStages(cache *Comp) {
 	cache.mshrStage = &mshrStage{cache: cache}
 	cache.flusher = &flusher{cache: cache}
 	cache.bottomSender = &bottomSender{
-		cache:                   cache,
-		writeBufferCapacity:     b.writeBufferCapacity,
-		maxInflightRequest:      b.maxInflightFetch,
-		maxInflightInvalidation: b.maxInflightEviction,
+		cache:                    cache,
+		writeBufferCapacity:      b.writeBufferCapacity,
+		maxInflightRequest:       b.maxInflightFetch,
+		maxInflightInvalidation:  b.maxInflightEviction,
+		maxInvEmitPerCycle:       b.maxInvEmitPerCycle,
+		maxInflightBypassRequest: 1024,
 	}
 }
 

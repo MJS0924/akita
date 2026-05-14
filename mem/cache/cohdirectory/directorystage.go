@@ -89,6 +89,11 @@ func (ds *directoryStage) processTransaction() bool {
 		if ds.doWrite(trans) {
 			ds.buf.Pop()
 			madeProgress = madeProgress || true
+		} else {
+			// Match REC/optdirectory: break on doWrite failure so stall
+			// counters reflect actual cycle-level back-pressure rather
+			// than inner-loop busy-spin amplification.
+			break
 		}
 	}
 
@@ -175,10 +180,19 @@ func (ds *directoryStage) doWriteHit(
 
 	if trans.isReadTrans() {
 		if ds.readPermission(trans, block.Sharer) {
+			// Existing sharer re-read fast-path: bypass writeToBank.
+			// Without this, action=Nothing would reach bankstage and
+			// hit the panic("bank action not supported") default
+			// branch. (readPermission only ever returns true for
+			// remote reads after the Meta().Src→GetSrcRDMA fix.)
 			trans.action = Nothing
-		} else {
-			trans.action = UpdateEntry
+			if !ds.cache.bottomSenderBuffer.CanPush() {
+				return false
+			}
+			ds.cache.bottomSenderBuffer.Push(trans)
+			return true
 		}
+		trans.action = UpdateEntry
 		return ds.writeToBank(trans, block)
 	}
 
@@ -290,8 +304,14 @@ func (ds *directoryStage) isFromLocal(trans *transaction) bool {
 func (ds *directoryStage) readPermission(trans *transaction, sharer []sim.RemotePort) bool {
 	// if !ds.isFromLocal(trans) { // remote access
 	if !trans.fromLocal { // remote access
+		// Sharer is recorded as the requester's RDMA port (see
+		// bankstage: blk.Sharer = appendSharer(..., GetSrcRDMA())),
+		// not the immediate-sender Meta().Src. Comparing against
+		// Meta().Src would never match, so the action=Nothing
+		// fast-path could not fire for existing sharers.
+		src := trans.accessReq().GetSrcRDMA()
 		for _, sh := range sharer {
-			if sh == trans.accessReq().Meta().Src {
+			if sh == src {
 				return true
 			}
 		}
@@ -306,7 +326,9 @@ func (ds *directoryStage) writePermission(trans *transaction, sharer []sim.Remot
 	if !ds.isFromLocal(trans) { // remote access
 		if len(sharer) > 1 {
 			return false
-		} else if sharer[0] != trans.accessReq().Meta().Src {
+		} else if sharer[0] != trans.accessReq().GetSrcRDMA() {
+			// Same rationale as readPermission: sharer entries are
+			// stored using GetSrcRDMA(), not Meta().Src.
 			return false
 		}
 

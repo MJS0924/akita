@@ -7,6 +7,7 @@ import (
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
+	"github.com/sarchlab/akita/v4/tracing"
 )
 
 type coalescer struct {
@@ -62,7 +63,7 @@ func (c *coalescer) processReqCoalescable(req mem.AccessReq) bool {
 	c.cache.transactions = append(c.cache.transactions, trans)
 	c.cache.topPort.RetrieveIncoming()
 
-	// tracing.TraceReqReceive(req, c.cache)
+	tracing.TraceReqReceive(req, c.cache)
 
 	return true
 }
@@ -74,16 +75,12 @@ func (c *coalescer) processReqNoncoalescable(req mem.AccessReq) bool {
 
 	c.coalesceAndSend()
 
-	// if c.cache.Name() == "GPU[1].SA[0].L1VCache[0]" {
-	// 	fmt.Printf("\t\t\t\t\t\t\tCoalesce\n")
-	// }
-
 	trans := c.createTransaction(req)
 	c.toCoalesce = append(c.toCoalesce, trans)
 	c.cache.transactions = append(c.cache.transactions, trans)
 	c.cache.topPort.RetrieveIncoming()
 
-	// tracing.TraceReqReceive(req, c.cache)
+	tracing.TraceReqReceive(req, c.cache)
 
 	return true
 }
@@ -93,10 +90,6 @@ func (c *coalescer) processReqLastInWaveCoalescable(req mem.AccessReq) bool {
 		return false
 	}
 
-	// if c.cache.Name() == "GPU[1].SA[0].L1VCache[0]" {
-	// 	fmt.Printf("\t\t\t\t\t\t\tCoalesce\n")
-	// }
-
 	trans := c.createTransaction(req)
 	c.toCoalesce = append(c.toCoalesce, trans)
 	c.cache.transactions = append(c.cache.transactions, trans)
@@ -104,7 +97,7 @@ func (c *coalescer) processReqLastInWaveCoalescable(req mem.AccessReq) bool {
 	c.coalesceAndSend()
 	c.cache.topPort.RetrieveIncoming()
 
-	// tracing.TraceReqReceive(req, c.cache)
+	tracing.TraceReqReceive(req, c.cache)
 
 	return true
 }
@@ -120,17 +113,13 @@ func (c *coalescer) processReqLastInWaveNoncoalescable(req mem.AccessReq) bool {
 		return true
 	}
 
-	// if c.cache.Name() == "GPU[1].SA[0].L1VCache[0]" {
-	// 	fmt.Printf("\t\t\t\t\t\t\tCoalesce\n")
-	// }
-
 	trans := c.createTransaction(req)
 	c.toCoalesce = append(c.toCoalesce, trans)
 	c.cache.transactions = append(c.cache.transactions, trans)
 	c.coalesceAndSend()
 	c.cache.topPort.RetrieveIncoming()
 
-	// tracing.TraceReqReceive(req, c.cache)
+	tracing.TraceReqReceive(req, c.cache)
 
 	return true
 }
