@@ -411,9 +411,11 @@ func (b *Builder) buildDirectoryStage(cache *Comp) {
 	}
 
 	// 4. Phase F dedicated InvReq pipeline. ingress: invStageBuffer → invPipeline
-	// (same dirLatency stages so tag lookup time is honored), post-pipeline:
+	// (dirLatency stages baseline so tag lookup time is honored), post-pipeline:
 	// invBuf. processTransaction drains invBuf BEFORE local/remote bufs so
-	// invs preempt stalled read/write at the commit stage.
+	// invs preempt stalled read/write at the commit stage. The +snoopLatency
+	// term lets experiments dial inv-handling cost up without touching the
+	// regular read/write pipelines.
 	invBuf := sim.NewBuffer(
 		cache.Name()+".InvDirectoryStageInternalBuffer",
 		b.numReqPerCycle,
@@ -421,7 +423,7 @@ func (b *Builder) buildDirectoryStage(cache *Comp) {
 	invPipeline := pipelining.
 		MakeBuilder().
 		WithCyclePerStage(1).
-		WithNumStage(b.dirLatency).
+		WithNumStage(b.dirLatency + b.snoopLatency).
 		WithPipelineWidth(b.numReqPerCycle).
 		WithPostPipelineBuffer(invBuf).
 		Build(cache.Name() + ".Dir.InvPipeline")

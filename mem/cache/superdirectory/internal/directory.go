@@ -332,7 +332,11 @@ type SuperDirectoryImpl struct {
 //   Bank 1 (regionLen=12) -> 2048 counters (1 KB)
 //   Bank 2 (regionLen=10) -> 4096 counters (2 KB)
 // Banks 3 and 4 do not host a filter (always probed regardless).
-var defaultCBFSizes = []uint64{1024, 2048, 4096}
+// CBF entries are sized as 4 × (subentry count per bank) — that is, 4 ×
+// numSets[i] × numWays × (1 << log2NumSubEntry). Defaulting to the first
+// three (coarsest) banks; len of this slice controls how many leading banks
+// receive a CBF, not the sizes themselves.
+var defaultCBFSizes = []uint64{0, 0, 0}
 
 // NewSuperDirectory builds a SuperDirectory.
 // numSetsPerBank: optional per-bank set counts (len == bank). When nil/empty,
@@ -386,9 +390,12 @@ func NewSuperDirectory(
 	}
 	d.bloomFilter = make([]*CountingBloomFilter, bank)
 	d.cbfStats = make([]CBFBankStats, bank)
+	subentryPerCohSet := way << log2NumSubEntry
 	for i := 0; i < d.numCBFBanks; i++ {
-		d.bloomFilter[i] = NewCountingBloomFilter(i, defaultCBFSizes[i])
-		d.cbfStats[i].NumEntries = defaultCBFSizes[i]
+		// 4 × total subentry count in bank i.
+		bfSize := uint64(d.NumSets[i] * subentryPerCohSet * 4)
+		d.bloomFilter[i] = NewCountingBloomFilter(i, bfSize)
+		d.cbfStats[i].NumEntries = bfSize
 	}
 
 	for i := 0; i < bank; i++ {
