@@ -789,7 +789,7 @@ func (bs *bottomSender) processInvalidationReq() bool {
 	req := item.(*mem.InvReq)
 
 	regionLen := bs.cache.log2BlockSize + bs.cache.log2UnitSize
-	blockSize := bs.cache.log2BlockSize
+
 	addr := req.GetAddress() >> regionLen << regionLen
 	endAddr := addr + 1<<regionLen
 
@@ -819,7 +819,7 @@ func (bs *bottomSender) processInvalidationReq() bool {
 		// regular read/write traffic stuck on backpressure.
 		bs.invRemoteSendToBottomQue = append(bs.invRemoteSendToBottomQue, reqToBottom)
 
-		addr += 1 << blockSize
+		addr += 1 << bs.cache.log2BlockSize
 		tr.ack++
 	}
 
@@ -873,9 +873,20 @@ func (bs *bottomSender) processInvRsp(rsp *mem.InvRsp) bool {
 		bs.removeInflightInvToOutside(i)
 		// fmt.Printf("[%s]\tFinalize Inv Req - 3.2: %x\n", bs.cache.name, trans.evictingAddr)
 
-		// write에 의한 invalidation 처리:
-		// 모든 InvRsp 수신 완료 후 실제 write를 L2로 전송해야 함
-		if trans.write != nil {
+		// write에 의한 invalidation 완료 후 처리.
+		//
+		// 두 경로가 sendInvalidationRequest 를 거치는데, 둘의 후처리는 다르다:
+		//   1) InvalidateAndUpdateEntry (write hit + remote sharer): write
+		//      가 L2 로 즉시 송신되지 않고 defer 됨 (sendInvalidationRequest
+		//      의 guard 참고). 따라서 invs ack 후 pendingWriteAfterInv 로
+		//      재큐잉해서 sendRequestToBottom 을 호출해야 함.
+		//   2) EvictAndInsertNewEntry: write/read 모두 invs 발송과 함께
+		//      sendRequestToBottom 이 이미 호출되어 trans 가 inflight 에
+		//      존재함. 여기서 pendingWriteAfterInv 로 재큐잉하면 동일 trans
+		//      가 L2 로 이중 송신되어 inflight 카운터 폭발 + 응답 두 번 →
+		//      vgg16_HMG (모든 write 가 evict-insert 경로) 데드락 원인.
+		//      이 경로는 재큐잉 SKIP.
+		if trans.write != nil && trans.action == InvalidateAndUpdateEntry {
 			trans.action = Nothing
 			if trans.fromLocal {
 				bs.pendingLocalWriteAfterInv = append(bs.pendingLocalWriteAfterInv, trans)

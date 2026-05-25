@@ -36,9 +36,18 @@ func (m *mockSuperDirectory) GetBanks() [][]internal.CohSet { panic("not impleme
 func (m *mockSuperDirectory) FindVictim(_ int, _ vm.PID, _ uint64) (*internal.CohEntry, bool) {
 	panic("not implemented")
 }
+func (m *mockSuperDirectory) FindVictimPreferPromotable(_ int, _ vm.PID, _ uint64) (*internal.CohEntry, bool) {
+	panic("not implemented")
+}
+func (m *mockSuperDirectory) FindVictimPreferStrictlyPromotable(_ int, _ vm.PID, _ uint64) (*internal.CohEntry, bool) {
+	panic("not implemented")
+}
 func (m *mockSuperDirectory) TotalSize() uint64  { panic("not implemented") }
 func (m *mockSuperDirectory) WayAssociativity() int { panic("not implemented") }
 func (m *mockSuperDirectory) GetRegionLen(_ int) int { panic("not implemented") }
+func (m *mockSuperDirectory) SampleCBFForAllBanks(_ vm.PID, _ uint64) {}
+func (m *mockSuperDirectory) CBFStats() []internal.CBFBankStats        { return nil }
+func (m *mockSuperDirectory) HasCBF(_ int) bool                        { return false }
 
 // ─── mock MSHR ────────────────────────────────────────────────────────────────
 
@@ -135,33 +144,38 @@ func TestSelectBank_RSBHit_BFEmpty(t *testing.T) {
 	}
 }
 
-// (b) RSB=1, BF=[3,2] (bfList[last]=2 > 1) → non-stale → bankID=1, bankList=nil
+// (b) RSB=1, BF=[3,2]. §2 simplified bank lookup: RSB hit ALWAYS routes
+// exclusively to RSB.bank. The previous bfDisagreesWithRSB cross-check
+// is gone — correctness for the BF-finer-than-RSB-hint case is now
+// provided by §1's alloc-time coarser-bank reprobe in doWriteMiss.
 func TestSelectBank_RSBHit_BFNonStale(t *testing.T) {
 	ds := newTestDirStage(newMockDir([]int{3, 2}), 1)
 	sel := ds.selectBank(vm.PID(0), testAddr)
 	if sel.bankID != 1 {
-		t.Errorf("bankID: want 1, got %d", sel.bankID)
+		t.Errorf("bankID: want 1 (RSB exclusive), got %d", sel.bankID)
 	}
 	if sel.bankList != nil {
-		t.Errorf("bankList: want nil, got %v", sel.bankList)
+		t.Errorf("bankList: want nil (RSB exclusive), got %v", sel.bankList)
 	}
 	if !sel.bfEager {
-		t.Error("bfEager: want true for normal RSB hit")
+		t.Error("bfEager: want true on RSB hit (eager BF insert)")
 	}
+	_ = reflect.DeepEqual // keep import alive (used elsewhere)
 }
 
-// (c) RSB=2, BF=[4,0] (bfList[last]=0 < 2) → stale → bankID=4, bankList=[0], bfEager=false
+// (c) RSB=2, BF=[4,0]. §2 simplified lookup: RSB exclusive, BF state
+// ignored at routing time. No stale-RSB fallback at selectBank.
 func TestSelectBank_RSBHit_BFStale(t *testing.T) {
 	ds := newTestDirStage(newMockDir([]int{4, 0}), 2)
 	sel := ds.selectBank(vm.PID(0), testAddr)
-	if sel.bankID != 4 {
-		t.Errorf("bankID: want 4, got %d", sel.bankID)
+	if sel.bankID != 2 {
+		t.Errorf("bankID: want 2 (RSB exclusive), got %d", sel.bankID)
 	}
-	if !reflect.DeepEqual(sel.bankList, []int{0}) {
-		t.Errorf("bankList: want [0], got %v", sel.bankList)
+	if sel.bankList != nil {
+		t.Errorf("bankList: want nil (RSB exclusive), got %v", sel.bankList)
 	}
-	if sel.bfEager {
-		t.Error("bfEager: want false for stale RSB")
+	if !sel.bfEager {
+		t.Error("bfEager: want true on RSB hit")
 	}
 }
 
@@ -248,15 +262,17 @@ func TestSelectBank_Race_BFInsertPreventsDefaultRouting(t *testing.T) {
 	}
 }
 
-// Stale path must not set bfEager=true (would suppress the allocation-path BF insert).
+// §2 simplified lookup: the previous "stale RSB hint vs BF" sub-case is
+// gone. Any RSB hit yields bfEager=true and bankList=nil regardless of
+// what BF reports. This test now asserts that contract directly.
 func TestSelectBank_Stale_BFEagerFalse(t *testing.T) {
 	ds := newTestDirStage(newMockDir([]int{4, 0}), 2)
 	sel := ds.selectBank(vm.PID(0), testAddr)
-	if sel.bfEager {
-		t.Error("stale sub-case must not set bfEager=true")
+	if !sel.bfEager {
+		t.Error("RSB hit must set bfEager=true under §2 contract")
 	}
-	if len(sel.bankList) == 0 {
-		t.Error("stale sub-case must carry bankList")
+	if sel.bankList != nil {
+		t.Errorf("RSB hit must clear bankList, got %v", sel.bankList)
 	}
 }
 

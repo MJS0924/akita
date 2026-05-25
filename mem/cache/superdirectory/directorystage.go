@@ -82,6 +82,13 @@ func (ds *directoryStage) acceptNewTransaction(fromLocal bool) bool {
 
 		addr := req.GetAddress()
 
+		// Unbiased CBF FPR sampling: probe every CBF-enabled bank for this
+		// access and record (CBF outcome, directory ground truth). Doing it
+		// here (per accepted access) avoids the sampling bias of measuring
+		// only at the bank selectBank ultimately routed to — that bias
+		// caps measured TN at near-zero by construction.
+		ds.cache.directory.SampleCBFForAllBanks(req.GetPID(), addr)
+
 		sel := ds.selectBank(req.GetPID(), addr)
 		trans.bankID = sel.bankID
 		trans.bankList = sel.bankList
@@ -319,6 +326,31 @@ func (ds *directoryStage) doPromotion(trans *transaction, isLocal bool) bool {
 	trans.block = targetBlock
 	trans.blockIdx = index
 
+	// §1 SO assertion (sub-entry granular). Active only when
+	// SD_ASSERT_SINGLE_OWNER=1. Probe every other bank's directory entry
+	// covering this sub-region; panic if another bank already owns a
+	// valid sub-entry for the same byte range.
+	if os.Getenv("SD_ASSERT_SINGLE_OWNER") == "1" {
+		for bid := 0; bid < ds.cache.numBanks; bid++ {
+			if bid == targetBankID {
+				continue
+			}
+			otherRegionLen := uint64(ds.cache.regionLen[bid])
+			otherCID, _ := getCacheLineID(addr, otherRegionLen)
+			otherEntry, _ := ds.cache.directory.Lookup(bid, pid, otherCID)
+			if otherEntry == nil || !otherEntry.IsValidEntry() {
+				continue
+			}
+			subIdxOther := int((addr >> otherRegionLen) % uint64(1<<ds.cache.log2NumSubEntry))
+			if !otherEntry.SubEntry[subIdxOther].IsValid {
+				continue
+			}
+			panic(fmt.Sprintf(
+				"[%s] SO violation (doPromotion): addr=%#x target bank=%d subIdx=%d clashes with bank=%d subIdx=%d (tag=%#x)",
+				ds.cache.name, addr, targetBankID, index, bid, subIdxOther, otherEntry.Tag))
+		}
+	}
+
 	ds.cache.directory.InsertBloomfilter(targetBankID, cachelineID)
 	// (E-3) Data is now present at targetBankID — drop any RSB hint pointing
 	// to a different bank for this addr to preserve the "RSB only for absent
@@ -326,44 +358,56 @@ func (ds *directoryStage) doPromotion(trans *transaction, isLocal bool) bool {
 	// past this bank and allocate a parallel entry.
 	ds.cache.regionSizeBuffer.InvalidateAddr(addr)
 
-	ds.sweepFinerBankEntriesInCoarseRegion(targetBankID, targetBlock, pid)
+	// §1 SO-invariant fix: sweep only the sub-region that this promotion
+	// actually fills, leaving other sub-regions' finer-bank entries alone.
+	ds.sweepFinerBankEntriesInSubRegion(targetBankID, targetBlock, index, pid)
 
 	targetBuffer[targetBankID].Push(trans)
 
 	return true
 }
 
-// sweepFinerBankEntriesInCoarseRegion migrates sharer info from every finer-
-// bank directory entry whose region overlaps the coarse region owned by
-// targetBlock into the corresponding sub-entry of targetBlock, then
+// sweepFinerBankEntriesInSubRegion migrates sharer info from every finer-
+// bank directory entry whose region overlaps a specific sub-region (a
+// single sub-entry of targetBlock) into targetBlock.SubEntry[subIdx], then
 // invalidates the finer entry. Without this migration the "at most one
 // bank owns each coarse region" invariant is restored only at the
 // directory layer; the underlying GPU L2s still hold copies that the
 // directory has forgotten, breaking cross-GPU coherence on subsequent
-// writes. Mapping: each valid finer sub-entry at byte address A is
-// merged into targetBlock.SubEntry[(A - targetBlock.Tag) >> coarseRegionLen]
-// via sharer union (dedupe) + IsDirty/IsValid propagation. BF inserts on
-// the coarse bank are issued for newly-validated coarse sub-entries so
-// future selectBank queries route here.
-func (ds *directoryStage) sweepFinerBankEntriesInCoarseRegion(
-	targetBankID int, targetBlock *internal.CohEntry, pid vm.PID,
+// writes.
+//
+// §1 SO-invariant fix: the iteration range is restricted to a single
+// sub-entry (sub-region) instead of the entire coarse region. The
+// previous all-region sweep absorbed finer-bank entries belonging to
+// sub-regions the current promotion does not actually fill, conflicting
+// with promotions in flight at those sub-regions.
+func (ds *directoryStage) sweepFinerBankEntriesInSubRegion(
+	targetBankID int, targetBlock *internal.CohEntry, subIdx int, pid vm.PID,
 ) {
 	coarseRegionStart := targetBlock.Tag
 	coarseRegionLen := uint64(ds.cache.regionLen[targetBankID])
-	coarseMaskLen := coarseRegionLen + uint64(ds.cache.log2NumSubEntry)
-	coarseRegionSize := uint64(1) << coarseMaskLen
+	subRegionStart := coarseRegionStart + uint64(subIdx)*(uint64(1)<<coarseRegionLen)
+	subRegionSize := uint64(1) << coarseRegionLen
 	for finerBankID := targetBankID + 1; finerBankID < ds.cache.numBanks; finerBankID++ {
 		finerRegionLen := ds.cache.regionLen[finerBankID]
 		finerMaskLen := uint64(finerRegionLen) + uint64(ds.cache.log2NumSubEntry)
 		finerEntrySize := uint64(1) << finerMaskLen
-		for probeAddr := coarseRegionStart; probeAddr < coarseRegionStart+coarseRegionSize; probeAddr += finerEntrySize {
+		// Iterate the finer-bank cache sets whose entries can overlap
+		// [subRegionStart, subRegionStart+subRegionSize). When the finer
+		// entry size exceeds the sub-region (only possible if regionLen
+		// ordering changes; defensive), probe at least once.
+		probeStep := finerEntrySize
+		if probeStep == 0 {
+			probeStep = subRegionSize
+		}
+		for probeAddr := subRegionStart; ; probeAddr += probeStep {
 			set, _ := ds.cache.directory.GetSet(finerBankID, probeAddr)
 			for _, finerEntry := range set.CohEntries {
 				if !finerEntry.IsValid || finerEntry.PID != pid {
 					continue
 				}
 				finerStart := (finerEntry.Tag >> finerMaskLen) << finerMaskLen
-				if finerStart < coarseRegionStart || finerStart >= coarseRegionStart+coarseRegionSize {
+				if finerStart+finerEntrySize <= subRegionStart || finerStart >= subRegionStart+subRegionSize {
 					continue
 				}
 				for i := range finerEntry.SubEntry {
@@ -371,8 +415,10 @@ func (ds *directoryStage) sweepFinerBankEntriesInCoarseRegion(
 						continue
 					}
 					finerSubAddr := finerStart + uint64(i)*(1<<uint64(finerRegionLen))
-					coarseSubIdx := int((finerSubAddr - coarseRegionStart) >> coarseRegionLen)
-					coarseSub := &targetBlock.SubEntry[coarseSubIdx]
+					if finerSubAddr < subRegionStart || finerSubAddr >= subRegionStart+subRegionSize {
+						continue
+					}
+					coarseSub := &targetBlock.SubEntry[subIdx]
 					wasValid := coarseSub.IsValid
 					for _, sh := range finerEntry.SubEntry[i].Sharer {
 						present := false
@@ -391,15 +437,32 @@ func (ds *directoryStage) sweepFinerBankEntriesInCoarseRegion(
 					}
 					coarseSub.IsValid = true
 					if !wasValid {
-						coarseSubAddr := coarseRegionStart + uint64(coarseSubIdx)*(1<<coarseRegionLen)
-						ds.cache.directory.InsertBloomfilter(targetBankID, coarseSubAddr)
+						ds.cache.directory.InsertBloomfilter(targetBankID, subRegionStart)
 					}
 					ds.cache.directory.EvictBloomfilter(finerBankID, finerSubAddr)
 					finerEntry.SubEntry[i].IsValid = false
 					finerEntry.SubEntry[i].Sharer = nil
 				}
-				finerEntry.IsValid = false
-				finerEntry.DemoteLocked = false
+				// finerEntry may still have other valid sub-entries
+				// belonging to different sub-regions; only invalidate
+				// the entry shell when no valid sub-entries remain.
+				stillValid := false
+				for _, se := range finerEntry.SubEntry {
+					if se.IsValid {
+						stillValid = true
+						break
+					}
+				}
+				if !stillValid {
+					finerEntry.IsValid = false
+					finerEntry.DemoteLocked = false
+				}
+			}
+			// Single iteration only (probe once per finer bank for the
+			// sub-region — finer entries that straddle the sub-region
+			// boundary are handled by GetSet's set-indexing).
+			if probeAddr+probeStep >= subRegionStart+subRegionSize {
+				break
 			}
 		}
 	}
@@ -580,8 +643,10 @@ func (ds *directoryStage) doDemotion(trans *transaction, isLocal bool) bool {
 		} else {
 			targetBlock.SubEntry[i].IsValid = false
 		}
-		// FinalizeDemotionEntry가 IsValid=false인 subentry까지 포함해 모두 IsValid=true로
-		// 덮어쓰므로, BF 삽입은 IsValid 여부와 무관하게 항상 수행해야 false negative를 막을 수 있다.
+		// mshrstage.insertDemotionEntry 가 4개 sub-entry 를 모두 IsValid=true 로
+		// 만들어 주므로 무조건 Insert. (trigger sub-region 만 fromLocal=true 일 때
+		// sharer 가 빈 상태이지만 IsValid 자체는 true 이고, BF Insert/Evict 는
+		// sharer 가 아닌 IsValid 기준으로 균형이 맞는다.)
 		ds.cache.directory.InsertBloomfilter(bankID, cachelineID)
 		cachelineID += 1 << regionLen
 	}
@@ -681,24 +746,11 @@ func (ds *directoryStage) doWrite(trans *transaction, isLocal bool) bool {
 		pipeline = ds.remotePipeline
 	}
 	if len(trans.bankList) != 0 {
-		// MSHR-aware redirect (mirrors selectBank's precise redirect):
-		// redirect only when this addr would alias to an in-flight motion
-		// target's block at the target bank's maskLen. Coarse-region
-		// overlap without alias falls through to the next bank in
-		// bankList (path B: hit source entry's different sub-region).
-		addrCheck := trans.accessReq().GetAddress()
-		pidCheck := trans.accessReq().GetPID()
-		if best := ds.aliasingMotionTarget(pidCheck, addrCheck); best != nil {
-			if !pipeline[best.RegionID].CanAccept() {
-				*ds.returnFalse += "MSHR-redirect: target bank pipeline full"
-				return false
-			}
-			trans.bankID = best.RegionID
-			trans.bankList = nil
-			pipeline[best.RegionID].Accept(dirPipelineItem{trans})
-			return true
-		}
-
+		// §3 deadlock fix: aliasingMotionTarget retry-path redirect removed.
+		// In-flight motion correctness is now covered by the MSHR check at
+		// doWrite's entry (above), which uses regionLen[bankID] mask so any
+		// finer/coarser overlap is detected via QueryWithMask's
+		// max(e.RegionLen, regionLen) semantics.
 		bankID := trans.bankList[0]
 
 		if !pipeline[bankID].CanAccept() {
@@ -869,7 +921,53 @@ func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
 	cachelineID, _ := getCacheLineID(addr, uint64(regionLen))
 	index := (addr >> regionLen) % uint64(1<<ds.cache.log2NumSubEntry)
 
-	victim, alloc := ds.cache.directory.FindVictim(bankID, pid, cachelineID)
+	// §1 Fix B-2: alloc-time coarser-bank reprobe. Between selectBank's
+	// routing decision and this allocation point, another transaction may
+	// have committed a coarser-bank entry covering this address. Probe
+	// every bank coarser than the chosen allocation bank with a sub-entry
+	// granular Lookup; on hit, redirect this trans into that bank's
+	// pipeline instead of allocating a parallel entry.
+	{
+		pipeline := ds.localPipeline
+		if !isLocal {
+			pipeline = ds.remotePipeline
+		}
+		for coarserBank := 0; coarserBank < bankID; coarserBank++ {
+			coarserRegionLen := uint64(ds.cache.regionLen[coarserBank])
+			coarserCID, _ := getCacheLineID(addr, coarserRegionLen)
+			coarserEntry, _ := ds.cache.directory.Lookup(coarserBank, pid, coarserCID)
+			if coarserEntry == nil || !coarserEntry.IsValidEntry() {
+				continue
+			}
+			subIdx := int((addr >> coarserRegionLen) % uint64(1<<ds.cache.log2NumSubEntry))
+			if !coarserEntry.SubEntry[subIdx].IsValid {
+				continue
+			}
+			if !pipeline[coarserBank].CanAccept() {
+				*ds.returnFalse += "doWriteMiss coarser-bank redirect: pipeline full"
+				return false
+			}
+			trans.bankID = coarserBank
+			trans.bankList = nil
+			pipeline[coarserBank].Accept(dirPipelineItem{trans})
+			return true
+		}
+	}
+
+	// §4 victim selection switch. v2 finest-bank path uses the lenient
+	// PromoteOnEvictEligible predicate. v3 non-finest non-coarsest path
+	// uses the stricter AbleToPromotionRelaxed predicate. The default
+	// remains the regular LRU victim finder.
+	var victim *internal.CohEntry
+	var alloc bool
+	switch {
+	case ds.cache.promoteAtEvict && ds.cache.promoteAtEvictBiasVictim && bankID == ds.cache.numBanks-1:
+		victim, alloc = ds.cache.directory.FindVictimPreferPromotable(bankID, pid, cachelineID)
+	case ds.cache.promoteAtEvict && ds.cache.promoteAtEvictMultiBank && bankID > 0 && bankID < ds.cache.numBanks-1:
+		victim, alloc = ds.cache.directory.FindVictimPreferStrictlyPromotable(bankID, pid, cachelineID)
+	default:
+		victim, alloc = ds.cache.directory.FindVictim(bankID, pid, cachelineID)
+	}
 
 	// (C-4) Stale-parent guard: at a non-finest bank, FindVictim's Loop 1 may
 	// return a parent whose target sub-entry is invalid (typically because a
@@ -898,7 +996,119 @@ func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
 		return false
 	}
 
-	if ds.needEviction(victim) {
+	// §4.4 Promote-at-evict — Step A: eligibility.
+	eligibleForPromoteAtEvict := false
+	if ds.cache.promoteAtEvict && bankID != 0 && ds.needEviction(victim) {
+		if bankID == ds.cache.numBanks-1 {
+			// Finest bank: lenient predicate (v1 / v2).
+			eligibleForPromoteAtEvict = victim.PromoteOnEvictEligible()
+		} else if ds.cache.promoteAtEvictMultiBank {
+			// Non-finest, non-coarsest: strict predicate (v3).
+			eligibleForPromoteAtEvict = victim.AbleToPromotionRelaxed()
+		}
+	}
+
+	promotedAtEvict := false
+	if eligibleForPromoteAtEvict {
+		coarseBank := bankID - 1
+		coarseRegionLen := ds.cache.regionLen[coarseBank]
+		coarseMaskLen := uint64(coarseRegionLen) + uint64(ds.cache.log2NumSubEntry)
+		coarseStart := (victim.Tag >> coarseMaskLen) << coarseMaskLen
+		coarseEnd := coarseStart + (uint64(1) << coarseMaskLen)
+
+		// Step B: coarse-region alias check. If the current access's addr
+		// falls inside the coarse region we are about to promote into,
+		// allocating the new finer-bank entry would coexist with the
+		// coarse-bank promoted entry — a single-owner violation. Skip
+		// promotion in that case.
+		if addr < coarseStart || addr >= coarseEnd {
+			coarseCachelineID, _ := getCacheLineID(victim.Tag, uint64(coarseRegionLen))
+
+			// Step C: resource & MSHR conflict guards. All three must hold:
+			//   - motion buffer has room,
+			//   - MSHR has room (Add below mustn't push it over),
+			//   - no in-flight MSHR entry overlaps the coarse region
+			//     (MSHR.Add would otherwise panic with "entry already in mshr").
+			if ds.cache.dirStageMotionBuffer.CanPush() &&
+				!ds.cache.mshr.IsFull() &&
+				len(ds.cache.mshr.QueryWithMask(victim.PID, coarseCachelineID, uint64(coarseRegionLen))) == 0 {
+
+				// Step D: sharer capture. Empty union means the entry has
+				// no live remote consumers — promoting it just shifts an
+				// inert entry up, no coherence value.
+				captured := victim.SharerUnion()
+				if len(captured) > 0 {
+					// Step E: register promotion MSHR. IsPromotion=true is
+					// the marker used by downstream stages (doWrite's MSHR
+					// check returns this entry as a fast-path MSHR hit for
+					// reads that arrive during the motion window).
+					promMshr := ds.cache.mshr.Add(victim.PID, coarseCachelineID,
+						uint64(coarseRegionLen), coarseBank)
+					promMshr.IsPromotion = true
+
+					// Step F: synthesize the promotion trans. DeepCopy
+					// preserves trans.read / trans.write (so
+					// bottomSender.sendInvalidationRequest's
+					// accessReq() dereference does not panic if a later
+					// stage ever runs it), then we overwrite the fields
+					// that belong to the promotion's context.
+					promTrans := trans.DeepCopy()
+					promTrans.action = InsertPromotionEntry
+					promTrans.bankID = coarseBank
+					promTrans.fromLocal = true
+					promTrans.sharers = captured
+					promTrans.fetchingAddr = victim.Tag
+					promTrans.fetchingPID = victim.PID
+					promTrans.mshrEntry = promMshr
+					promTrans.blockIdx = int((victim.Tag >> uint(coarseRegionLen)) %
+						uint64(1<<ds.cache.log2NumSubEntry))
+					promTrans.rsbHintBank = -1
+					// Inherited fields that must not carry over into the
+					// synthesized promotion context.
+					promTrans.reqToBottom = nil
+					promTrans.capturedPromoteSharers = nil
+					promTrans.invalidationList = nil
+					promTrans.pendingEviction = nil
+					promTrans.entryProcessingPromotion = false
+					promTrans.bfEagerInserted = false
+					promTrans.bankList = nil
+					promTrans.banksChecked = 0
+
+					// Step G: enqueue into the motion buffer. doPromotion
+					// (via acceptMotionTransaction → processMotionTransaction)
+					// picks it up on a subsequent tick and runs the canonical
+					// promotion path including sweepFinerBankEntriesInSubRegion.
+					ds.cache.dirStageMotionBuffer.Push(promTrans)
+					ds.cache.promoteAtEvictCount++
+					promotedAtEvict = true
+
+					// Step H: event log emit (optional). validSubs counts
+					// the source entry's currently-valid sub-entries so
+					// downstream analysis can distinguish full-population
+					// from PromoteOnEvictEligible's lenient (≥2) case.
+					if ds.cache.eventLogger != nil && ds.cache.eventLogger.IsEnabled() {
+						validSubs := 0
+						for _, se := range victim.SubEntry {
+							if se.IsValid {
+								validSubs++
+							}
+						}
+						ds.cache.eventLogger.logPromotion(victim.Tag, bankID, coarseBank, len(captured), validSubs)
+					}
+				}
+			}
+		}
+	}
+
+	// Step I: action decision.
+	//
+	// When promote-at-evict fires, sharer state has been captured into the
+	// promotion trans and will be installed at the coarse bank. The L2
+	// caches still hold valid copies of those lines — invalidating them
+	// here (via EvictAndInsertNewEntry) would silently drop coherent
+	// shared copies. Use InsertNewEntry instead so the access path does
+	// not emit invalidations for the displaced victim.
+	if !promotedAtEvict && ds.needEviction(victim) {
 		trans.action = EvictAndInsertNewEntry
 		trans.victim = *victim.DeepCopy()
 		trans.evictingAddr = victim.Tag
@@ -1008,6 +1218,29 @@ func (ds *directoryStage) writeToBank(
 		return false
 	}
 
+	// §1 SO assertion (sub-entry granular) for the writeToBank alloc
+	// path. Active only when SD_ASSERT_SINGLE_OWNER=1.
+	if os.Getenv("SD_ASSERT_SINGLE_OWNER") == "1" {
+		for bid := 0; bid < ds.cache.numBanks; bid++ {
+			if bid == bankID {
+				continue
+			}
+			otherRegionLen := uint64(ds.cache.regionLen[bid])
+			otherCID, _ := getCacheLineID(addr, otherRegionLen)
+			otherEntry, _ := ds.cache.directory.Lookup(bid, pid, otherCID)
+			if otherEntry == nil || !otherEntry.IsValidEntry() {
+				continue
+			}
+			subIdxOther := int((addr >> otherRegionLen) % uint64(1<<ds.cache.log2NumSubEntry))
+			if !otherEntry.SubEntry[subIdxOther].IsValid {
+				continue
+			}
+			panic(fmt.Sprintf(
+				"[%s] SO violation (writeToBank): addr=%#x alloc bank=%d subIdx=%d clashes with bank=%d subIdx=%d (tag=%#x)",
+				ds.cache.name, addr, bankID, index, bid, subIdxOther, otherEntry.Tag))
+		}
+	}
+
 	if !block.SubEntry[index].IsValid && !trans.bfEagerInserted {
 		ds.cache.directory.InsertBloomfilter(bankID, cachelineID)
 	}
@@ -1028,12 +1261,11 @@ func (ds *directoryStage) writeToBank(
 
 	// Symmetric to doPromotion: when allocating a coarser-or-equal entry
 	// at bankID, sweep any stale finer-bank entries that fall within
-	// this new entry's coarse region. Direct allocation via writeToBank
-	// (e.g., bankList fall-through from selectBank to a non-finest bank)
-	// can otherwise leave finer banks holding parallel entries for the
-	// same coarse region — surfacing later as "Hit about demotion"
-	// invariant violations during demotion of sub-entries of this block.
-	ds.sweepFinerBankEntriesInCoarseRegion(bankID, block, block.PID)
+	// this new entry's sub-region. §1 SO-invariant fix narrows the sweep
+	// to the specific sub-entry being filled (instead of the entire
+	// coarse region) so concurrent promotions for other sub-regions of
+	// the same coarse block are not disturbed.
+	ds.sweepFinerBankEntriesInSubRegion(bankID, block, index, block.PID)
 
 	bankBuf.Push(trans)
 
@@ -1174,52 +1406,36 @@ func (ds *directoryStage) aliasingMotionTarget(pid vm.PID, addr uint64) *interna
 }
 
 func (ds *directoryStage) selectBank(pid vm.PID, addr uint64) bankSelection {
-	// MSHR-aware redirect (precise): redirect to a motion target only when
-	// addr would alias to the motion target's block at that bank's full
-	// maskLen (regionLen + log2NumSubEntry) — i.e., the future block Tag
-	// would collide. Stale entries at a different sub-region of the same
-	// coarse 16KB region are NOT redirected: they should follow normal
-	// BF/RSB routing and either hit the still-valid source entry
-	// (different sub-region remained valid post-demotion) or allocate at
-	// their natural bank without false stalling.
-	if best := ds.aliasingMotionTarget(pid, addr); best != nil {
-		return bankSelection{
-			bankID:      best.RegionID,
-			bankList:    nil,
-			onCommit:    nil,
-			bfEager:     false,
-			rsbHintBank: -1,
-		}
-	}
+	// §3 deadlock fix: aliasingMotionTarget redirect removed to break the
+	// heterogeneous bankList traversal cycle (bank3↔bank4 pipeline cycle in
+	// pagerank). Correctness is preserved by (a) doWrite's MSHR-aware check
+	// at entry (mshr.QueryWithMask using max(e.RegionLen, currentBankRegionLen))
+	// which catches in-flight motions at any granularity, and (b) §1's
+	// alloc-time coarser-bank reprobe in doWriteMiss.
 
 	e := ds.cache.regionSizeBuffer.Search(addr) // miss when RSB disabled
 	if e.RegionID != -1 {
-		bfList := ds.cache.directory.GetBank(addr)
-		n := len(bfList)
-		// (E-2) BF reflects actual entry presence — when BF and RSB disagree,
-		// trust BF. Previously only the "BF coarser than RSB hint" case was
-		// handled; this missed the "BF finer than RSB hint" case (stale RSB
-		// pointing to a bank coarser than where data is now), causing
-		// allocation at a coarser bank while a finer bank already had the
-		// region — invariant violation that surfaces as Hit-about-demotion.
-		// Keep the special "RSB hint exactly matches the only BF bank" case
-		// (eager BF insert path) since RSB is consistent with BF there.
-		bfDisagreesWithRSB := n > 0 && (bfList[0] != e.RegionID || bfList[n-1] != e.RegionID)
-		if bfDisagreesWithRSB {
-			rsbEntry := e
-			return bankSelection{
-				bankID:      bfList[0],
-				bankList:    bfList[1:],
-				onCommit:    func() { ds.cache.regionSizeBuffer.Delete(rsbEntry) },
-				bfEager:     false,
-				rsbHintBank: e.RegionID,
+		// §2 simplified bank lookup: RSB hit routes exclusively to the
+		// recorded bank. The bfDisagreesWithRSB cross-check is removed;
+		// correctness for the "stale RSB pointing at a coarser bank while
+		// a finer bank now owns the region" case is provided by §1's
+		// alloc-time coarser-bank reprobe in doWriteMiss.
+		if os.Getenv("SD_ASSERT_RSB_BF_DISJOINT") == "1" {
+			bfList := ds.cache.directory.GetBank(addr)
+			for _, probedBank := range bfList {
+				probedCachelineID, _ := getCacheLineID(addr, uint64(ds.cache.regionLen[probedBank]))
+				realEntry, _ := ds.cache.directory.Lookup(probedBank, pid, probedCachelineID)
+				if realEntry != nil && realEntry.IsValidEntry() {
+					panic(fmt.Sprintf("RSB/BF invariant violated: addr=%#x, RSB.bank=%d, real entry at bank=%d (tag=%#x)",
+						addr, e.RegionID, probedBank, realEntry.Tag))
+				}
 			}
 		}
-		// normal RSB hit → eager BF insert로 후속 요청이 동일 bank로 라우팅되도록 보장
 		rsbEntry := e
 		routedBank := e.RegionID
 		return bankSelection{
-			bankID: routedBank,
+			bankID:   routedBank,
+			bankList: nil,
 			onCommit: func() {
 				ds.cache.directory.InsertBloomfilter(routedBank, addr)
 				ds.cache.regionSizeBuffer.Delete(rsbEntry)
@@ -1229,10 +1445,31 @@ func (ds *directoryStage) selectBank(pid vm.PID, addr uint64) bankSelection {
 		}
 	}
 
-	// RSB miss: BF finest-first 그대로 사용; 상태 변경 없음
-	list := ds.cache.directory.GetBank(addr)
+	// RSB miss: per the m/n=4 L-CBF spec, the lookup order is
+	//   [CBF-positive coarse banks (finest-first)] -> Bank N-1 -> Bank N-2
+	// Banks N-1 and N-2 have no CBF and are always probed last.
+	list := ds.lookupOrder(addr)
 	if len(list) > 0 {
 		return bankSelection{bankID: list[0], bankList: list[1:], rsbHintBank: -1}
 	}
 	return bankSelection{bankID: ds.cache.numBanks - 1, rsbHintBank: -1}
+}
+
+// lookupOrder builds the full per-access bank probe order:
+//   1) CBF-positive coarse banks (finest-first among CBF banks).
+//   2) The two finest non-CBF banks (numBanks-1 then numBanks-2).
+// This is the user-visible ordering "CBF 양성 bank > Bank 4 > Bank 3".
+// When CBF is globally disabled, GetBank already returns finest-first across
+// every bank, so we just pass that through.
+func (ds *directoryStage) lookupOrder(addr uint64) []int {
+	type cbfInfo interface{ NumCBFBanks() int }
+	dir := ds.cache.directory
+	out := dir.GetBank(addr)
+	if info, ok := dir.(cbfInfo); ok && info.NumCBFBanks() > 0 {
+		cbfBanks := info.NumCBFBanks()
+		for i := ds.cache.numBanks - 1; i >= cbfBanks; i-- {
+			out = append(out, i)
+		}
+	}
+	return out
 }

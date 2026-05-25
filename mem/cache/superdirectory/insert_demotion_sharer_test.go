@@ -108,7 +108,9 @@ func TestInsertDemotion_Sharer_RemoteWithList(t *testing.T) {
 }
 
 // Case 2: fromLocal=true with invalidationList=[A,B]
-//   trigger sub-entry → IsValid=false, Sharer nil/empty
+//   trigger sub-entry → IsValid=true (CBF patch §3.2 symmetrised this; the
+//     old IsValid=false produced 4-of-3 valid asymmetry that drove CBF
+//     Insert/Evict imbalance and ~100% FPR), Sharer nil/empty
 //   non-trigger sub-entries → Sharer == [A,B], IsValid=true
 func TestInsertDemotion_Sharer_LocalWithList(t *testing.T) {
 	s, _ := newTestMshrStage(false)
@@ -129,8 +131,8 @@ func TestInsertDemotion_Sharer_LocalWithList(t *testing.T) {
 	blk := popDemotedBlock(t, s)
 
 	trig := blk.SubEntry[0]
-	if trig.IsValid {
-		t.Errorf("trigger sub-entry (local): expected IsValid=false, got true")
+	if !trig.IsValid {
+		t.Errorf("trigger sub-entry (local): expected IsValid=true, got false")
 	}
 	if len(trig.Sharer) != 0 {
 		t.Errorf("trigger sub-entry (local): expected empty Sharer, got %v", trig.Sharer)

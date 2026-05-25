@@ -372,7 +372,7 @@ func (ds *directoryStage) writeToBank(
 	addr := trans.accessReq().GetAddress()
 	cachelineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize+ds.cache.log2UnitSize)
 
-	ds.cache.directory.Visit(block)
+	ds.cache.directory.Insert(block)
 	block.IsLocked = true
 	block.Tag = cachelineID
 	block.IsValid = true

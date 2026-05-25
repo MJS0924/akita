@@ -29,12 +29,18 @@ type Builder struct {
 	useRsbHintAlloc      bool
 	recordSilentEvict    bool
 
+	// §4 promote-at-evict (default off).
+	promoteAtEvict           bool
+	promoteAtEvictBiasVictim bool
+	promoteAtEvictMultiBank  bool
+
 	interleaving          bool
 	numInterleavingBlock  int
 	interleavingUnitCount int
 	interleavingUnitIndex int
 
 	numBanks            int
+	numSetsPerBank      []int // optional explicit per-bank set counts
 	byteSize            uint64
 	numMSHREntry        int
 	numReqPerCycle      int
@@ -122,6 +128,17 @@ func (b Builder) WithNumBanks(n int) Builder {
 	return b
 }
 
+// WithNumSetsPerBank overrides the default uniform-doubling formula and sets
+// the number of sets explicitly per bank. Slice length must equal numBanks.
+// Index 0 corresponds to the coarsest bank (bank 0). When omitted, the
+// builder falls back to the legacy formula based on byteSize.
+func (b Builder) WithNumSetsPerBank(sets []int) Builder {
+	cp := make([]int, len(sets))
+	copy(cp, sets)
+	b.numSetsPerBank = cp
+	return b
+}
+
 func (b Builder) WithDisableRSB(v bool) Builder {
 	b.disableRSB = v
 	return b
@@ -149,6 +166,27 @@ func (b Builder) WithUseRsbHintAlloc(v bool) Builder {
 
 func (b Builder) WithRecordSilentEvict(v bool) Builder {
 	b.recordSilentEvict = v
+	return b
+}
+
+// WithPromoteAtEvict enables §4 v1: promote eligible finest-bank entries
+// at eviction time (using PromoteOnEvictEligible).
+func (b Builder) WithPromoteAtEvict(v bool) Builder {
+	b.promoteAtEvict = v
+	return b
+}
+
+// WithPromoteAtEvictBiasVictim enables §4 v2: bias finest-bank victim
+// selection toward promote-eligible entries. Only meaningful with v1 on.
+func (b Builder) WithPromoteAtEvictBiasVictim(v bool) Builder {
+	b.promoteAtEvictBiasVictim = v
+	return b
+}
+
+// WithPromoteAtEvictMultiBank enables §4 v3: extend promote-at-evict to
+// non-finest, non-coarsest banks (uses AbleToPromotionRelaxed).
+func (b Builder) WithPromoteAtEvictMultiBank(v bool) Builder {
+	b.promoteAtEvictMultiBank = v
 	return b
 }
 
@@ -320,7 +358,8 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 		// regionLen = {14, 12, 10, 8, 6}
 	}
 	directory := internal.NewSuperDirectory(
-		b.numBanks, numSet, b.wayAssociativity, blockSize, int(b.log2NumSubEntry), 64, vimctimFinder, regionLen, b.disableCBF)
+		b.numBanks, numSet, b.wayAssociativity, blockSize, int(b.log2NumSubEntry), 64, vimctimFinder, regionLen, b.disableCBF,
+		b.numSetsPerBank)
 
 	if b.interleaving {
 		directory.AddrConverter = &mem.InterleavingConverter{
@@ -366,6 +405,9 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.promoteRelaxed = b.promoteRelaxed
 	cacheModule.useRsbHintAlloc = b.useRsbHintAlloc
 	cacheModule.recordSilentEvict = b.recordSilentEvict
+	cacheModule.promoteAtEvict = b.promoteAtEvict
+	cacheModule.promoteAtEvictBiasVictim = b.promoteAtEvictBiasVictim
+	cacheModule.promoteAtEvictMultiBank = b.promoteAtEvictMultiBank
 
 	if b.eventLogger != nil {
 		cacheModule.eventLogger = b.eventLogger

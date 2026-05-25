@@ -290,7 +290,7 @@ func (s *bankStage) InsertNewEntry(trans *transaction, bottomSenderBuffer sim.Bu
 		s.cache.recordSharerRead(blk.Tag>>s.cache.log2BlockSize, bit)
 	}
 
-	s.cache.directory.Visit(blk)
+	s.cache.directory.Insert(blk)
 	blk.IsLocked = false
 
 	// [수정] 하드코딩된 버퍼 대신 인자로 받은 타겟 버퍼 사용
@@ -311,7 +311,7 @@ func (s *bankStage) EvictAndInsertNewEntry(trans *transaction, bottomSenderBuffe
 		s.cache.recordSharerRead(blk.Tag>>s.cache.log2BlockSize, bit)
 	}
 
-	s.cache.directory.Visit(blk)
+	s.cache.directory.Insert(blk)
 	blk.IsLocked = false
 
 	bottomSenderBuffer.Push(trans)

@@ -36,6 +36,8 @@ type Builder struct {
 	maxInflightEviction int
 	maxInvEmitPerCycle  int
 
+	useFIFO bool // FIFO replacement instead of LRU
+
 	cohDirLatency int
 	dirLatency    int
 	bankLatency   int
@@ -120,6 +122,13 @@ func (b Builder) WithLog2UnitSize(n uint64) Builder {
 // instead of the full coherence unit region (256B). Used for HMG.
 func (b Builder) WithFetchSingleCacheLine(v bool) Builder {
 	b.fetchSingleCacheLine = v
+	return b
+}
+
+// WithFIFOReplacement selects FIFO replacement (paper §4.2 baseline). When
+// false (default), LRU is used.
+func (b Builder) WithFIFOReplacement(v bool) Builder {
+	b.useFIFO = v
 	return b
 }
 
@@ -294,6 +303,7 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	directory := internal.NewCohDirectory(
 		numSet, b.wayAssociativity, blockSize, b.log2UnitSize, vimctimFinder)
 	directory.Ideal = b.IdealDirectory
+	directory.UseFIFO = b.useFIFO
 
 	if b.interleaving {
 		directory.AddrConverter = &mem.InterleavingConverter{

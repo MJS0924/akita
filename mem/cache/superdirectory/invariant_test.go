@@ -32,20 +32,22 @@ func (m *programmableMSHR) Remove(_ vm.PID, _ uint64) *internal.MSHREntry { retu
 func (m *programmableMSHR) AllEntries() []*internal.MSHREntry             { return nil }
 func (m *programmableMSHR) Reset()                                        {}
 
-// TestInvariant_SelectBank_RedirectsToInFlightMotion verifies that when an
-// in-flight motion MSHR entry exists, selectBank routes the new access to
-// that entry's RegionID — overriding both BF and RSB.
+// §3 deadlock fix removed the aliasingMotionTarget redirect from
+// selectBank to break the bank3↔bank4 pipeline cycle observed in
+// pagerank. Routing now follows RSB → CBF/BF only. In-flight motion
+// correctness is preserved by (a) doWrite's MSHR-aware entry check and
+// (b) §1's alloc-time coarser-bank reprobe in doWriteMiss. This test
+// asserts the new contract: a present MSHR motion entry does NOT
+// override RSB/BF routing at selectBank.
 func TestInvariant_SelectBank_RedirectsToInFlightMotion(t *testing.T) {
 	mshr := &programmableMSHR{
 		queryResp: []*internal.MSHREntry{{
 			PID:       vm.PID(1),
 			Address:   testAddr,
-			RegionLen: 8, // bank 3 (regionLen[3]=8)
-			RegionID:  3, // in-flight motion target
+			RegionLen: 8,
+			RegionID:  3,
 		}},
 	}
-	// dir returns finest bank as BF result (not bank 3); RSB hints bank 1.
-	// Either would mis-route to a parallel bank if MSHR check didn't fire.
 	dir := newMockDir([]int{4, 2})
 	rsb := internal.NewRegionSizeBuffer(1, testLog2PageSize, testRegionLen, false)
 	rsb.Push(testAddr, 1)
@@ -59,29 +61,29 @@ func TestInvariant_SelectBank_RedirectsToInFlightMotion(t *testing.T) {
 	ds := &directoryStage{cache: comp}
 
 	sel := ds.selectBank(vm.PID(1), testAddr)
-	if sel.bankID != 3 {
-		t.Errorf("bankID: want 3 (in-flight motion target), got %d", sel.bankID)
+	// RSB hint (bank 1) wins under §2/§3 — motion target (bank 3) is
+	// no longer a routing input.
+	if sel.bankID != 1 {
+		t.Errorf("bankID: want 1 (RSB exclusive, motion redirect removed), got %d", sel.bankID)
 	}
 	if sel.bankList != nil {
-		t.Errorf("bankList: want nil after redirect, got %v", sel.bankList)
+		t.Errorf("bankList: want nil for RSB hit, got %v", sel.bankList)
 	}
-	if sel.onCommit != nil {
-		t.Error("onCommit: want nil (no state mutation on redirect)")
-	}
-	if sel.rsbHintBank != -1 {
-		t.Errorf("rsbHintBank: want -1, got %d", sel.rsbHintBank)
+	if !sel.bfEager {
+		t.Error("bfEager: want true for RSB hit")
 	}
 }
 
-// TestInvariant_SelectBank_PrefersCoarserOnMultipleMotions verifies the
-// tie-breaking rule when multiple overlapping in-flight motion entries
-// happen to coexist (defensive — invariant says this shouldn't occur,
-// but the routing must be deterministic).
+// §3 deadlock fix removed motion-redirect, so the "prefer coarsest
+// motion target" tie-breaking is no longer a routing decision. This
+// test now asserts that selectBank ignores the MSHR motion entries and
+// falls back to the default finest-bank route when both BF and RSB are
+// empty.
 func TestInvariant_SelectBank_PrefersCoarserOnMultipleMotions(t *testing.T) {
 	mshr := &programmableMSHR{
 		queryResp: []*internal.MSHREntry{
 			{PID: vm.PID(1), Address: testAddr, RegionLen: 6, RegionID: 4},
-			{PID: vm.PID(1), Address: testAddr, RegionLen: 10, RegionID: 2}, // coarser
+			{PID: vm.PID(1), Address: testAddr, RegionLen: 10, RegionID: 2},
 			{PID: vm.PID(1), Address: testAddr, RegionLen: 8, RegionID: 3},
 		},
 	}
@@ -95,8 +97,9 @@ func TestInvariant_SelectBank_PrefersCoarserOnMultipleMotions(t *testing.T) {
 	ds := &directoryStage{cache: comp}
 
 	sel := ds.selectBank(vm.PID(1), testAddr)
-	if sel.bankID != 2 {
-		t.Errorf("bankID: want 2 (smallest RegionID = coarsest), got %d", sel.bankID)
+	if sel.bankID != testNumBanks-1 {
+		t.Errorf("bankID: want %d (finest fallback after §3 motion-redirect removal), got %d",
+			testNumBanks-1, sel.bankID)
 	}
 }
 
@@ -212,12 +215,12 @@ func TestInvariant_WriteToBank_Preflight_NonAliasingNoStall(t *testing.T) {
 	}
 }
 
-// TestInvariant_BankList_RedirectsOnMSHRConflict verifies that the bankList
-// traversal path in doWrite redirects to the in-flight motion's bank rather
-// than blindly accepting at the next bank in bankList. We use the real MSHR
-// so QueryWithMask honors the mask argument correctly (the programmable mock
-// returns its preset list regardless of mask, which would short-circuit the
-// earlier 446 check and skip the bankList path entirely).
+// §3 deadlock fix also removed the aliasingMotionTarget call from
+// doWrite's retry path. The bankList traversal now pops the next bank
+// without consulting in-flight motion entries — correctness is provided
+// by the MSHR-aware QueryWithMask check at doWrite's entry. This test
+// asserts the new contract: a motion entry at a non-list bank does NOT
+// redirect the trans away from its bankList traversal.
 func TestInvariant_BankList_RedirectsOnMSHRConflict(t *testing.T) {
 	// localPipeline & remotePipeline must accept items.
 	localPipes := make([]pipelining.Pipeline, testNumBanks)
@@ -272,13 +275,15 @@ func TestInvariant_BankList_RedirectsOnMSHRConflict(t *testing.T) {
 
 	ok := ds.doWrite(trans, true)
 	if !ok {
-		t.Fatalf("doWrite returned false; want true (redirect succeeded). returnFalse=%q", ds.returnFalse0)
+		t.Fatalf("doWrite returned false; want true. returnFalse=%q", ds.returnFalse0)
 	}
-	if trans.bankID != 1 {
-		t.Errorf("trans.bankID after redirect: want 1, got %d (returnFalse=%q)", trans.bankID, ds.returnFalse0)
+	// Post-§3: no motion-target redirect. The retry path pops the head
+	// of bankList ([3]) and advances bankList to [4].
+	if trans.bankID != 3 {
+		t.Errorf("trans.bankID after bankList pop: want 3, got %d (returnFalse=%q)", trans.bankID, ds.returnFalse0)
 	}
-	if trans.bankList != nil {
-		t.Errorf("trans.bankList after redirect: want nil, got %v", trans.bankList)
+	if len(trans.bankList) != 1 || trans.bankList[0] != 4 {
+		t.Errorf("trans.bankList after bankList pop: want [4], got %v", trans.bankList)
 	}
 }
 

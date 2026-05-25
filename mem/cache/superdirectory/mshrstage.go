@@ -207,10 +207,11 @@ func (s *mshrStage) processOneReq() bool {
 }
 
 // canPromote selects the strict or relaxed promotion eligibility check
-// based on the runtime flag. Relaxed lets a coarsened block return to a
-// finer bank when most sub-entries agree on sharers (vs. strict's
-// all-must-be-identical), which is necessary to recover finer R after a
-// phase change.
+// based on the runtime flag. Relaxed requires all sub-entries valid AND
+// non-empty sharer intersection (vs. strict's identical sharer sets);
+// promoted entry uses SharerUnion() to stay coherence-safe. This permits
+// promotion when sub-entries share at least one common GPU without
+// demanding fully identical sharer lists.
 func (s *mshrStage) canPromote(blk *internal.CohEntry) bool {
 	if s.cache.promoteRelaxed {
 		return blk.AbleToPromotionRelaxed()
@@ -583,14 +584,21 @@ func (s *mshrStage) insertDemotionEntry() bool {
 		e := &newBlk.SubEntry[i]
 
 		if currAddr <= addr && addr < nxtAddr {
-			if !trans.fromLocal {
-				e.Sharer = make([]sim.RemotePort, 1)
-				e.Sharer[0] = owner
-				e.IsValid = true
-				e.IsLocked = false
-				e.ReadCount = 0
+			// Trigger sub-region after demotion: 항상 IsValid=true 로 분할 entry
+			// 에 자리잡는다. 과거 fromLocal=true 일 때 IsValid=false 로 만드는
+			// 분기가 있어 "4 중 3 valid" 비대칭이 생겼고, 결과적으로 CBF
+			// Insert/Evict 카운트가 어긋나 saturation 의 한 축이 됐다.
+			//   - fromLocal=true  : sharer 를 비운다 (로컬 GPU 가 자신을 떼어내는
+			//                       것이 demotion 의 의미이므로 sole sharer 가
+			//                       없는 상태).
+			//   - fromLocal=false : 요청자(remote GPU)가 sole sharer.
+			e.IsValid = true
+			e.IsLocked = false
+			e.ReadCount = 0
+			if trans.fromLocal {
+				e.Sharer = nil
 			} else {
-				e.IsValid = false
+				e.Sharer = []sim.RemotePort{owner}
 			}
 		} else {
 			copiedSh := make([]sim.RemotePort, len(sh))
@@ -650,7 +658,11 @@ func (s *mshrStage) updateBloomFilter(tag uint64, prevBankID int, forPromotion b
 		endAddr := addr + 1<<currRegionLen
 		diff := 1 << prevRegionLen
 
-		s.cache.directory.InsertBloomfilter(prevBankID-1, tag) // 이게 맞나??
+		// NOTE: the Insert at the coarser bank is done later in
+		// directoryStage.doPromotion (with the canonical cachelineID).
+		// Inserting again here caused a double-Insert at the same CBF
+		// counter, driving counters toward saturation and producing the
+		// ~100% FPR observed in FIR-class workloads.
 		for addr < endAddr {
 			s.cache.directory.EvictBloomfilter(prevBankID, addr)
 			addr += uint64(diff)

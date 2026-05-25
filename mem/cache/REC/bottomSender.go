@@ -949,9 +949,16 @@ func (bs *bottomSender) processInvRsp(rsp *mem.InvRsp) bool {
 		bs.removeInflightInvToOutside(i)
 		// fmt.Printf("[%s]\tF.2. Remove inflight invalidation to outside\n", bs.cache.Name())
 
-		// write에 의한 invalidation 처리:
-		// 모든 InvRsp 수신 완료 후 실제 write를 L2로 전송해야 함
-		if trans.write != nil {
+		// write에 의한 invalidation 완료 후 처리.
+		//
+		// EvictAndInsertNewEntry 의 경우 sendInvalidationRequest 에서
+		// 이미 sendRequestToBottom 을 호출했으므로 trans 가 inflightRequest
+		// 에 존재함. 여기서 pendingWriteAfterInv 로 재큐잉하면 L2 로 이중
+		// 송신되어 inflight 카운터 폭발 → vgg16_REC 데드락 (모든 write 가
+		// evict-insert 경로). 따라서 InvalidateAndUpdateEntry 경우에만
+		// 재큐잉 (이쪽은 sendInvalidationRequest 가 sendRequestToBottom 을
+		// 호출하지 않고 defer 함).
+		if trans.write != nil && trans.action == InvalidateAndUpdateEntry {
 			trans.action = Nothing
 			if trans.fromLocal {
 				bs.pendingLocalWriteAfterInv = append(bs.pendingLocalWriteAfterInv, trans)

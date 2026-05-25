@@ -154,6 +154,20 @@ type Comp struct {
 	// effectively empty even though evictions are common.
 	recordSilentEvict bool
 
+	// §4 promote-at-evict configuration. promoteAtEvict (v1) enables the
+	// feature at the finest bank with the lenient PromoteOnEvictEligible
+	// predicate. promoteAtEvictBiasVictim (v2) additionally biases finest-
+	// bank victim selection toward promote-eligible entries. The default
+	// for v2 is true when v1 is on. promoteAtEvictMultiBank (v3) extends
+	// the feature to non-finest, non-coarsest banks using the stricter
+	// AbleToPromotionRelaxed predicate.
+	promoteAtEvict           bool
+	promoteAtEvictBiasVictim bool
+	promoteAtEvictMultiBank  bool
+	// promoteAtEvictCount counts how many times doWriteMiss successfully
+	// converted a victim into a promotion at eviction time.
+	promoteAtEvictCount uint64
+
 	// OP5 deviation regression slots (PHASE C-2). Increment sites are
 	// intentionally absent in the post-fix code: a non-zero value means
 	// either (a) a future change reintroduced the buggy branch and wired
@@ -179,11 +193,38 @@ func (c *Comp) incEvent(name string) {
 	c.eventCounts[name]++
 }
 
-// EventCounts returns a copy of the in-memory event counters.
+// EventCounts returns a copy of the in-memory event counters. Per-bank
+// CBF FPR counters are merged in under the "CBF_*_<bank>" namespace so
+// they flow through the existing eventCountsProvider -> sqlite pipeline.
 func (c *Comp) EventCounts() map[string]uint64 {
-	out := make(map[string]uint64, len(c.eventCounts))
+	out := make(map[string]uint64, len(c.eventCounts)+32)
 	for k, v := range c.eventCounts {
 		out[k] = v
+	}
+	if c.directory != nil {
+		for bank, s := range c.directory.CBFStats() {
+			if s.NumEntries == 0 {
+				continue // no CBF on this bank
+			}
+			prefix := fmt.Sprintf("CBF_bank%d_", bank)
+			out[prefix+"queries"] = s.Queries
+			out[prefix+"positives"] = s.Positives
+			out[prefix+"true_positives"] = s.TruePositives
+			out[prefix+"false_positives"] = s.FalsePositives
+			out[prefix+"true_negatives"] = s.TrueNegatives
+			out[prefix+"false_negatives"] = s.FalseNegatives
+			out[prefix+"num_entries"] = s.NumEntries
+			out[prefix+"inserts"] = s.Inserts
+			out[prefix+"evicts"] = s.Evicts
+			out[prefix+"overflowed"] = s.NumOverflowed
+			// Embed FPR×1e6 as an integer so the count-typed metric carries
+			// a usable ratio in the same sqlite column.
+			negatives := s.FalsePositives + s.TrueNegatives
+			if negatives > 0 {
+				out[prefix+"fpr_ppm"] = uint64(float64(s.FalsePositives) /
+					float64(negatives) * 1e6)
+			}
+		}
 	}
 	return out
 }
@@ -214,6 +255,7 @@ func (c *Comp) ActionCounts() map[string]uint64 {
 		"demote_lock_hits":         c.demoteLockHits,
 		"op5a_shortcut_with_remote_sharer":     c.op5aShortcutWithRemoteSharer,
 		"op5b_writer_cleared_at_finest_bank":   c.op5bWriterClearedAtFinestBank,
+		"promote_at_evict_count":               c.promoteAtEvictCount,
 	}
 }
 

@@ -33,6 +33,7 @@ type CohDirectory interface {
 	Lookup(pid vm.PID, address uint64) *Block
 	FindVictim(address uint64) *Block
 	Visit(block *Block)
+	Insert(block *Block)
 	TotalSize() uint64
 	WayAssociativity() int
 	GetSets() []Set
@@ -47,6 +48,10 @@ type CohDirectoryImpl struct {
 	UnitSize      uint64
 	AddrConverter mem.AddressConverter
 	Ideal         bool // 용량 한계에 의한 eviction이 발생하지 않음
+	// UseFIFO selects FIFO replacement: Visit (access touch) is a no-op so
+	// that LRUQueue stays in insertion order. Insert (fresh allocation) is
+	// unaffected and always places the block at the tail.
+	UseFIFO bool
 
 	Sets []Set
 
@@ -129,8 +134,22 @@ func (d *CohDirectoryImpl) FindVictim(addr uint64) *Block {
 	return block
 }
 
-// Visit moves the block to the end of the LRUQueue
+// Visit moves the block to the end of the LRUQueue. In FIFO mode, Visit is
+// a no-op so insertion order is preserved across hit-time accesses.
 func (d *CohDirectoryImpl) Visit(block *Block) {
+	if d.UseFIFO {
+		return
+	}
+	d.moveToTail(block)
+}
+
+// Insert places block at the tail of the LRUQueue regardless of replacement
+// policy. Call this on fresh allocations (invalid→valid transitions).
+func (d *CohDirectoryImpl) Insert(block *Block) {
+	d.moveToTail(block)
+}
+
+func (d *CohDirectoryImpl) moveToTail(block *Block) {
 	set := d.Sets[block.SetID]
 
 	for i, b := range set.LRUQueue {

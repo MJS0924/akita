@@ -36,7 +36,11 @@ func newTestMshrStage(enableLogging bool) (*mshrStage, *EventLogger) {
 }
 
 // buildPromotionTrans creates a transaction whose block passes AbleToPromotion
-// in bank 2 (so bankID-1=1 is a valid target).
+// in bank 2 (so bankID-1=1 is a valid target). capturedPromoteSharers is
+// pre-populated to mirror the queue-time capture done by processOneReq /
+// processOneReqAfterPromotion in the real pipeline — insertPromotionEntry
+// reads from this field rather than re-computing from block.SubEntry (which
+// would return [] after the source block's sub-entries are cleared).
 func buildPromotionTrans(sharer sim.RemotePort) *transaction {
 	blk := &internal.CohEntry{IsValid: true, SubEntry: make([]internal.CohSubEntry, 4)}
 	for i := range blk.SubEntry {
@@ -46,10 +50,11 @@ func buildPromotionTrans(sharer sim.RemotePort) *transaction {
 	blk.Tag = testAddr
 
 	return &transaction{
-		bankID:    2,
-		block:     blk,
-		mshrEntry: internal.NewMSHREntry(),
-		read:      mem.ReadReqBuilder{}.WithAddress(testAddr).WithByteSize(64).Build(),
+		bankID:                 2,
+		block:                  blk,
+		mshrEntry:              internal.NewMSHREntry(),
+		read:                   mem.ReadReqBuilder{}.WithAddress(testAddr).WithByteSize(64).Build(),
+		capturedPromoteSharers: []sim.RemotePort{sharer},
 	}
 }
 
