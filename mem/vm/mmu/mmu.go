@@ -301,6 +301,16 @@ func (m *middleware) addTransactionToInvalidationQueue(walkingIndex int) bool {
 }
 
 func (m *middleware) pageNeedMigrate(walking transaction) bool {
+	// policy 2 = None: skip every migration path including the hardcoded
+	// first-touch. The first-touch branch below was the GPU1-as-dummy
+	// workaround (4-GPU setup uses GPU1 as a real device now); leaving it
+	// active causes real GPU1-resident pages to migrate on every cross-GPU
+	// access, which races with multi-bank directory invalidation cascades
+	// and deadlocks SD/REC variants.
+	if m.Comp.pageMigrationPolicy == 2 {
+		return false
+	}
+
 	if walking.page.DeviceID == 1 && walking.req.DeviceID != 1 { // first touch
 		return true
 	}
