@@ -408,12 +408,36 @@ func (ds *directoryStage) doPrefetch(trans *transaction) bool {
 	}
 }
 
+// [FIX #2] dirStage push 시 fromLocal 기준으로 Local/Remote 버퍼 분기.
+// bankStage.pullFromBuf 가 Remote 먼저 drain 하므로, cross-GPU 데드락의 닫힘
+// 고리(remote 요청이 local 가득찬 bankBuf 뒤에 밀려서 처리 못 됨)를 차단.
+func (ds *directoryStage) bankBufFor(trans *transaction, bank int) sim.Buffer {
+	if trans.fromLocal {
+		return ds.cache.dirToBankBuffersLocal[bank]
+	}
+	return ds.cache.dirToBankBuffersRemote[bank]
+}
+
+// [FIX #3] writeBuffer 가 임계 이상 차 있을 때 fromLocal=true 트랜잭션의
+// evict() 진입을 막아 자기 GPU L1 으로 backpressure. remote 트랜잭션은
+// 무조건 통과시켜 cross-GPU 응답 경로를 살림. capacity 의 7/8(87.5%)을
+// 임계로 사용 — soft cap 보다 더 일찍 막아 양쪽 GPU 가 동시에 wB cap 을
+// 점유할 수 없게 함.
+func (ds *directoryStage) writeBufferReservedForRemote(trans *transaction) bool {
+	if !trans.fromLocal {
+		return false
+	}
+	wb := ds.cache.writeBuffer
+	used := len(wb.pendingEvictions) + len(wb.inflightEviction)
+	return used >= wb.writeBufferCapacity*7/8
+}
+
 func (ds *directoryStage) prefetchToBank(trans *transaction, block *internal.Block) bool {
 	*ds.activeString = *ds.activeString + "[prefetchToBank] "
 
 	numBanks := len(ds.cache.dirToBankBuffers)
 	bank := bankID(block, ds.cache.directory.WayAssociativity(), numBanks)
-	bankBuf := ds.cache.dirToBankBuffers[bank]
+	bankBuf := ds.bankBufFor(trans, bank)
 
 	if !bankBuf.CanPush() {
 		*ds.activeString = *ds.activeString + "Cannot push to bankBuf "
@@ -451,9 +475,15 @@ func (ds *directoryStage) prefetchToBank(trans *transaction, block *internal.Blo
 func (ds *directoryStage) evictAndPrefetch(trans *transaction, victim *internal.Block) bool {
 	*ds.activeString = *ds.activeString + "[evictAndPrefetch] "
 
+	if ds.writeBufferReservedForRemote(trans) {
+		*ds.activeString = *ds.activeString + "wB cap reserved for remote"
+		trans.returnFalse = *ds.activeString
+		return false
+	}
+
 	bankNum := bankID(victim,
 		ds.cache.directory.WayAssociativity(), len(ds.cache.dirToBankBuffers))
-	bankBuf := ds.cache.dirToBankBuffers[bankNum]
+	bankBuf := ds.bankBufFor(trans, bankNum)
 
 	if !bankBuf.CanPush() {
 		*ds.activeString = *ds.activeString + "Cannot push to bankBuf "
@@ -1048,7 +1078,7 @@ func (ds *directoryStage) readFromBank(
 	*ds.activeString = *ds.activeString + "[readFromBank] "
 	numBanks := len(ds.cache.dirToBankBuffers)
 	bank := bankID(block, ds.cache.directory.WayAssociativity(), numBanks)
-	bankBuf := ds.cache.dirToBankBuffers[bank]
+	bankBuf := ds.bankBufFor(trans, bank)
 
 	if !bankBuf.CanPush() {
 		*ds.activeString = *ds.activeString + "Cannot push to bankBuf"
@@ -1079,7 +1109,7 @@ func (ds *directoryStage) writeToBank(
 
 	numBanks := len(ds.cache.dirToBankBuffers)
 	bank := bankID(block, ds.cache.directory.WayAssociativity(), numBanks)
-	bankBuf := ds.cache.dirToBankBuffers[bank]
+	bankBuf := ds.bankBufFor(trans, bank)
 
 	if !bankBuf.CanPush() {
 		*ds.activeString = *ds.activeString + "Cannot push to bankBuf "
@@ -1138,9 +1168,15 @@ func (ds *directoryStage) evict(
 ) bool {
 	*ds.activeString = *ds.activeString + "[evict] "
 
+	if ds.writeBufferReservedForRemote(trans) {
+		*ds.activeString = *ds.activeString + "wB cap reserved for remote"
+		trans.returnFalse = *ds.activeString
+		return false
+	}
+
 	bankNum := bankID(victim,
 		ds.cache.directory.WayAssociativity(), len(ds.cache.dirToBankBuffers))
-	bankBuf := ds.cache.dirToBankBuffers[bankNum]
+	bankBuf := ds.bankBufFor(trans, bankNum)
 
 	if !bankBuf.CanPush() {
 		*ds.activeString = *ds.activeString + "Cannot push to bankBuf "

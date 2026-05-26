@@ -100,7 +100,8 @@ func (f *flusher) processFlush() bool {
 		block,
 		f.cache.directory.WayAssociativity(),
 		len(f.cache.dirToBankBuffers))
-	bankBuf := f.cache.dirToBankBuffers[bankNum]
+	// flusher 가 push 하는 evict 는 이 cache 자체의 flush — local 취급.
+	bankBuf := f.cache.dirToBankBuffersLocal[bankNum]
 
 	if !bankBuf.CanPush() {
 		return false
@@ -218,7 +219,12 @@ func (f *flusher) finalizeFlushing() bool {
 }
 
 func (f *flusher) flushCompleted() bool {
-	for _, b := range f.cache.dirToBankBuffers {
+	for _, b := range f.cache.dirToBankBuffersLocal {
+		if b.Size() > 0 {
+			return false
+		}
+	}
+	for _, b := range f.cache.dirToBankBuffersRemote {
 		if b.Size() > 0 {
 			return false
 		}

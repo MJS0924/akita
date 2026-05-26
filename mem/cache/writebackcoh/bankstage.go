@@ -155,6 +155,8 @@ func (s *bankStage) Tick() (madeProgress bool) {
 
 func (s *bankStage) Reset() {
 	s.cache.dirToBankBuffers[s.bankID].Clear()
+	s.cache.dirToBankBuffersLocal[s.bankID].Clear()
+	s.cache.dirToBankBuffersRemote[s.bankID].Clear()
 	s.cache.writeBufferToBankBuffers[s.bankID].Clear()
 	s.pipeline.Clear()
 	s.postPipelineBuf.Clear()
@@ -182,21 +184,20 @@ func (s *bankStage) pullFromBuf() bool {
 		return false
 	}
 
-	inBuf = s.cache.dirToBankBuffers[s.bankID]
+	// [FIX #2] Remote 먼저, Local 그 다음. dirStage 의 invBuf→remoteBuf→localBuf
+	// priority 가 bank 까지 전파되도록. local 트랜잭션이 bankBuf head 에 쌓여도
+	// remote 가 뒤에서 영원히 밀리는 일이 없게 함 (cross-GPU 데드락 차단).
+	for _, inBuf := range []sim.Buffer{
+		s.cache.dirToBankBuffersRemote[s.bankID],
+		s.cache.dirToBankBuffersLocal[s.bankID],
+	} {
+		trans = inBuf.Pop()
+		if trans == nil {
+			continue
+		}
 
-	// [FIX: head-of-line blocking] writeBufferFetch 항목은 더 이상 dirToBankBuffers를 통해
-	// 오지 않는다. dirStage.fetch()에서 writeBufferBuffer로 직접 push하도록 변경됨.
-	// dirToBankBuffers에는 실제 bank 파이프라인 처리가 필요한 항목만 있으므로
-	// writeBufferFetch 관련 가드(writeBufferBuffer.CanPush() 확인)를 제거한다.
-	// 원래 코드(writeBufferFetch 중계)로 되돌리려면 위 directorystage.go 의
-	// fetch() 수정도 함께 되돌려야 한다.
-	trans = inBuf.Pop()
-
-	if trans != nil {
 		t := trans.(*transaction)
-
-		s.pipeline.Accept(bankPipelineElem{trans: trans.(*transaction)})
-
+		s.pipeline.Accept(bankPipelineElem{trans: t})
 		s.inflightTransCount++
 
 		switch t.action {

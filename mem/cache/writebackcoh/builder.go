@@ -499,6 +499,16 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 		cache.Name()+".DirToBankBuffer",
 		cache.numReqPerCycle,
 	)
+	cache.dirToBankBuffersLocal = make([]sim.Buffer, 1)
+	cache.dirToBankBuffersLocal[0] = sim.NewBuffer(
+		cache.Name()+".DirToBankBufferLocal",
+		cache.numReqPerCycle,
+	)
+	cache.dirToBankBuffersRemote = make([]sim.Buffer, 1)
+	cache.dirToBankBuffersRemote[0] = sim.NewBuffer(
+		cache.Name()+".DirToBankBufferRemote",
+		cache.numReqPerCycle,
+	)
 	cache.writeBufferToBankBuffers = make([]sim.Buffer, 1)
 	cache.writeBufferToBankBuffers[0] = sim.NewBuffer(
 		cache.Name()+".WriteBufferToBankBuffer",

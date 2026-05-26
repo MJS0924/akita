@@ -43,6 +43,11 @@ type Comp struct {
 	// stalled on bankBuf or MSHR cannot block invalidations behind them.
 	invStageBuffer           sim.Buffer
 	dirToBankBuffers         []sim.Buffer
+	// [FIX #2: priority preserved past dirStage] dirStage 가 fromLocal 기준으로
+	// 분기 push. bankStage.pullFromBuf 가 Remote 를 먼저 drain → cross-GPU 데드락
+	// 회피. dirToBankBuffers 는 length(numBanks) 계산 용도로만 유지.
+	dirToBankBuffersLocal    []sim.Buffer
+	dirToBankBuffersRemote   []sim.Buffer
 	writeBufferToBankBuffers []sim.Buffer
 	mshrStageBuffer          sim.Buffer
 	writeBufferBuffer        sim.Buffer // eviction 전용 (writeBufferFlush, writeBufferEvictAndFetch, writeBufferEvictAndWrite)
