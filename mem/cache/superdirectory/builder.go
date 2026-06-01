@@ -449,6 +449,14 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.Name()+".RDMAInvPort")
 	cache.AddPort("RDMAInv", cache.RDMAInvPort)
 
+	// D1: dedicated InvRsp ingress port (same per-cycle bandwidth).
+	// Isolated FIFO so InvRsp cannot be head-blocked by an undrained
+	// InvReq backlog at invReqBuffer.
+	cache.RDMAInvRspPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMAInvRspPort")
+	cache.AddPort("RDMAInvRsp", cache.RDMAInvRspPort)
+
 	cache.ToRDMA = b.ToRDMA
 }
 

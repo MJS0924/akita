@@ -23,6 +23,20 @@ const (
 	cacheStatePaused
 )
 
+// deferredRedirectEntry tracks a doWriteMiss trans whose Fix B-2
+// coarser-bank reprobe found an existing coarser entry but couldn't
+// dispatch because that coarser bank's pipeline was full. The trans
+// is parked here until the targeted pipeline drains, breaking the
+// head-of-line deadlock that arises when many concurrent
+// useRsbHintAlloc-driven coarse allocs saturate every coarser
+// bank's pipeline simultaneously (A2 fir / matmul deadlock pattern,
+// CYCLE_FINDINGS.md §13).
+type deferredRedirectEntry struct {
+	trans      *transaction
+	targetBank int
+	isLocal    bool
+}
+
 type Comp struct {
 	*sim.TickingComponent
 	sim.MiddlewareHolder
@@ -36,8 +50,19 @@ type Comp struct {
 	controlPort      sim.Port
 	RDMAPort         sim.Port
 	RDMAInvPort      sim.Port
+	// D1: separate InvRsp incoming channel. RDMAInvPort previously
+	// carried both InvReq and InvRsp in the same FIFO; when the head
+	// was an InvReq and invReqBuffer was full, InvRsp behind it could
+	// not be retrieved → upstream SD's inflightInvToBottom never
+	// drained → cross-GPU cyclic backpressure (A2 fir deadlock at
+	// win=495 when useRsbHintAlloc=true triggers coarse-alloc InvReq
+	// broadcast bursts).
+	RDMAInvRspPort   sim.Port
 	ToRDMA           sim.RemotePort
 	ToRDMAInv        sim.RemotePort
+	// D1: remote-side endpoint name for the new InvRsp channel; set by
+	// the r9nano builder when plugging RDMAToCohDirForInvRsp.
+	ToRDMAInvRsp     sim.RemotePort
 
 	// [수정 코드] 자원을 Local과 Remote로 완전 분리
 	localDirStageBuffer  sim.Buffer
@@ -121,6 +146,25 @@ type Comp struct {
 	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
 	stallWriteToBankPreflight uint64 // writeToBank: MSHR cross-granularity conflict caught before mutation
 	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
+
+	// E-RACE-DEFER: deferred redirect queue. Fix B-2's coarser-bank
+	// reprobe MUST route to the existing coarser entry for SO invariant.
+	// When that coarser bank's pipeline is full, the old code returned
+	// false from doWriteMiss, which kept the trans pinned at the head
+	// of dirStage's per-bank remoteBuf. Under useRsbHintAlloc=true,
+	// many trans simultaneously hit this condition across all banks,
+	// and the pipeline can't drain because trans behind them (waiting
+	// for the same pipeline) block bankStage from working through
+	// remoteBuf entries — closed cycle.
+	//
+	// Fix: when Fix B-2 hits a full pipeline, push the trans onto
+	// deferredRedirects (consuming the head of remoteBuf via
+	// `return true`) and retry from this queue each Tick. This breaks
+	// the head-of-line block — other trans in remoteBuf can now make
+	// progress, draining the saturated pipeline so the deferred trans
+	// eventually get their target slot.
+	deferredRedirects []deferredRedirectEntry
+	deferredRedirectCount uint64 // diagnostic: how many trans were ever deferred
 
 	// H3e fix counter: number of demote triggers that hit a DemoteLocked
 	// entry and were converted to invalidate-only. Reports cascade-prevention

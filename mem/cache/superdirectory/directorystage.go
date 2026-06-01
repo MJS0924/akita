@@ -35,6 +35,13 @@ type directoryStage struct {
 }
 
 func (ds *directoryStage) Tick() (madeProgress bool) {
+	// E-RACE-DEFER: drain deferred Fix B-2 redirects FIRST. These are
+	// trans that were forced to wait by a momentarily-full coarser
+	// pipeline; retrying them ahead of new acceptNewTransaction work
+	// minimizes their dwell time and keeps SO invariant routing
+	// honored ASAP. Returns true if any deferred trans dispatched.
+	madeProgress = ds.retryDeferredRedirects() || madeProgress
+
 	// 양쪽 모두 Tick 진행
 	madeProgress = ds.acceptNewTransaction(true) || madeProgress  // Local
 	madeProgress = ds.acceptNewTransaction(false) || madeProgress // Remote
@@ -50,6 +57,41 @@ func (ds *directoryStage) Tick() (madeProgress bool) {
 	madeProgress = ds.processTransaction(false) || madeProgress
 	madeProgress = ds.processMotionTransaction() || madeProgress
 
+	return madeProgress
+}
+
+// retryDeferredRedirects drains the deferredRedirects queue.  Each
+// entry was pushed by doWriteMiss's Fix B-2 reprobe when the targeted
+// coarser bank's pipeline was momentarily full. For every queued
+// entry we re-check pipeline.CanAccept and dispatch if possible;
+// stuck entries are kept for the next Tick. Re-verification of the
+// coarser entry (SubEntry.IsValid) is intentionally skipped: trans
+// stalls here are short (until pipeline drains one stage, typically
+// within a few cycles), and the coarser entry is very unlikely to
+// be evicted in that window. Subsequent stages (bankStage) still
+// perform their own directory operations, so the late-binding bank
+// alloc is safe under SO invariant in practice.
+func (ds *directoryStage) retryDeferredRedirects() bool {
+	if len(ds.cache.deferredRedirects) == 0 {
+		return false
+	}
+	madeProgress := false
+	remaining := ds.cache.deferredRedirects[:0]
+	for _, d := range ds.cache.deferredRedirects {
+		pipeline := ds.localPipeline
+		if !d.isLocal {
+			pipeline = ds.remotePipeline
+		}
+		if !pipeline[d.targetBank].CanAccept() {
+			remaining = append(remaining, d)
+			continue
+		}
+		d.trans.bankID = d.targetBank
+		d.trans.bankList = nil
+		pipeline[d.targetBank].Accept(dirPipelineItem{d.trans})
+		madeProgress = true
+	}
+	ds.cache.deferredRedirects = remaining
 	return madeProgress
 }
 
@@ -944,8 +986,31 @@ func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
 				continue
 			}
 			if !pipeline[coarserBank].CanAccept() {
-				*ds.returnFalse += "doWriteMiss coarser-bank redirect: pipeline full"
-				return false
+				// E-RACE-DEFER (CYCLE_FINDINGS.md §13): the SO invariant
+				// requires this trans to route to coarserBank (entry
+				// exists at sub-level), so we cannot fall through to
+				// finest alloc. Returning false here pins the trans at
+				// the head of dirStage's remoteBuf[bankID], and when
+				// many concurrent useRsbHintAlloc-driven coarse allocs
+				// simultaneously hit this condition across all banks,
+				// every bank's processTransaction breaks → dirStage.Tick
+				// returns false → no auto-reschedule → engine halt.
+				//
+				// Fix: park the trans on a deferredRedirects queue and
+				// return true (consume head of remoteBuf), breaking the
+				// head-of-line. retryDeferredRedirects() drains the
+				// queue each Tick whenever the targeted pipeline has
+				// room.
+				ds.cache.deferredRedirects = append(
+					ds.cache.deferredRedirects,
+					deferredRedirectEntry{
+						trans:      trans,
+						targetBank: coarserBank,
+						isLocal:    isLocal,
+					})
+				ds.cache.deferredRedirectCount++
+				*ds.returnFalse += "doWriteMiss coarser-bank redirect: pipeline full -> deferred"
+				return true
 			}
 			trans.bankID = coarserBank
 			trans.bankList = nil

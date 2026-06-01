@@ -40,6 +40,19 @@ func (p *topParser) Tick() bool {
 		progress = true
 	}
 
+	// D1: drain the dedicated InvRsp ingress. This FIFO carries
+	// *mem.InvRsp only (RDMA's processInvRsp delivers here via
+	// RDMAInvRspInside). Isolated from RDMAInvPort's InvReq backlog so
+	// it cannot be head-blocked by a full invReqBuffer. processReq's
+	// existing InvRsp case pushes to invRspBuffer; any other message
+	// type arriving here is unexpected (defensive: still routed via
+	// processReq for symmetric handling).
+	req = p.cache.RDMAInvRspPort.PeekIncoming()
+	if p.processReq(req, false) {
+		p.cache.RDMAInvRspPort.RetrieveIncoming()
+		progress = true
+	}
+
 	return progress
 }
 

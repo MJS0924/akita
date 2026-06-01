@@ -2,6 +2,7 @@ package superdirectory
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/cache/superdirectory/internal"
@@ -63,6 +64,16 @@ type bottomSender struct {
 	returnFalse0 string
 	returnFalse1 string
 	returnFalse2 string
+
+	// Observability — count of times the bottomSender saw an incoming
+	// response (DataReadyRsp / WriteDoneRsp) whose RspTo did not match
+	// any of localInflightBypassRequest / localInflightRequest /
+	// remoteInflightRequest. Today the discard is silent (port.
+	// RetrieveIncoming + return true); counters + stderr logs added so
+	// the A2 (RSB-on) fir deadlock root cause (~128 stranded L2
+	// inflightEviction) can be identified by reproducer logs.
+	lostDataReadyRspCount uint64
+	lostWriteDoneRspCount uint64
 }
 
 func (bs *bottomSender) refreshEmitBudget() {
@@ -875,6 +886,15 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 	}
 
 	if i == -1 {
+		// OBSERVABILITY (a): DataReadyRsp arrived but its RspTo did
+		// not match any inflight tracking. Discard is preserved
+		// (behavior unchanged) but a stderr log + counter is emitted
+		// to identify the source of the A2 (RSB-on) fir deadlock.
+		bs.lostDataReadyRspCount++
+		fmt.Fprintf(os.Stderr,
+			"[%s] [LOSTRSP %d] processDataReadyRsp: no match in any inflight; rsp_to=%q origin_addr=%#x src=%s -> DISCARD\n",
+			bs.cache.name, bs.lostDataReadyRspCount,
+			msg.GetRspTo(), msg.Origin.GetAddress(), msg.Meta().Src)
 		// superdirectory 환경에서 트랜잭션 유실을 추적하기 위해 기존 로그 유지
 		if bs.cache.debugProcess {
 			fmt.Printf("[%s] [bottomSender]\tDiscard read rsp - 3.2: addr %x\n", bs.cache.name, msg.Origin.GetAddress())
@@ -950,6 +970,18 @@ func (bs *bottomSender) processWriteDoneRsp(msg *mem.WriteDoneRsp, port sim.Port
 	}
 
 	if i == -1 {
+		// OBSERVABILITY (a): WriteDoneRsp arrived but its RspTo did
+		// not match any inflight tracking. This is the L2-deadlock
+		// terminal site for the A2 (RSB-on) fir hang: every
+		// uncaptured WriteDoneRsp here corresponds to one stranded
+		// inflightEviction in L2.writeBuffer. Discard preserved;
+		// stderr log + counter added so the reproducer prints exactly
+		// which RspTo/addr are being dropped.
+		bs.lostWriteDoneRspCount++
+		fmt.Fprintf(os.Stderr,
+			"[%s] [LOSTRSP %d] processWriteDoneRsp: no match in any inflight; rsp_to=%q origin_addr=%#x src=%s -> DISCARD\n",
+			bs.cache.name, bs.lostWriteDoneRspCount,
+			msg.GetRspTo(), msg.Origin.GetAddress(), msg.Meta().Src)
 		// superdirectory의 디버깅 로그 유지
 		if bs.cache.debugProcess && msg.Origin.GetAddress() == bs.cache.debugAddress {
 			fmt.Printf("[%s] [bottomSender]\tDiscard write rsp - 3.4: addr %x\n", bs.cache.name, msg.Origin.GetAddress())
