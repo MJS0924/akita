@@ -14,9 +14,28 @@ import (
 type writeBufferStage struct {
 	cache *Comp
 
-	writeBufferCapacity int
-	maxInflightFetch    int
-	maxInflightEviction int
+	// [ITER17 F2] writeBufferCapacity split into local/peer sub-budgets.
+	// Old single cap shared between LOCAL and REMOTE pending+inflight
+	// meant peer-bypass (iter13 #1) admits that pushed to
+	// pendingLocalEvictions grew the LOCAL bucket past cap → blocked
+	// fromLocal=true at writeBufferReservedForRemote → cascading stall
+	// observed in conv2d sim 7.71 ms and stencil2d sim 21.38 ms.
+	// Now each side has its own ceiling; one side's saturation does not
+	// block admit / drain of the other. Defaults: local=1024 (= legacy),
+	// peer=256 (~conservative since peer is rate-limited by sender caps).
+	writeBufferCapacity      int // = writeBufferLocalCapacity (kept name for back-compat)
+	writeBufferPeerCapacity  int
+	maxInflightFetch         int
+	maxInflightEviction      int
+
+	// [ITER17 F1] Cap on peer-bypass admit lane (the iter13 #1 path
+	// that admits fromLocal=false unconditionally except for bankBuf.
+	// Without this cap, observed: pendingLocalEvictions = 1432 (1.4×
+	// writeBufferCapacity) and writeBufferReservedForRemote stuck TRUE
+	// permanently. Incremented in peer-bypass admit, decremented when
+	// the trans transitions into inflight (tryWriteOne).
+	maxPeerIncomingPending int
+	numPeerIncomingPending int
 
 	// [ITER10 STRUCTURAL FIX] pendingEvictions split into local/remote
 	// queues to prevent LOCAL-blocks-REMOTE head-of-line in the FIFO.
@@ -219,7 +238,7 @@ func (wb *writeBufferStage) processNewTransaction() bool {
 	case writeBufferFlush:
 		return wb.processWriteBufferFlush(trans, true)
 	default:
-		fmt.Printf("[%s]\t[WARNING]\tUnknown transaction action %d, trans: %x\n", wb.cache.name, trans.action, trans)
+		fmt.Printf("[%s]\t[WARNING]\tUnknown transaction action %d, trans: %p\n", wb.cache.name, trans.action, trans)
 		for true {
 		}
 		panic("unknown transaction action")
@@ -409,6 +428,21 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 	// now backed by the explicit workflow audit finding that the L2 wB
 	// admit gate is the principal cycle vertex.
 	if !trans.fromLocal {
+		// [ITER17 F1] Peer-bypass admit lane MUST honor a sane upper
+		// cap. iter13 #1 omitted any pending-queue check, which let
+		// pendingLocalEvictions grow to 1432 (1.4× writeBufferCapacity)
+		// in conv2d sim 7.71 ms hang. The cycle then closed via
+		// writeBufferReservedForRemote=TRUE permanently. Restore the
+		// design invariant: peer admits are bounded by
+		// maxPeerIncomingPending. When hit, RDMA backpressure
+		// propagates to peer's REC.bottomSender — peer slows its own
+		// sender-side, which lets receiver drain.
+		if wb.maxPeerIncomingPending > 0 &&
+			wb.numPeerIncomingPending >= wb.maxPeerIncomingPending {
+			wb.lastAdmitFailReason = fmt.Sprintf("peerIncomingPendingCap: numPeerIncomingPending=%d >= max=%d",
+				wb.numPeerIncomingPending, wb.maxPeerIncomingPending)
+			return false
+		}
 		bankNum := bankID(
 			trans.block,
 			wb.cache.directory.WayAssociativity(),
@@ -429,15 +463,16 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 			wb.pendingRemoteEvictions = append(wb.pendingRemoteEvictions, trans)
 			wb.numPendingRemoteEvictions++
 		}
+		wb.numPeerIncomingPending++
 		wb.currentEvictionSrcBuf.Pop()
 		return true
 	}
 
-	if wb.writeBufferFull() {
+	if wb.writeBufferFull(trans.fromLocal) {
 		// [ITER12] precise reason
-		wb.lastAdmitFailReason = fmt.Sprintf("writeBufferFull: pendingLoc=%d pendingRem=%d inflight=%d cap=%d fromLocal=%v",
-			len(wb.pendingLocalEvictions), len(wb.pendingRemoteEvictions),
-			len(wb.inflightEviction), wb.writeBufferCapacity, trans.fromLocal)
+		wb.lastAdmitFailReason = fmt.Sprintf("writeBufferFull(side=%v): pendingLoc=%d pendingRem=%d numLocalInfl=%d numRemoteInfl=%d locCap=%d peerCap=%d",
+			trans.fromLocal, len(wb.pendingLocalEvictions), len(wb.pendingRemoteEvictions),
+			wb.numLocalInflightEviction, wb.numRemoteInflightEviction, wb.writeBufferCapacity, wb.writeBufferPeerCapacity)
 		return false
 	}
 
@@ -495,7 +530,7 @@ func (wb *writeBufferStage) processWriteBufferEvictAndPrefetch(
 		panic("invalid function called")
 	}
 
-	if wb.writeBufferFull() {
+	if wb.writeBufferFull(trans.fromLocal) {
 		return false
 	}
 
@@ -563,14 +598,24 @@ func (wb *writeBufferStage) processWriteBufferFlush(
 	// processWriteBufferEvictAndWrite: peer-incoming flush request
 	// MUST be admitted so the ACK path stays open.
 	if trans.fromLocal {
-		if wb.writeBufferFull() {
+		if wb.writeBufferFull(true) {
 			return false
 		}
 		// [OUTGOING-REMOTE CAP FIX] Same admit-side guard as
 		// processWriteBufferEvictAndWrite — guards against sender L2
 		// over-filling its pending+inflight remote eviction count.
-		isLocal := wb.cache.toLocal(trans.evictingAddr)
-		if wb.tooManyOutgoingRemote(isLocal) {
+		isLocalDst := wb.cache.toLocal(trans.evictingAddr)
+		if wb.tooManyOutgoingRemote(isLocalDst) {
+			return false
+		}
+	} else {
+		// [ITER17 F1] Cap peer-bypass admit path here too (mirror
+		// processWriteBufferEvictAndWrite). Without this, peer-incoming
+		// flush requests grow pendingEvictions unboundedly.
+		if wb.maxPeerIncomingPending > 0 &&
+			wb.numPeerIncomingPending >= wb.maxPeerIncomingPending {
+			wb.lastAdmitFailReason = fmt.Sprintf("peerIncomingPendingCap(flush): numPeerIncomingPending=%d >= max=%d",
+				wb.numPeerIncomingPending, wb.maxPeerIncomingPending)
 			return false
 		}
 	}
@@ -583,6 +628,10 @@ func (wb *writeBufferStage) processWriteBufferFlush(
 	} else {
 		wb.pendingRemoteEvictions = append(wb.pendingRemoteEvictions, trans)
 		wb.numPendingRemoteEvictions++
+	}
+	// [ITER17 F1] Track peer-bypass admits so the cap above can fire.
+	if !trans.fromLocal {
+		wb.numPeerIncomingPending++
 	}
 
 	if popAfterDone {
@@ -643,6 +692,14 @@ func (wb *writeBufferStage) tryWriteOne(isLocal bool) bool {
 	trans.evictionToLocal = isLocal
 	*queue = (*queue)[1:]
 	wb.inflightEviction = append(wb.inflightEviction, trans)
+	// [ITER17 F1] trans left the pending queue — release peer-bypass
+	// admit slot so the next peer-incoming can take it. Note: we
+	// release at PENDING→INFLIGHT transition, not at ACK, because the
+	// cap is on PENDING growth (writeBufferReservedForRemote keys off
+	// pending+inflight, but the unbounded growth was in PENDING).
+	if !trans.fromLocal && wb.numPeerIncomingPending > 0 {
+		wb.numPeerIncomingPending--
+	}
 	if isLocal {
 		wb.numLocalInflightEviction++
 	} else {
@@ -979,8 +1036,31 @@ func (wb *writeBufferStage) processWriteDoneRsp(
 	return true
 }
 
-func (wb *writeBufferStage) writeBufferFull() bool {
-	// [ITER10] total = local-pending + remote-pending + inflight.
+// [ITER17 F2] writeBufferFull now checks the appropriate side bucket
+// instead of the shared total. A local-side caller (fromLocal=true) is
+// admitted as long as the LOCAL bucket has headroom even when REMOTE
+// is saturated; vice versa for peer-side. Used by both
+// processWriteBufferEvictAndWrite and processWriteBufferFlush.
+func (wb *writeBufferStage) writeBufferFull(fromLocal bool) bool {
+	if fromLocal {
+		// LOCAL bucket = pendingLocalEvictions + numLocalInflightEviction
+		used := len(wb.pendingLocalEvictions) + wb.numLocalInflightEviction
+		return used >= wb.writeBufferCapacity
+	}
+	// PEER bucket = pendingRemoteEvictions + numRemoteInflightEviction +
+	// peer-bypass items still queued (numPeerIncomingPending)
+	used := len(wb.pendingRemoteEvictions) + wb.numRemoteInflightEviction
+	cap := wb.writeBufferPeerCapacity
+	if cap <= 0 {
+		cap = wb.writeBufferCapacity // fall back to legacy if peer cap unset
+	}
+	return used >= cap
+}
+
+// Legacy accessor preserved for compatibility with any external caller
+// (e.g. flusher) that does not know the side. Reports the total entry
+// count vs the LOCAL cap (mirrors pre-iter17 semantics for those callers).
+func (wb *writeBufferStage) writeBufferFullLegacy() bool {
 	numEntry := len(wb.pendingLocalEvictions) + len(wb.pendingRemoteEvictions) + len(wb.inflightEviction)
 	return numEntry >= wb.writeBufferCapacity
 }
@@ -1003,13 +1083,33 @@ func (wb *writeBufferStage) tooManyInflightFetches() bool {
 }
 
 func (wb *writeBufferStage) tooManyInflightEvictions(isLocal bool) bool {
-	// Asymmetric soft cap: remote can use the full maxInflightEviction
-	// budget; local is bounded at 3/4 of it. The remaining 1/4 is
-	// always reserved for remote so local cannot starve cross-GPU
-	// traffic, while remote-dominant workloads (e.g., stencil2d on
-	// multi-GPU where all evictions go cross-GPU) can still use the
-	// full cap when local is idle. Total inflight is hard-capped by
-	// maxInflightEviction so the writeBuffer's accounting stays sound.
+	// [ITER16 SPLIT INFLIGHT CAP]
+	// Discovered at iter15 stencil2d sim 21.38 ms deadlock via the akita
+	// monitoring tool: GPU[3].L2[14] had numLocalInflightEviction=0,
+	// numRemoteInflightEviction=128 (CAP), pendingLocalEvictions=11615
+	// (11× the writeBufferCapacity). The old SHARED total cap means
+	// REMOTE-bound inflight monopolizing the 128 slots blocked ALL new
+	// admits — including LOCAL-bound ones whose drain path is
+	// INDEPENDENT (LOCAL drains via DRAM ACK; REMOTE drains via peer
+	// L2 ACK). LOCAL pending grew unbounded behind a queue it could
+	// not progress through.
+	//
+	// Fix: each side caps INDEPENDENTLY at maxInflightEviction. Total
+	// system load is bounded by 2× maxInflightEviction (was 128, now
+	// 256) — modest growth, NOT a relaxation in the user's sense
+	// because the structural cycle (remote ⟂ local block at the
+	// inflight queue) is what's being broken. Mirrors the iter15 REC
+	// .bottomSender.tooManyInflightRequest split (REC layer) and the
+	// iter10/iter13 pendingLocal/pendingRemote split (pending stage).
+	if isLocal {
+		return wb.numLocalInflightEviction >= wb.maxInflightEviction
+	}
+	return wb.numRemoteInflightEviction >= wb.maxInflightEviction
+}
+
+// _unused_tooManyInflightEvictions_old is the pre-iter16 shared-cap
+// version kept here as a reference. Do not call; left for review.
+func (wb *writeBufferStage) _unused_tooManyInflightEvictions_old(isLocal bool) bool {
 	total := wb.numLocalInflightEviction + wb.numRemoteInflightEviction
 	if total >= wb.maxInflightEviction {
 		return true
@@ -1036,4 +1136,5 @@ func (wb *writeBufferStage) Reset() {
 	wb.pendingDataReady = nil
 	wb.pendingWriteDone = nil
 	wb.numPendingRemoteEvictions = 0
+	wb.numPeerIncomingPending = 0 // [ITER17 F1]
 }

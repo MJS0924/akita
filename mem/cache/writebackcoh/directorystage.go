@@ -423,14 +423,18 @@ func (ds *directoryStage) bankBufFor(trans *transaction, bank int) sim.Buffer {
 // 무조건 통과시켜 cross-GPU 응답 경로를 살림. capacity 의 7/8(87.5%)을
 // 임계로 사용 — soft cap 보다 더 일찍 막아 양쪽 GPU 가 동시에 wB cap 을
 // 점유할 수 없게 함.
+// [ITER17 F2] Only count the LOCAL bucket so a saturated REMOTE bucket
+// no longer gates LOCAL admission. Without this fix, conv2d sim 7.71 ms
+// and stencil2d sim 21.38 ms deadlocked because peer-bypass-admitted
+// items inflated `used` past 7/8 cap → fromLocal=true trans permanently
+// rejected → topPort filled with stuck LOCAL trans → REC stuck → cycle.
 func (ds *directoryStage) writeBufferReservedForRemote(trans *transaction) bool {
 	if !trans.fromLocal {
 		return false
 	}
 	wb := ds.cache.writeBuffer
-	// [ITER10] sum split pending queues.
-	used := len(wb.pendingLocalEvictions) + len(wb.pendingRemoteEvictions) + len(wb.inflightEviction)
-	return used >= wb.writeBufferCapacity*7/8
+	usedLocal := len(wb.pendingLocalEvictions) + wb.numLocalInflightEviction
+	return usedLocal >= wb.writeBufferCapacity*7/8
 }
 
 func (ds *directoryStage) prefetchToBank(trans *transaction, block *internal.Block) bool {

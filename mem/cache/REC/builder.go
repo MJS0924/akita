@@ -380,6 +380,7 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		maxInflightRequest:        b.maxInflightFetch,
 		maxInflightInvalidation:   b.maxInflightEviction,
 		maxInflightBypassRequest:  1024,
+		maxPeerInflightRequest:    256, // [ITER17 F5b] peer-bypass cap (2× maxInflightRequest)
 		maxInvEmitPerCycle:        b.maxInvEmitPerCycle,
 		maxOutgoingRemoteInflight: b.maxOutgoingRemoteInflight,
 	}

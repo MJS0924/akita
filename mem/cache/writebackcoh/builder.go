@@ -31,7 +31,9 @@ type Builder struct {
 	byteSize                 uint64
 	numMSHREntry             int
 	numReqPerCycle           int
-	writeBufferCapacity      int
+	writeBufferCapacity      int // local-side cap (= legacy)
+	writeBufferPeerCapacity  int // peer-side cap (iter17 F2)
+	maxPeerIncomingPending   int // peer-bypass admit cap (iter17 F1)
 	maxInflightFetch         int
 	maxInflightEviction      int
 	maxOutgoingRemotePending int
@@ -50,16 +52,18 @@ type Builder struct {
 // MakeBuilder creates a new builder with default configurations.
 func MakeBuilder() Builder {
 	return Builder{
-		freq:                1 * sim.GHz,
-		wayAssociativity:    4,
-		log2BlockSize:       6,
-		byteSize:            512 * mem.KB,
-		numMSHREntry:        16,
-		numReqPerCycle:      1,
-		writeBufferCapacity: 1024,
-		maxInflightFetch:    128,
-		maxInflightEviction: 128,
-		bankLatency:         10,
+		freq:                    1 * sim.GHz,
+		wayAssociativity:        4,
+		log2BlockSize:           6,
+		byteSize:                512 * mem.KB,
+		numMSHREntry:            16,
+		numReqPerCycle:          1,
+		writeBufferCapacity:     1024, // local-side cap
+		writeBufferPeerCapacity: 256,  // [ITER17 F2] peer-side cap
+		maxPeerIncomingPending:  64,   // [ITER17 F1] peer-bypass admit cap
+		maxInflightFetch:        128,
+		maxInflightEviction:     128,
+		bankLatency:             10,
 	}
 }
 
@@ -366,6 +370,8 @@ func (b *Builder) createInternalStages(cache *Comp) {
 	cache.writeBuffer = &writeBufferStage{
 		cache:                    cache,
 		writeBufferCapacity:      b.writeBufferCapacity,
+		writeBufferPeerCapacity:  b.writeBufferPeerCapacity,
+		maxPeerIncomingPending:   b.maxPeerIncomingPending,
 		maxInflightFetch:         b.maxInflightFetch,
 		maxInflightEviction:      b.maxInflightEviction,
 		maxOutgoingRemotePending: b.maxOutgoingRemotePending,

@@ -49,6 +49,15 @@ type bottomSender struct {
 	localInflightBypassRequest []*transaction
 	remoteInflightRequest      []*transaction
 
+	// [ITER17 F5b] Cap on the peer-incoming bypass lane added in
+	// iter15. iter15's `if !isLocal { return false }` admitted peer
+	// reqs unconditionally — bounded only by upstream peer's sender
+	// cap, which is fine in symmetric workloads but pathological when
+	// one GPU becomes a hot dest. Track numPeerInflightRequest
+	// separately and cap at maxPeerInflightRequest (default 256).
+	maxPeerInflightRequest int
+	numPeerInflightRequest int
+
 	inflightInvToOutside []*transaction
 	inflightInvToBottom  []*invTrans
 
@@ -368,6 +377,11 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 		bs.sendToRemoteBottomQue = append(bs.sendToRemoteBottomQue, req)
 		bs.remoteInflightRequest = append(bs.remoteInflightRequest, trans)
 	}
+	// [ITER17 F5b] Track peer-bypass inflight count so tooManyInflightRequest
+	// can cap it. Origin = trans.fromLocal (peer if !fromLocal).
+	if !trans.fromLocal {
+		bs.numPeerInflightRequest++
+	}
 
 	bs.cache.bottomSendCount++
 
@@ -418,9 +432,17 @@ func (bs *bottomSender) sendInvalidationRequest(
 	// shared fetch-cap. Previously REC throttled only
 	// EvictAndInsertNewEntry, letting InvalidateAndUpdateEntry slip
 	// through and hide inv pressure on the fetch path.
-	if trans.action != InvalidateEntry && bs.tooManyInflightRequest(isLocal) {
+	// [ITER17 F5a] Pass trans.fromLocal to match the semantic of the
+	// iter15 peer-incoming bypass. The local `isLocal` parameter here
+	// is the BSB-side flag (which BSB the trans was popped from), NOT
+	// the request-origin flag. The bypass in tooManyInflightRequest is
+	// keyed on origin (fromLocal=false → peer-incoming → don't gate on
+	// own sender cap), so using `isLocal` here was a semantic mismatch
+	// that let local sender flood the cap without throttling. Mirror
+	// of sendRequestToBottom:334 which already uses trans.fromLocal.
+	if trans.action != InvalidateEntry && bs.tooManyInflightRequest(trans.fromLocal) {
 		bs.cache.stallInflightFetch++
-		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequest: tooManyInflightRequest=true (localInflight=%d/%d, action=%v)", len(bs.localInflightRequest), bs.maxInflightRequest, trans.action)
+		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequest: tooManyInflightRequest=true (localInflight=%d/%d, action=%v, fromLocal=%v)", len(bs.localInflightRequest), bs.maxInflightRequest, trans.action, trans.fromLocal)
 		return false
 	}
 
@@ -574,7 +596,9 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 ) bool {
 	// Cross-variant fairness: write-induced inv path also respects the
 	// fetch cap (matches CD strict semantics).
-	if bs.tooManyInflightRequest(isLocal) {
+	// [ITER17 F5a] Pass trans.fromLocal (origin) instead of isLocal
+	// (BSB side) — mirror of sendInvalidationRequest:421.
+	if bs.tooManyInflightRequest(trans.fromLocal) {
 		bs.cache.stallInflightFetch++
 		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequestByWrite: tooManyInflightRequest=true (localInflight=%d/%d)", len(bs.localInflightRequest), bs.maxInflightRequest)
 		return false
@@ -1276,6 +1300,13 @@ func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
 	// inflight bookkeeping. Sender-side caps are unchanged so total
 	// system load remains bounded.
 	if !isLocal {
+		// [ITER17 F5b] Cap the peer-bypass lane at maxPeerInflightRequest
+		// so a hot dest GPU cannot accumulate unbounded inflight from
+		// peer-incoming traffic.
+		if bs.maxPeerInflightRequest > 0 &&
+			bs.numPeerInflightRequest >= bs.maxPeerInflightRequest {
+			return true
+		}
 		return false
 	}
 	total := len(bs.localInflightRequest) + len(bs.remoteInflightRequest)
@@ -1321,6 +1352,7 @@ func (bs *bottomSender) Reset() {
 	bs.sendToRemoteBottomInvQue = nil
 	bs.sendToDirQue = nil
 	bs.bypassRspQue = nil
+	bs.numPeerInflightRequest = 0 // [ITER17 F5b]
 }
 
 // func (bs *bottomSender) findTransactionByReqIDToBottom(ID string, list []*transaction) int {
@@ -1376,14 +1408,22 @@ func (bs *bottomSender) removeInflightInvalidation(i int) {
 
 // [수정] 배열에서 제거하는 헬퍼 함수
 func (bs *bottomSender) removeInflightRequest(i int, isLocal bool) {
+	var trans *transaction
 	if isLocal {
+		trans = bs.localInflightRequest[i]
 		copy(bs.localInflightRequest[i:], bs.localInflightRequest[i+1:])
 		bs.localInflightRequest[len(bs.localInflightRequest)-1] = nil
 		bs.localInflightRequest = bs.localInflightRequest[:len(bs.localInflightRequest)-1]
 	} else {
+		trans = bs.remoteInflightRequest[i]
 		copy(bs.remoteInflightRequest[i:], bs.remoteInflightRequest[i+1:])
 		bs.remoteInflightRequest[len(bs.remoteInflightRequest)-1] = nil
 		bs.remoteInflightRequest = bs.remoteInflightRequest[:len(bs.remoteInflightRequest)-1]
+	}
+	// [ITER17 F5b] Decrement peer-inflight count when the removed trans
+	// was peer-originated. Use the trans.fromLocal flag to detect.
+	if trans != nil && !trans.fromLocal && bs.numPeerInflightRequest > 0 {
+		bs.numPeerInflightRequest--
 	}
 }
 

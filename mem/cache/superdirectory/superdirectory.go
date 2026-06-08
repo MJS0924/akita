@@ -273,6 +273,31 @@ func (c *Comp) EventCounts() map[string]uint64 {
 	for bank, v := range c.demoteCountByBank {
 		out[fmt.Sprintf("demote_bank%d", bank)] = v
 	}
+	// [BANK-LEVEL ENTRY ACTIVITY + COVERAGE — END-OF-SIM SNAPSHOT]
+	// At the moment EventCounts() is called (typically at simulation
+	// end via reportingProvider), capture per-bank entry counts and
+	// cache-line coverage so the sqlite/summary.csv pipeline records
+	// the final directory layout per bank. Per-window evolution is
+	// recorded separately by runner/windowsnapshot.go.
+	if c.directory != nil {
+		validEntries := c.PerBankValidEntries()
+		maxEntries := c.PerBankMaxEntries()
+		validSub := c.PerBankValidSubEntries()
+		coverage := c.CoverageByBank()
+		maxCoverage := c.MaxCoverageByBank()
+		// Per-bank util ×1e6 (avoid float in uint64 map; consumers
+		// divide by 1e6 to recover ratio).
+		utilPpm := c.PerBankUtilization()
+		for i := 0; i < len(validEntries); i++ {
+			prefix := fmt.Sprintf("bank%d_", i)
+			out[prefix+"valid_entries"] = uint64(validEntries[i])
+			out[prefix+"max_entries"] = uint64(maxEntries[i])
+			out[prefix+"valid_subentries"] = uint64(validSub[i])
+			out[prefix+"coverage_cachelines"] = uint64(coverage[i])
+			out[prefix+"max_coverage_cachelines"] = uint64(maxCoverage[i])
+			out[prefix+"util_ppm"] = uint64(utilPpm[i] * 1e6)
+		}
+	}
 	if c.directory != nil {
 		for bank, s := range c.directory.CBFStats() {
 			if s.NumEntries == 0 {
@@ -463,6 +488,125 @@ func (c *Comp) CoverageByBank() []int {
 			}
 		}
 	}
+	return out
+}
+
+// MaxCoverageByBank returns per-bank static maximum cache-line coverage
+// (= numEntriesInBank × numSubEntriesPerEntry × cachelinesPerSub).
+// Useful as a per-bank denominator. Sum matches MaxCoverageCacheLines().
+func (c *Comp) MaxCoverageByBank() []int {
+	banks := c.directory.GetBanks()
+	numSub := 1 << c.log2NumSubEntry
+	out := make([]int, len(banks))
+	for bankIdx, bank := range banks {
+		cachelinesPerSub := 1 << (c.regionLen[bankIdx] - int(c.log2BlockSize))
+		nEntries := 0
+		for _, set := range bank {
+			nEntries += len(set.CohEntries)
+		}
+		out[bankIdx] = nEntries * numSub * cachelinesPerSub
+	}
+	return out
+}
+
+// PerBankValidEntries returns per-bank counts of parent entries with
+// IsValidEntry()==true. Index = bankID.
+func (c *Comp) PerBankValidEntries() []int {
+	banks := c.directory.GetBanks()
+	out := make([]int, len(banks))
+	for bankIdx, bank := range banks {
+		for _, set := range bank {
+			for _, entry := range set.CohEntries {
+				if entry != nil && entry.IsValidEntry() {
+					out[bankIdx]++
+				}
+			}
+		}
+	}
+	return out
+}
+
+// PerBankMaxEntries returns the static maximum number of entries per
+// bank (= numSets × wayAssociativity).
+func (c *Comp) PerBankMaxEntries() []int {
+	banks := c.directory.GetBanks()
+	out := make([]int, len(banks))
+	for bankIdx, bank := range banks {
+		for _, set := range bank {
+			out[bankIdx] += len(set.CohEntries)
+		}
+	}
+	return out
+}
+
+// PerBankValidSubEntries returns the total number of valid sub-entries
+// per bank. CoverageByBank[i] = PerBankValidSubEntries[i] × (regionSize
+// at bank i / cacheLineSize).
+func (c *Comp) PerBankValidSubEntries() []int {
+	banks := c.directory.GetBanks()
+	out := make([]int, len(banks))
+	for bankIdx, bank := range banks {
+		for _, set := range bank {
+			for _, entry := range set.CohEntries {
+				if entry == nil || !entry.IsValidEntry() {
+					continue
+				}
+				for k := 0; k < len(entry.SubEntry); k++ {
+					if entry.SubEntry[k].IsValid {
+						out[bankIdx]++
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// PerBankUtilization returns per-bank average sub-entry fill ratio
+// (validSub/numSub averaged across valid entries in that bank). 0 if no
+// valid entries.
+func (c *Comp) PerBankUtilization() []float64 {
+	banks := c.directory.GetBanks()
+	numSub := 1 << c.log2NumSubEntry
+	out := make([]float64, len(banks))
+	for bankIdx, bank := range banks {
+		var sum float64
+		count := 0
+		for _, set := range bank {
+			for _, entry := range set.CohEntries {
+				if entry == nil || !entry.IsValidEntry() {
+					continue
+				}
+				validSub := 0
+				for k := 0; k < len(entry.SubEntry); k++ {
+					if entry.SubEntry[k].IsValid {
+						validSub++
+					}
+				}
+				sum += float64(validSub) / float64(numSub)
+				count++
+			}
+		}
+		if count > 0 {
+			out[bankIdx] = sum / float64(count)
+		}
+	}
+	return out
+}
+
+// PerBankPromoteCounts returns a copy of bank-level cumulative promote
+// counts for external samplers (per-window snapshot). Index = bankID.
+func (c *Comp) PerBankPromoteCounts() []uint64 {
+	out := make([]uint64, len(c.promoteCountByBank))
+	copy(out, c.promoteCountByBank)
+	return out
+}
+
+// PerBankDemoteCounts returns a copy of bank-level cumulative demote
+// counts. Index = bankID.
+func (c *Comp) PerBankDemoteCounts() []uint64 {
+	out := make([]uint64, len(c.demoteCountByBank))
+	copy(out, c.demoteCountByBank)
 	return out
 }
 
