@@ -350,6 +350,21 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.Name()+".RDMAPort")
 	cache.AddPort("RDMA", cache.RDMAPort)
 
+	// [R2] Split peer-facing data ingress into REQ vs RSP ports.  Paired
+	// with R1's split RDMA outside ports (RDMADataReqInside /
+	// RDMADataRspInside).  topparser polls each port independently and
+	// dispatches to a dedicated downstream buffer
+	// (remoteDirStageBuffer for REQ, remoteBypassBuffer for RSP).
+	cache.RDMADataReqPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMADataReqPort")
+	cache.AddPort("RDMADataReq", cache.RDMADataReqPort)
+
+	cache.RDMADataRspPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMADataRspPort")
+	cache.AddPort("RDMADataRsp", cache.RDMADataRspPort)
+
 	cache.RDMAInvPort = sim.NewPort(cache,
 		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
 		cache.Name()+".RDMAInvPort")
@@ -383,6 +398,7 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		maxPeerInflightRequest:    256, // [ITER17 F5b] peer-bypass cap (2× maxInflightRequest)
 		maxInvEmitPerCycle:        b.maxInvEmitPerCycle,
 		maxOutgoingRemoteInflight: b.maxOutgoingRemoteInflight,
+		flushDropCount:            map[vm.PID]uint64{},
 	}
 }
 
@@ -517,13 +533,25 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 		cache.numReqPerCycle,
 	)
 
-	// [수정] BottomSenderBuffer를 Local과 Remote로 분리
-	cache.localBottomSenderBuffer = sim.NewBuffer(
-		cache.Name()+".LocalBottomSenderBuffer",
+	// [R4] BottomSenderBuffer split into Data + Inv classes per side.
+	// Each lane keeps the same per-side capacity (numReqPerCycle) so the
+	// total push budget grows 2x — intentional: inv-class push pressure
+	// no longer steals data-class headroom (HoL). Builder field defaults
+	// preserved (no new flag introduced for this split).
+	cache.localBSBData = sim.NewBuffer(
+		cache.Name()+".LocalBSBData",
 		cache.numReqPerCycle,
 	)
-	cache.remoteBottomSenderBuffer = sim.NewBuffer(
-		cache.Name()+".RemoteBottomSenderBuffer",
+	cache.localBSBInv = sim.NewBuffer(
+		cache.Name()+".LocalBSBInv",
+		cache.numReqPerCycle,
+	)
+	cache.remoteBSBData = sim.NewBuffer(
+		cache.Name()+".RemoteBSBData",
+		cache.numReqPerCycle,
+	)
+	cache.remoteBSBInv = sim.NewBuffer(
+		cache.Name()+".RemoteBSBInv",
 		cache.numReqPerCycle,
 	)
 
@@ -537,6 +565,13 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 	)
 	cache.localBypassBuffer = sim.NewBuffer(
 		cache.Name()+".LocalBypassBuffer",
+		cache.numReqPerCycle,
+	)
+	// [R2] Drain target for the new RDMADataRspPort topparser loop.
+	// Sized to match the other top-side buffers so back-pressure
+	// propagates uniformly into R1's RDMADataRspInside.
+	cache.remoteBypassBuffer = sim.NewBuffer(
+		cache.Name()+".RemoteBypassBuffer",
 		cache.numReqPerCycle,
 	)
 }

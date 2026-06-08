@@ -157,7 +157,9 @@ func (s *bankStage) Reset() {
 	s.cache.dirToBankBuffers[s.bankID].Clear()
 	s.cache.dirToBankBuffersLocal[s.bankID].Clear()
 	s.cache.dirToBankBuffersRemote[s.bankID].Clear()
-	s.cache.writeBufferToBankBuffers[s.bankID].Clear()
+	// [R5] clear both Req and Rsp halves.
+	s.cache.writeBufferToBankBuffersReq[s.bankID].Clear()
+	s.cache.writeBufferToBankBuffersRsp[s.bankID].Clear()
 	s.pipeline.Clear()
 	s.postPipelineBuf.Clear()
 	s.inflightTransCount = 0
@@ -168,14 +170,22 @@ func (s *bankStage) pullFromBuf() bool {
 		return false
 	}
 
-	inBuf := s.cache.writeBufferToBankBuffers[s.bankID]
-
-	trans := inBuf.Pop()
-	if trans != nil {
+	// [R5] Drain Rsp (bankWriteFetched) lane first, then Req
+	// (bankWriteHit / bankWritePrefetched). Rsp-first mirrors the
+	// pendingDataReady response-priority precedent — a fetched-data
+	// committing to the bank frees an MSHR slot upstream and is on the
+	// critical path for L1 read-miss completion. Both buffers feed the
+	// same pipeline; only the dequeue order changes.
+	for _, inBuf := range []sim.Buffer{
+		s.cache.writeBufferToBankBuffersRsp[s.bankID],
+		s.cache.writeBufferToBankBuffersReq[s.bankID],
+	} {
+		trans := inBuf.Pop()
+		if trans == nil {
+			continue
+		}
 		s.pipeline.Accept(bankPipelineElem{trans: trans.(*transaction)})
-
 		s.inflightTransCount++
-
 		return true
 	}
 
@@ -191,7 +201,7 @@ func (s *bankStage) pullFromBuf() bool {
 		s.cache.dirToBankBuffersRemote[s.bankID],
 		s.cache.dirToBankBuffersLocal[s.bankID],
 	} {
-		trans = inBuf.Pop()
+		trans := inBuf.Pop()
 		if trans == nil {
 			continue
 		}

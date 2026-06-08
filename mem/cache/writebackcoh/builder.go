@@ -60,7 +60,7 @@ func MakeBuilder() Builder {
 		numReqPerCycle:          1,
 		writeBufferCapacity:     1024, // local-side cap
 		writeBufferPeerCapacity: 256,  // [ITER17 F2] peer-side cap
-		maxPeerIncomingPending:  64,   // [ITER17 F1] peer-bypass admit cap
+		maxPeerIncomingPending:  256,  // [ITER17 F1] peer-bypass admit cap (raised iter19 F1)
 		maxInflightFetch:        128,
 		maxInflightEviction:     128,
 		bankLatency:             10,
@@ -528,11 +528,22 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 		cache.Name()+".DirToBankBufferRemote",
 		cache.numReqPerCycle,
 	)
-	cache.writeBufferToBankBuffers = make([]sim.Buffer, 1)
-	cache.writeBufferToBankBuffers[0] = sim.NewBuffer(
-		cache.Name()+".WriteBufferToBankBuffer",
+	// [R5] writeBufferToBankBuffers split into Req / Rsp lanes per bank.
+	// Req = bankWriteHit / bankWritePrefetched (write admit path).
+	// Rsp = bankWriteFetched (fetch-response path).
+	// Backward-compat alias `writeBufferToBankBuffers` retained for length
+	// queries (bankID / dirToBank fan-out) — points at the Req slice.
+	cache.writeBufferToBankBuffersReq = make([]sim.Buffer, 1)
+	cache.writeBufferToBankBuffersReq[0] = sim.NewBuffer(
+		cache.Name()+".WriteBufferToBankBufferReq",
 		cache.numReqPerCycle,
 	)
+	cache.writeBufferToBankBuffersRsp = make([]sim.Buffer, 1)
+	cache.writeBufferToBankBuffersRsp[0] = sim.NewBuffer(
+		cache.Name()+".WriteBufferToBankBufferRsp",
+		cache.numReqPerCycle,
+	)
+	cache.writeBufferToBankBuffers = cache.writeBufferToBankBuffersReq
 	// [ITER13 fix #2] local/remote split — each cap=numReqPerCycle so
 	// total slots stay 2× the original, but local cannot HoL-block peer.
 	cache.mshrStageBuffer = sim.NewBuffer(

@@ -14,53 +14,85 @@ type topParser struct {
 	returnFalse string
 }
 
+// Tick drains topPort + RDMAPort + RDMAInvPort + RDMAInvRspPort
+// independently per cycle so that a backlog on one ingress port
+// cannot head-of-line block the others (iter19 D1-D3-CD).
 func (p *topParser) Tick() bool {
 	if p.cache.state != cacheStateRunning {
 		p.returnFalse = "cacheStateIsNotRunning"
 		return false
 	}
 
+	progress := false
+
 	req := p.cache.topPort.PeekIncoming()
+	if p.processReq(req, true, p.cache.topPort) {
+		p.cache.topPort.RetrieveIncoming()
+		progress = true
+	}
+
+	if p.cache.RDMAPort != nil {
+		req = p.cache.RDMAPort.PeekIncoming()
+		if p.processReq(req, false, p.cache.RDMAPort) {
+			p.cache.RDMAPort.RetrieveIncoming()
+			progress = true
+		}
+	}
+
+	if p.cache.RDMAInvPort != nil {
+		req = p.cache.RDMAInvPort.PeekIncoming()
+		if p.processReq(req, false, p.cache.RDMAInvPort) {
+			p.cache.RDMAInvPort.RetrieveIncoming()
+			progress = true
+		}
+	}
+
+	if p.cache.RDMAInvRspPort != nil {
+		req = p.cache.RDMAInvRspPort.PeekIncoming()
+		if p.processReq(req, false, p.cache.RDMAInvRspPort) {
+			p.cache.RDMAInvRspPort.RetrieveIncoming()
+			progress = true
+		}
+	}
+
+	return progress
+}
+
+func (p *topParser) processReq(req sim.Msg, fromLocal bool, srcPort sim.Port) bool {
 	if req == nil {
-		p.returnFalse = "request is nil"
 		return false
 	}
 
 	if p.cache.flushLocalAccess && !strings.Contains(fmt.Sprintf("%s", req.Meta().Src), "RDMA") {
-		p.cache.topPort.RetrieveIncoming()
-
+		// migration 중에는 local access 버려버리기
+		srcPort.RetrieveIncoming()
 		p.returnFalse = "Cache is flushing, request from local"
 		return false
-		// migration 중에는 local access 버려버리기
 	}
 
 	trans := &transaction{
 		id:        sim.GetIDGenerator().Generate(),
-		fromLocal: p.cache.fromLocal(req), // remote에서 발생한 request인지, local에서 발생한 request인지에 따라 동작이 달라질 수 있으므로 구분이 필요함
+		fromLocal: fromLocal,
 	}
 
 	switch req := req.(type) {
 	case *mem.InvReq:
-		if !p.cache.bottomSenderBuffer.CanPush() {
-
-			p.returnFalse = "Cannot push to bottomSenderBuffer"
+		if !p.cache.bottomSenderInvBuffer.CanPush() {
+			p.returnFalse = "Cannot push to bottomSenderInvBuffer"
 			return false
 		}
 
-		p.cache.bottomSenderBuffer.Push(req)
-		p.cache.topPort.RetrieveIncoming()
+		p.cache.bottomSenderInvBuffer.Push(req)
 
 		return true
 
 	case *mem.InvRsp:
 		if !p.cache.invRspBuffer.CanPush() {
-
 			p.returnFalse = "Cannot push InvRsp to buffer"
 			return false
 		}
 
 		p.cache.invRspBuffer.Push(req)
-		p.cache.topPort.RetrieveIncoming()
 
 		return true
 
@@ -80,16 +112,15 @@ func (p *topParser) Tick() bool {
 
 		trans.read = req
 
-		if trans.fromLocal || !p.cache.toLocal(req.Address) { // local에서 L2 cache를 read하는 경우 또는 remote data를 read 하는 경우는 directory 확인이 필요 없음
+		if trans.fromLocal || !p.cache.toLocal(req.Address) {
+			// local에서 L2 cache를 read하는 경우 또는 remote data를 read 하는 경우는 directory 확인이 필요 없음
 			trans.action = Nothing
 
-			if !p.cache.bottomSenderBuffer.CanPush() {
-
-				p.returnFalse = "Cannot push to bottomSenderBuffer"
+			if !p.cache.bottomSenderTransBuffer.CanPush() {
+				p.returnFalse = "Cannot push to bottomSenderTransBuffer"
 				return false
 			}
-			p.cache.bottomSenderBuffer.Push(trans)
-			p.cache.topPort.RetrieveIncoming()
+			p.cache.bottomSenderTransBuffer.Push(trans)
 
 			return true
 		}
@@ -113,13 +144,11 @@ func (p *topParser) Tick() bool {
 		if !p.cache.toLocal(req.Address) { // remote data를 write 하는 경우는 directory 확인이 필요 없음
 			trans.action = Nothing
 
-			if !p.cache.bottomSenderBuffer.CanPush() {
-
-				p.returnFalse = "Cannot push to bottomSenderBuffer"
+			if !p.cache.bottomSenderTransBuffer.CanPush() {
+				p.returnFalse = "Cannot push to bottomSenderTransBuffer"
 				return false
 			}
-			p.cache.bottomSenderBuffer.Push(trans)
-			p.cache.topPort.RetrieveIncoming()
+			p.cache.bottomSenderTransBuffer.Push(trans)
 
 			return true
 		}
@@ -130,9 +159,6 @@ func (p *topParser) Tick() bool {
 		return false
 	}
 	p.cache.dirStageBuffer.Push(trans)
-	p.cache.topPort.RetrieveIncoming()
-
-	// p.cache.inFlightTransactions = append(p.cache.inFlightTransactions, trans)
 
 	return true
 }

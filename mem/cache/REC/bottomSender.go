@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -36,6 +37,14 @@ type bottomSender struct {
 	lostDataReadyRspCount uint64
 	lostWriteDoneRspSampleID string
 	lostDataReadyRspSampleID string
+
+	// [C2 observability] Per-PID counter of flushable local-origin
+	// transactions silently dropped during a flush window
+	// (flushLocalAccess=true). The topparser drops non-RDMA ingress
+	// during migration to prevent in-flight local accesses from racing
+	// the directory reset; counting them per-PID makes the drop volume
+	// observable for post-mortem analysis. No semantic change.
+	flushDropCount map[vm.PID]uint64
 
 	// Phase 2 inv-emit budget (see cohdirectory/bottomSender.go for
 	// rationale). Filtered by message type when draining the shared
@@ -69,6 +78,12 @@ type bottomSender struct {
 
 	sendToBottomQue       []sim.Msg
 	sendToRemoteBottomQue []sim.Msg
+	// [R3] Local bottom egress for InvReq (to own L2). Mirrors the
+	// remote-side iter17 split: invalidation traffic gets its own
+	// outbound lane so a data-path backpressure burst on bottomPort
+	// cannot HoL-block invalidations into our own L2. Drained BEFORE
+	// sendToBottomQue at the egress.
+	sendToBottomInvQue []sim.Msg
 	// Phase F equivalent for REC path. Inv send queue separated from
 	// read/write so a backpressure burst on the data path cannot
 	// HoL-block invalidation traffic. processInvalidationReq() pushes
@@ -89,7 +104,14 @@ type bottomSender struct {
 	// longer prevents progress on the other ports.
 	sendToTopRspQue       []sim.Msg // local L1 RSPs → topPort
 	sendToRDMADataRspQue  []sim.Msg // peer data RSPs → RDMAPort
-	sendToRDMAInvQue      []sim.Msg // outbound InvReq + InvRsp → RDMAInvPort
+	// [R3] Split iter17's sendToRDMAInvQue into request vs response
+	// lanes. Mixing them at the egress queue forced InvReq backpressure
+	// (peer's RDMAInvPort.incomingBuf full) to HoL-block our outbound
+	// InvRsp — which is exactly the traffic the peer needs to drain its
+	// own inflightInvToBottom and free that very buffer. Split + drained
+	// independently breaks that mutual-block cycle.
+	sendToRDMAInvQue      []sim.Msg // outbound InvReq → RDMAInvPort
+	sendToRDMAInvRspQue   []sim.Msg // outbound InvRsp → RDMAInvPort
 	sendToRemoteTopQue    []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
 	sendToDirQue          []*transaction
 	bypassRspQue          []sim.Msg
@@ -256,30 +278,46 @@ func (bs *bottomSender) processInputReq() bool {
 	// hang diagnosis impossible. Now: if buffer was non-empty and
 	// processItem failed, returnFalse2 preserves the exact send* reason.
 
-	// 1. Remote 버퍼 우선 확인 (원격 응답/요청을 먼저 빼주어 네트워크 데드락 완화)
-	item := bs.cache.remoteBottomSenderBuffer.Peek()
-	remoteSawItem := item != nil
-	if remoteSawItem {
-		if bs.processItem(item, false) {
-			bs.cache.remoteBottomSenderBuffer.Pop()
-			progress = true
+	// [R4] BSB split into Data + Inv classes (per trans.action). Drain
+	// all 4 lanes each tick so an Inv-class HoL-stall (e.g. inflight cap
+	// reached) cannot block Data-class trans behind it, and vice versa.
+	// Order: Remote-Inv, Remote-Data, Local-Inv, Local-Data — remote
+	// first preserves the iter6 cross-GPU forward-progress rule; inv
+	// first within each side preserves the egress-priority rule.
+	drainOne := func(buf sim.Buffer, isLocal bool) (sawItem, popped bool) {
+		item := buf.Peek()
+		if item == nil {
+			return false, false
 		}
+		if bs.processItem(item, isLocal) {
+			buf.Pop()
+			return true, true
+		}
+		return true, false
 	}
 
-	// 2. Local 버퍼 확인
-	item = bs.cache.localBottomSenderBuffer.Peek()
-	localSawItem := item != nil
-	if localSawItem {
-		if bs.processItem(item, true) {
-			bs.cache.localBottomSenderBuffer.Pop()
-			progress = true
-		}
-	}
+	anySaw := false
 
-	// Only mark "both empty" when both Peeks returned nil; otherwise
+	rInvSaw, rInvPop := drainOne(bs.cache.remoteBSBInv, false)
+	anySaw = anySaw || rInvSaw
+	progress = progress || rInvPop
+
+	rDataSaw, rDataPop := drainOne(bs.cache.remoteBSBData, false)
+	anySaw = anySaw || rDataSaw
+	progress = progress || rDataPop
+
+	lInvSaw, lInvPop := drainOne(bs.cache.localBSBInv, true)
+	anySaw = anySaw || lInvSaw
+	progress = progress || lInvPop
+
+	lDataSaw, lDataPop := drainOne(bs.cache.localBSBData, true)
+	anySaw = anySaw || lDataSaw
+	progress = progress || lDataPop
+
+	// Only mark "all empty" when all four Peeks returned nil; otherwise
 	// preserve the send*-failure reason already in returnFalse2.
-	if !progress && !remoteSawItem && !localSawItem {
-		bs.returnFalse2 = "both BSB empty (no items to process)"
+	if !progress && !anySaw {
+		bs.returnFalse2 = "all BSB lanes empty (no items to process)"
 	}
 
 	return progress
@@ -1017,8 +1055,10 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 		WithSrcRDMA(req.DstRDMA).
 		Build()
 
-	// [ITER17 F4/D7] outbound InvRsp → RDMAInvPort (Dst is peer GPU).
-	bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, rspToOutside)
+	// [R3] outbound InvRsp → dedicated InvRsp lane (Dst is peer GPU).
+	// Split from the request lane so InvReq backpressure on RDMAInvPort
+	// cannot HoL-block InvRsp drain.
+	bs.sendToRDMAInvRspQue = append(bs.sendToRDMAInvRspQue, rspToOutside)
 
 	port.RetrieveIncoming()
 
@@ -1144,21 +1184,27 @@ func (bs *bottomSender) sendBypassRspToTop() bool {
 	return true
 }
 
-// sendRemoteRspToTop은 Dst에 "RDMA"가 없는 remote 응답을 RDMAPort를 통해 전송한다.
+// sendRemoteRspToTop은 Dst에 "RDMA"가 없는 remote 응답을 RDMADataRspPort 를 통해 전송한다.
 // GPU[X].L2Cache.bottomPort 로부터 온 write eviction 응답 등이 해당된다.
+// [R2 BUGFIX] Use the new typed RDMADataRspPort. The legacy RDMAPort
+// is still allocated but its name is NOT registered into RDMAToCohDir
+// (only "RDMA" name string is plugged, but routing is by port-name
+// string which is "<cache>.RDMAPort"). DirectConnection cannot find
+// it, causing "port not found" panic. RDMADataRspPort is paired with
+// rdma.RDMADataRspInside on RDMAToCohDirForDataRsp, so messages route.
 func (bs *bottomSender) sendRemoteRspToTop() bool {
 	if len(bs.sendToRemoteTopQue) == 0 {
 		return false
 	}
 
-	if !bs.cache.RDMAPort.CanSend() {
+	if !bs.cache.RDMADataRspPort.CanSend() {
 		bs.cache.stallTopPortBusy++
 		return false
 	}
 
 	msg := bs.sendToRemoteTopQue[0]
-	msg.Meta().Src = bs.cache.RDMAPort.AsRemote()
-	err := bs.cache.RDMAPort.Send(msg)
+	msg.Meta().Src = bs.cache.RDMADataRspPort.AsRemote()
+	err := bs.cache.RDMADataRspPort.Send(msg)
 	if err != nil {
 		return false
 	}
@@ -1177,10 +1223,17 @@ func (bs *bottomSender) sendToTop() bool {
 	if bs.drainOneTypedQueue(&bs.sendToTopRspQue, bs.cache.topPort) {
 		progress = true
 	}
-	if bs.drainOneTypedQueue(&bs.sendToRDMADataRspQue, bs.cache.RDMAPort) {
+	// [R2 BUGFIX] sendToRDMADataRspQue drains via the typed RSP port
+	// (paired with rdma.RDMADataRspInside via RDMAToCohDirForDataRsp).
+	if bs.drainOneTypedQueue(&bs.sendToRDMADataRspQue, bs.cache.RDMADataRspPort) {
 		progress = true
 	}
 	if bs.drainOneTypedQueue(&bs.sendToRDMAInvQue, bs.cache.RDMAInvPort) {
+		progress = true
+	}
+	// [R3] Drain the InvRsp lane independently — same egress port but
+	// queue is type-pure so a stalled InvReq head cannot block it.
+	if bs.drainOneTypedQueue(&bs.sendToRDMAInvRspQue, bs.cache.RDMAInvPort) {
 		progress = true
 	}
 	return progress
@@ -1231,24 +1284,37 @@ func (bs *bottomSender) sendToBottom() bool {
 		}
 	}
 
+	// [R3] Local-bottom InvReq lane drained FIRST so data-path
+	// backpressure on bottomPort cannot starve invalidation traffic
+	// into our own L2. Queue is type-pure (only InvReq pushed here).
+	if len(bs.sendToBottomInvQue) > 0 {
+		head := bs.sendToBottomInvQue[0]
+		if !bs.canEmitInvToBottom() {
+			// budget exhausted; defer to next cycle
+		} else if bs.cache.bottomPort.CanSend() {
+			err := bs.cache.bottomPort.Send(head)
+			if err == nil {
+				bs.sendToBottomInvQue[0] = nil
+				bs.sendToBottomInvQue = bs.sendToBottomInvQue[1:]
+				bs.invEmittedToBottomThisCycle++
+				madeProgress = true
+			}
+		} else {
+			bs.cache.stallBottomPortBusy++
+		}
+	}
+
 	// 1. Remote Bottom 전송 (우선)
-	// Phase 2: per-cycle inv-emit budget. When head of queue is an
-	// InvReq AND the channel's budget is exhausted, defer to next
-	// cycle (HoL: non-inv messages behind cannot pass — models the
-	// directory's outgoing channel serialization).
+	// [R3] Queue is type-pure (data-only) after split — InvReq routed to
+	// sendToRemoteBottomInvQue at push-site. Runtime headIsInv check
+	// removed; per-cycle inv-emit budget no longer applies here.
 	if len(bs.sendToRemoteBottomQue) > 0 {
 		head := bs.sendToRemoteBottomQue[0]
-		_, headIsInv := head.(*mem.InvReq)
-		if headIsInv && !bs.canEmitInvToRDMA() {
-			// budget exhausted; defer to next cycle
-		} else if bs.cache.remoteBottomPort.CanSend() {
+		if bs.cache.remoteBottomPort.CanSend() {
 			err := bs.cache.remoteBottomPort.Send(head)
 			if err == nil {
 				bs.sendToRemoteBottomQue[0] = nil
 				bs.sendToRemoteBottomQue = bs.sendToRemoteBottomQue[1:]
-				if headIsInv {
-					bs.invEmittedToRDMAThisCycle++
-				}
 				madeProgress = true
 			}
 		} else {
@@ -1257,19 +1323,15 @@ func (bs *bottomSender) sendToBottom() bool {
 	}
 
 	// 2. Local Bottom 전송
+	// [R3] Queue is type-pure (data-only) after split — InvReq routed to
+	// sendToBottomInvQue at push-site. Runtime headIsInv check removed.
 	if len(bs.sendToBottomQue) > 0 {
 		head := bs.sendToBottomQue[0]
-		_, headIsInv := head.(*mem.InvReq)
-		if headIsInv && !bs.canEmitInvToBottom() {
-			// budget exhausted; defer to next cycle
-		} else if bs.cache.bottomPort.CanSend() {
+		if bs.cache.bottomPort.CanSend() {
 			err := bs.cache.bottomPort.Send(head)
 			if err == nil {
 				bs.sendToBottomQue[0] = nil
 				bs.sendToBottomQue = bs.sendToBottomQue[1:]
-				if headIsInv {
-					bs.invEmittedToBottomThisCycle++
-				}
 				madeProgress = true
 			}
 		} else {
@@ -1367,8 +1429,6 @@ func (bs *bottomSender) tooManyInflightInvalidationToBottom() bool {
 }
 
 func (bs *bottomSender) Reset() {
-	bs.cache.localBottomSenderBuffer.Clear()
-	bs.cache.remoteBottomSenderBuffer.Clear()
 	bs.cache.localBypassBuffer.Clear()
 
 	bs.localInflightRequest = nil
@@ -1382,10 +1442,18 @@ func (bs *bottomSender) Reset() {
 	bs.sendToTopRspQue = nil
 	bs.sendToRDMADataRspQue = nil
 	bs.sendToRDMAInvQue = nil
+	// [R3] clear new InvRsp + local-InvReq lanes.
+	bs.sendToRDMAInvRspQue = nil
+	bs.sendToBottomInvQue = nil
 	bs.sendToRemoteTopQue = nil
 	bs.sendToBottomQue = nil
 	bs.sendToRemoteBottomQue = nil
 	bs.sendToRemoteBottomInvQue = nil
+	// [R4] clear new split BSB buffers (data + inv class, both sides).
+	bs.cache.localBSBData.Clear()
+	bs.cache.localBSBInv.Clear()
+	bs.cache.remoteBSBData.Clear()
+	bs.cache.remoteBSBInv.Clear()
 	bs.sendToDirQue = nil
 	bs.bypassRspQue = nil
 	bs.numPeerInflightRequest = 0 // [ITER17 F5b]

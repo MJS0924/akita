@@ -32,7 +32,7 @@ func (s *mshrStage) processOneReq() bool {
 
 	blk := s.processingTrans.block
 	for _, trans := range s.processingTrans.mshrEntry.Requests {
-		if !s.cache.bottomSenderBuffer.CanPush() {
+		if !s.cache.bottomSenderTransBuffer.CanPush() {
 			if !progress {
 				s.returnFalse = "[processOneReq] Cannot push to bottomSenderBuffer"
 			}
@@ -43,7 +43,7 @@ func (s *mshrStage) processOneReq() bool {
 		t := trans.(*transaction)
 		blk.Sharer = s.appendSharer(t.accessReq().GetSrcRDMA(), blk.Sharer)
 		t.action = Nothing
-		s.cache.bottomSenderBuffer.Push(t)
+		s.cache.bottomSenderTransBuffer.Push(t)
 		progress = true
 	}
 

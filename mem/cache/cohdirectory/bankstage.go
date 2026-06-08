@@ -166,9 +166,9 @@ func (s *bankStage) pullFromBuf() bool {
 }
 
 func (s *bankStage) finalizeTrans() bool {
-	if !s.cache.bottomSenderBuffer.CanPush() || !s.cache.mshrStageBuffer.CanPush() {
+	if !s.cache.bottomSenderTransBuffer.CanPush() || !s.cache.mshrStageBuffer.CanPush() {
 
-		if !s.cache.bottomSenderBuffer.CanPush() {
+		if !s.cache.bottomSenderTransBuffer.CanPush() {
 			s.returnFalse0 = "Cannot push to bottomSenderBuffer"
 		} else {
 			s.returnFalse0 = "Cannot push to mshrStageBuffer"
@@ -190,7 +190,7 @@ func (s *bankStage) finalizeTrans() bool {
 			if trans.block != nil {
 				trans.block.IsLocked = false
 			}
-			s.cache.bottomSenderBuffer.Push(trans)
+			s.cache.bottomSenderTransBuffer.Push(trans)
 			done = true
 		case InsertNewEntry:
 			done = s.InsertNewEntry(trans)
@@ -225,7 +225,7 @@ func (s *bankStage) InsertNewEntry(trans *transaction) bool {
 	s.cache.directory.Visit(blk)
 	blk.IsLocked = false
 	// trans.action = Nothing
-	s.cache.bottomSenderBuffer.Push(trans)
+	s.cache.bottomSenderTransBuffer.Push(trans)
 	s.cache.mshrStageBuffer.Push(trans)
 
 	return true
@@ -237,7 +237,7 @@ func (s *bankStage) EvictAndInsertNewEntry(trans *transaction) bool {
 
 	s.cache.directory.Visit(blk)
 	blk.IsLocked = false
-	s.cache.bottomSenderBuffer.Push(trans)
+	s.cache.bottomSenderTransBuffer.Push(trans)
 	s.cache.mshrStageBuffer.Push(trans)
 
 	return true
@@ -250,7 +250,7 @@ func (s *bankStage) UpdateEntry(trans *transaction) bool {
 	s.cache.directory.Visit(blk)
 	blk.IsLocked = false
 	// trans.action = Nothing
-	s.cache.bottomSenderBuffer.Push(trans)
+	s.cache.bottomSenderTransBuffer.Push(trans)
 	s.cache.mshrStageBuffer.Push(trans)
 
 	return true
@@ -262,7 +262,7 @@ func (s *bankStage) InvalidateAndUpdateEntry(trans *transaction) bool {
 
 	s.cache.directory.Visit(blk)
 	blk.IsLocked = false
-	s.cache.bottomSenderBuffer.Push(trans)
+	s.cache.bottomSenderTransBuffer.Push(trans)
 	s.cache.mshrStageBuffer.Push(trans)
 
 	return true
@@ -273,7 +273,7 @@ func (s *bankStage) InvalidateEntry(trans *transaction) bool {
 	trans.invalidationList = blk.Sharer
 	blk.Sharer = blk.Sharer[:0]
 
-	s.cache.bottomSenderBuffer.Push(trans)
+	s.cache.bottomSenderTransBuffer.Push(trans)
 	blk.IsLocked = false
 
 	return true
@@ -319,7 +319,7 @@ func (s *bankStage) appendSharer(list []sim.RemotePort, sh sim.RemotePort) []sim
 // 		if t == trans {
 // 			blk.Sharer = append(blk.Sharer, t.accessReq().GetSrcRDMA())
 // 			t.action = Nothing
-// 			s.cache.bottomSenderBuffer.Push(t)
+// 			s.cache.bottomSenderTransBuffer.Push(t)
 // 		}
 // 	}
 

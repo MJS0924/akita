@@ -157,6 +157,15 @@ func (f *flusher) startProcessingFlush(
 		f.cache.discardInflightTransactions()
 		clearPort(f.cache.topPort)
 		clearPort(f.cache.bottomPort)
+		if f.cache.RDMAPort != nil {
+			clearPort(f.cache.RDMAPort)
+		}
+		if f.cache.RDMAInvPort != nil {
+			clearPort(f.cache.RDMAInvPort)
+		}
+		if f.cache.RDMAInvRspPort != nil {
+			clearPort(f.cache.RDMAInvRspPort)
+		}
 	}
 
 	f.cache.state = cacheStatePreFlushing
@@ -243,14 +252,25 @@ func (f *flusher) flushCompleted() bool {
 		}
 	}
 
-	if f.cache.bottomSenderBuffer.Size() > 0 {
-		// fmt.Printf("[%s]\tFlush not completed yet: bottomSenderBuffer. %d\n", f.cache.name, f.cache.bottomSenderBuffer.Size())
+	if f.cache.bottomSenderTransBuffer.Size() > 0 {
+		return false
+	}
+	if f.cache.bottomSenderInvBuffer.Size() > 0 {
 		return false
 	}
 
+	// [ITER19b D3] Egress typed queues must drain.
+	if len(f.cache.bottomSender.sendToTopRspQue) > 0 ||
+		len(f.cache.bottomSender.sendToRDMAQue) > 0 ||
+		len(f.cache.bottomSender.sendToRDMAInvQue) > 0 ||
+		len(f.cache.bottomSender.sendToRDMAInvRspQue) > 0 {
+		return false
+	}
+
+	// [ITER19b LATENT] inflightInvToBottom missing today.
 	if len(f.cache.bottomSender.inflightRequest) > 0 ||
-		len(f.cache.bottomSender.inflightInvToOutside) > 0 {
-		// fmt.Printf("[%s]\tFlush not completed yet: inflightRequest %d, inflightInvToOutside %d\n", f.cache.name, len(f.cache.bottomSender.inflightRequest), len(f.cache.bottomSender.inflightInvToOutside))
+		len(f.cache.bottomSender.inflightInvToOutside) > 0 ||
+		len(f.cache.bottomSender.inflightInvToBottom) > 0 {
 		return false
 	}
 

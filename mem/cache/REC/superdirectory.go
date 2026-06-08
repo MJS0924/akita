@@ -35,9 +35,22 @@ type Comp struct {
 	remoteBottomPort sim.Port
 	controlPort      sim.Port
 	RDMAPort         sim.Port
+	// [R2] Split peer-facing data ingress into REQ vs RSP ports so a
+	// stalled REQ stream cannot HoL-block returning RSPs (and vice
+	// versa).  Paired with R1's split RDMA outside ports
+	// (RDMADataReqInside / RDMADataRspInside).  RDMAPort is retained
+	// only as a legacy field; new traffic flows through the split
+	// ports.
+	RDMADataReqPort  sim.Port
+	RDMADataRspPort  sim.Port
+	// RDMAInvPort is conceptually the InvReq ingress (carried under
+	// the historical iter7 field name); RDMAInvRspPort is the InvRsp
+	// ingress added in iter7.
 	RDMAInvPort      sim.Port
 	RDMAInvRspPort   sim.Port
 	ToRDMA           sim.RemotePort
+	ToRDMADataReq    sim.RemotePort // [R2] paired with R1 RDMADataReqInside
+	ToRDMADataRsp    sim.RemotePort // [R2] paired with R1 RDMADataRspInside
 	ToRDMAInv        sim.RemotePort
 	ToRDMAInvRsp     sim.RemotePort
 
@@ -53,13 +66,29 @@ type Comp struct {
 	localMshrStageBuffer  sim.Buffer
 	remoteMshrStageBuffer sim.Buffer
 
-	localBottomSenderBuffer  sim.Buffer
-	remoteBottomSenderBuffer sim.Buffer
+	// [R4] BottomSenderBuffer split by trans.action class to avoid HoL
+	// blocking between data-path trans (Nothing/InsertNewEntry/UpdateEntry)
+	// and inv-path trans (EvictAndInsertNewEntry/InvalidateEntry/
+	// InvalidateAndUpdateEntry/RemoteWriteHitPreserveWriter). Inv-path
+	// trans can stall on inflightInvToOutside / maxInflightInvalidation
+	// caps; before the split, that stall HoL-blocked data-path trans at
+	// the BSB head, dropping useful work behind unrelated inv pressure.
+	// processInputReq drains both classes per tick (inv first within each
+	// side, remote-side first overall to preserve cross-GPU progress).
+	localBSBData  sim.Buffer
+	localBSBInv   sim.Buffer
+	remoteBSBData sim.Buffer
+	remoteBSBInv  sim.Buffer
 
 	writeBufferToBankBuffers sim.Buffer
 	invReqBuffer             sim.Buffer
 	invRspBuffer             sim.Buffer
 	localBypassBuffer        sim.Buffer // [추가] Local-to-Local Read 전용 고속 우회 버퍼
+	// [R2] Dedicated drain target for the RDMADataRspPort topparser
+	// loop.  Returning peer data RSPs land here so they are isolated
+	// from data REQ flow (remoteDirStageBuffer) and INV traffic
+	// (invReqBuffer / invRspBuffer).
+	remoteBypassBuffer sim.Buffer
 
 	topParser    *topParser
 	bottomSender *bottomSender

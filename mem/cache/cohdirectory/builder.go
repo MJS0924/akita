@@ -40,7 +40,9 @@ type Builder struct {
 
 	addressMapperType string
 
-	ToRDMA sim.RemotePort
+	ToRDMA       sim.RemotePort
+	ToRDMAInv    sim.RemotePort
+	ToRDMAInvRsp sim.RemotePort
 
 	dirtyMask *[]map[vm.PID]map[uint64][]uint8
 	readMask  *[]map[vm.PID]map[uint64][]uint8
@@ -216,6 +218,20 @@ func (b Builder) WithToRDMA(port sim.RemotePort) Builder {
 	return b
 }
 
+// WithToRDMAInv sets the remote endpoint that outbound InvReqs are
+// addressed to (D1 / port iter7). Mirrors SD/optDir builder API.
+func (b Builder) WithToRDMAInv(port sim.RemotePort) Builder {
+	b.ToRDMAInv = port
+	return b
+}
+
+// WithToRDMAInvRsp sets the remote endpoint that outbound InvRsps are
+// addressed to (D1 / port iter7). Mirrors SD/optDir builder API.
+func (b Builder) WithToRDMAInvRsp(port sim.RemotePort) Builder {
+	b.ToRDMAInvRsp = port
+	return b
+}
+
 func (b Builder) WithDirtyMask(mask *[]map[vm.PID]map[uint64][]uint8) Builder {
 	b.dirtyMask = mask
 	return b
@@ -307,8 +323,21 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
 		cache.Name()+".RDMAPort")
 	cache.AddPort("RDMAPort", cache.RDMAPort)
+	cache.AddPort("RDMA", cache.RDMAPort)
+
+	cache.RDMAInvPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMAInvPort")
+	cache.AddPort("RDMAInv", cache.RDMAInvPort)
+
+	cache.RDMAInvRspPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMAInvRspPort")
+	cache.AddPort("RDMAInvRsp", cache.RDMAInvRspPort)
 
 	cache.ToRDMA = b.ToRDMA
+	cache.ToRDMAInv = b.ToRDMAInv
+	cache.ToRDMAInvRsp = b.ToRDMAInvRsp
 }
 
 func (b *Builder) createInternalStages(cache *Comp) {
@@ -396,8 +425,12 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 		cache.Name()+".MSHRStageBuffer",
 		cache.numReqPerCycle,
 	)
-	cache.bottomSenderBuffer = sim.NewBuffer(
-		cache.Name()+".BottomSenderBuffer",
+	cache.bottomSenderTransBuffer = sim.NewBuffer(
+		cache.Name()+".BottomSenderTransBuffer",
+		cache.numReqPerCycle,
+	)
+	cache.bottomSenderInvBuffer = sim.NewBuffer(
+		cache.Name()+".BottomSenderInvBuffer",
 		cache.numReqPerCycle,
 	)
 	cache.invRspBuffer = sim.NewBuffer(

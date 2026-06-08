@@ -235,14 +235,30 @@ func (f *flusher) flushCompleted() bool {
 		return false
 	}
 
-	if f.cache.localBottomSenderBuffer.Size() > 0 || f.cache.remoteBottomSenderBuffer.Size() > 0 {
+	// [R4] Check all four split BSB lanes (Data + Inv, both sides).
+	if f.cache.localBSBData.Size() > 0 || f.cache.localBSBInv.Size() > 0 ||
+		f.cache.remoteBSBData.Size() > 0 || f.cache.remoteBSBInv.Size() > 0 {
 		return false
 	}
 
-	// [수정] 양방향 Inflight Request 리스트 확인
+	// [ITER19b R3] Egress typed queues — must all drain before declaring
+	// flush done. Previously only the singular sendToBottomQue (or shared
+	// sendToRDMAInvQue) was implicit through inflightInvToOutside. After R3
+	// split, each queue can hold messages that haven't moved to the port
+	// yet, and a flush completion that misses them would silently drop them.
+	if len(f.cache.bottomSender.sendToBottomQue) > 0 ||
+		len(f.cache.bottomSender.sendToBottomInvQue) > 0 ||
+		len(f.cache.bottomSender.sendToRDMAInvQue) > 0 ||
+		len(f.cache.bottomSender.sendToRDMAInvRspQue) > 0 {
+		return false
+	}
+
+	// [ITER19b LATENT] inflightInvToBottom missing today — the inv REQ
+	// dispatched toward local L2 must complete before flush declares done.
 	if len(f.cache.bottomSender.localInflightRequest) > 0 ||
 		len(f.cache.bottomSender.remoteInflightRequest) > 0 ||
-		len(f.cache.bottomSender.inflightInvToOutside) > 0 {
+		len(f.cache.bottomSender.inflightInvToOutside) > 0 ||
+		len(f.cache.bottomSender.inflightInvToBottom) > 0 {
 		return false
 	}
 

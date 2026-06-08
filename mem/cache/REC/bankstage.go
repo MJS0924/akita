@@ -191,24 +191,33 @@ func (s *bankStage) pullFromBuf(isLocal bool) bool {
 
 func (s *bankStage) finalizeTrans(isLocal bool) bool {
 	var postBuf *bufferImpl
-	var bottomSenderBuf sim.Buffer
+	var bsbData sim.Buffer
+	var bsbInv sim.Buffer
 	var mshrStageBuf sim.Buffer
 
 	// 목적지 버퍼 라우팅
 	if isLocal {
 		postBuf = s.localPostPipelineBuf
-		bottomSenderBuf = s.cache.localBottomSenderBuffer
+		bsbData = s.cache.localBSBData
+		bsbInv = s.cache.localBSBInv
 		mshrStageBuf = s.cache.localMshrStageBuffer
 	} else {
 		postBuf = s.remotePostPipelineBuf
-		bottomSenderBuf = s.cache.remoteBottomSenderBuffer
+		bsbData = s.cache.remoteBSBData
+		bsbInv = s.cache.remoteBSBInv
 		mshrStageBuf = s.cache.remoteMshrStageBuffer
 	}
 
-	if !bottomSenderBuf.CanPush() {
+	// [R4] Conservative admission: require headroom on BOTH BSB classes
+	// before draining post-pipeline, because the action handlers below
+	// dispatch into either lane and we cannot peek the action without
+	// popping. Cheap (1-slot CanPush check) and avoids per-elem stall.
+	if !bsbData.CanPush() || !bsbInv.CanPush() {
 		s.cache.stallBottomBufFull++
 		return false
 	}
+	// bottomSenderBuf chosen per-elem below by trans.action.
+	bottomSenderBuf := bsbData
 	if !mshrStageBuf.CanPush() {
 		s.cache.stallMshrBufFull++
 		return false
@@ -227,6 +236,19 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 
 		done := false
 
+		// [R4] Pick BSB class by action: Data for read/no-inv paths,
+		// Inv for evict/invalidate paths. Selection precedes the action
+		// dispatch below so all *bottomSenderBuf.Push(...) calls hit the
+		// correct lane without further changes to handlers.
+		switch trans.action {
+		case EvictAndInsertNewEntry,
+			InvalidateAndUpdateEntry,
+			InvalidateEntry,
+			RemoteWriteHitPreserveWriter:
+			bottomSenderBuf = bsbInv
+		default:
+			bottomSenderBuf = bsbData
+		}
 		switch trans.action {
 		case Nothing:
 			// Defensive handler: the directorystage fast-path now drops

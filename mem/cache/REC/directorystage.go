@@ -254,9 +254,11 @@ func (ds *directoryStage) doWriteHit(
 		// trivial sharer-list append (no MSHR, no sub-entry lock, no
 		// bank-pipeline traversal). Without this path, the per-sub-entry
 		// tracking required by REC inflates dir_avg_latency to ~78ns.
-		targetBuffer := ds.cache.localBottomSenderBuffer
+		// [R4] Read-hit fast-path is Data-class only (action is Nothing or
+		// UpdateEntry — sharer-list append, no inv emission). Push to BSBData.
+		targetBuffer := ds.cache.localBSBData
 		if !isLocal {
-			targetBuffer = ds.cache.remoteBottomSenderBuffer
+			targetBuffer = ds.cache.remoteBSBData
 		}
 		if !targetBuffer.CanPush() {
 			*ds.returnFalse += "Cannot push to bottom sender buffer (read-hit fast-path)"
@@ -312,9 +314,15 @@ func (ds *directoryStage) doWriteHit(
 		trans.evictingPID = block.PID
 	}
 
-	targetBuffer := ds.cache.localBottomSenderBuffer
+	// [R4] doWriteHit fast-path reaches the push-site only when
+	// trans.action is Nothing (write hit with full permission — no inv
+	// needed). Inv-class actions (InvalidateAndUpdateEntry,
+	// RemoteWriteHitPreserveWriter) fall through to writeToBank ->
+	// bankstage, which routes them to BSBInv. So this push-site is
+	// pure Data-class.
+	targetBuffer := ds.cache.localBSBData
 	if !isLocal {
-		targetBuffer = ds.cache.remoteBottomSenderBuffer
+		targetBuffer = ds.cache.remoteBSBData
 	}
 	if trans.action == Nothing {
 		if !targetBuffer.CanPush() {
@@ -334,9 +342,11 @@ func (ds *directoryStage) doWriteHit(
 
 func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
 	*ds.returnFalse += "[doWriteMiss] "
-	targetBuffer := ds.cache.localBottomSenderBuffer
+	// [R4] doWriteMiss local-write fast-path: action forced to Nothing
+	// (no directory entry added for local-write miss) -> Data-class.
+	targetBuffer := ds.cache.localBSBData
 	if !isLocal {
-		targetBuffer = ds.cache.remoteBottomSenderBuffer
+		targetBuffer = ds.cache.remoteBSBData
 	}
 	if trans.fromLocal { // local write request에 대해 directory miss 발생 시, entry 추가 안 함
 		trans.action = Nothing

@@ -57,7 +57,11 @@ type bottomSender struct {
 	// [ITER18 F4/D7] split sendToTopQue by egress port (mirrors REC).
 	sendToTopRspQue       []sim.Msg
 	sendToRDMADataRspQue  []sim.Msg
-	sendToRDMAInvQue      []sim.Msg
+	sendToRDMAInvQue      []sim.Msg // outbound InvReq → RDMAInvPort
+	// S1 (ported from SD): outbound InvRsp split off from sendToRDMAInvQue.
+	// Drained via the new RDMAInvRspOutPort; complies with RDMA's
+	// contract (processFromInvInside panics on InvRsp).
+	sendToRDMAInvRspQue   []sim.Msg // outbound InvRsp → RDMAInvRspOutPort
 	sendToRemoteTopQue    []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
 	bypassRspQue          []sim.Msg
 
@@ -793,8 +797,10 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 		WithRspTo(req.ReqFrom).
 		Build()
 
-	// [ITER18 F4/D7] outbound InvRsp → RDMAInvPort.
-	bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, rspToOutside)
+	// S1 (ported from SD): outbound InvRsp → RDMAInvRspOutPort
+	// (RDMA's processFromInvInside panics on InvRsp; only
+	// RDMAInvRspInside accepts InvRsp).
+	bs.sendToRDMAInvRspQue = append(bs.sendToRDMAInvRspQue, rspToOutside)
 	port.RetrieveIncoming()
 
 	// [핵심 추가] 처리가 완료된 트랜잭션을 Inflight 배열에서 안전하게 삭제합니다.
@@ -1014,6 +1020,12 @@ func (bs *bottomSender) sendToTop() bool {
 	if bs.drainOneTypedQueue(&bs.sendToRDMAInvQue, bs.cache.RDMAInvPort) {
 		progress = true
 	}
+	// S1 (ported from SD): drain outbound InvRsp via the dedicated egress
+	// port. Split from sendToRDMAInvQue removes HoL stall under outbound
+	// InvReq bursts and complies with RDMA's contract.
+	if bs.drainOneTypedQueue(&bs.sendToRDMAInvRspQue, bs.cache.RDMAInvRspOutPort) {
+		progress = true
+	}
 	return progress
 }
 
@@ -1167,6 +1179,8 @@ func (bs *bottomSender) Reset() {
 	bs.sendToTopRspQue = nil
 	bs.sendToRDMADataRspQue = nil
 	bs.sendToRDMAInvQue = nil
+	// S1 (ported from SD): clear outbound InvRsp egress queue.
+	bs.sendToRDMAInvRspQue = nil
 	bs.numPeerInflightRequest = 0
 	bs.sendToRemoteTopQue = nil
 	bs.sendToBottomQue = nil

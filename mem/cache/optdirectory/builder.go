@@ -367,6 +367,12 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.Name()+".ToTop")
 	cache.AddPort("Top", cache.topPort)
 
+	// D4 (ported from SD): L1-facing dedicated InvRsp ingress.
+	cache.topInvRspPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".TopInvRspPort")
+	cache.AddPort("TopInvRsp", cache.topInvRspPort)
+
 	cache.bottomPort = sim.NewPort(cache,
 		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
 		cache.Name()+".BottomPort")
@@ -399,6 +405,15 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
 		cache.Name()+".RDMAInvRspPort")
 	cache.AddPort("RDMAInvRsp", cache.RDMAInvRspPort)
+
+	// S1 (ported from SD): dedicated egress port for outbound InvRsp.
+	// Splits outbound InvRsp out of sendToRDMAInvQue and routes it to
+	// RDMAInvRspInside (RDMA's processFromInvInside panics on InvRsp;
+	// only RDMAInvRspInside accepts InvRsp).
+	cache.RDMAInvRspOutPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMAInvRspOutPort")
+	cache.AddPort("RDMAInvRspOut", cache.RDMAInvRspOutPort)
 
 	cache.ToRDMA = b.ToRDMA
 }

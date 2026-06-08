@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -28,21 +29,53 @@ func (p *topParser) Tick() bool {
 		progress = true
 	}
 
-	req = p.cache.RDMAPort.PeekIncoming()
+	// [R2] 4 typed peek/dispatch loops, each draining to its specific
+	// downstream buffer.  Replaces the previous single RDMAPort poll that
+	// mixed data REQ, data RSP, INV REQ, INV RSP traffic.  Each port is
+	// paired with R1's split RDMA outside ports
+	// (RDMADataReqInside / RDMADataRspInside / RDMAInvInside / RDMAInvRspInside).
+	//
+	// Rate-limit: 1 msg per Tick per port (matches the previous design).
+
+	// 1. Peer data REQ ingress → remoteDirStageBuffer (via processReq fast path).
+	req = p.cache.RDMADataReqPort.PeekIncoming()
+	// [iter7 contract] The peer data REQ ingress is REQ-only
+	// (Read/Write). Invalidation traffic is split off to RDMAInvPort
+	// (InvReq) and RDMAInvRspPort (InvRsp). Any Inv* message arriving
+	// here violates the wiring contract — fail loudly instead of
+	// silently routing.
+	if req != nil {
+		switch req.(type) {
+		case *mem.InvReq, *mem.InvRsp:
+			panic("RDMADataReqPort is REQ-only by contract")
+		}
+	}
 	if p.processReq(req, false) {
-		p.cache.RDMAPort.RetrieveIncoming()
+		p.cache.RDMADataReqPort.RetrieveIncoming()
 		progress = true
 	}
 
+	// 2. Peer data RSP ingress → remoteBypassBuffer.  RSPs returning to
+	// REC from a peer must not contend with REQ ingress for the same
+	// physical port; isolating them prevents a stalled REQ backlog from
+	// HoL-blocking RSP delivery.
+	req = p.cache.RDMADataRspPort.PeekIncoming()
+	if p.processRDMADataRsp(req) {
+		p.cache.RDMADataRspPort.RetrieveIncoming()
+		progress = true
+	}
+
+	// 3. Inv REQ ingress (conceptually RDMAInvReqPort; kept under the
+	// historical RDMAInvPort field name from iter7) → invReqBuffer.
 	req = p.cache.RDMAInvPort.PeekIncoming()
 	if p.processReq(req, false) {
 		p.cache.RDMAInvPort.RetrieveIncoming()
 		progress = true
 	}
 
-	// D1 (ported from SD 307dbe6): drain the dedicated InvRsp ingress.
-	// Isolated from RDMAInvPort's InvReq backlog so it cannot be
-	// head-blocked by a full invReqBuffer.
+	// 4. Inv RSP ingress (iter7) → invRspBuffer.  Isolated from
+	// RDMAInvPort's InvReq backlog so it cannot be head-blocked by a
+	// full invReqBuffer.
 	req = p.cache.RDMAInvRspPort.PeekIncoming()
 	if p.processReq(req, false) {
 		p.cache.RDMAInvRspPort.RetrieveIncoming()
@@ -52,12 +85,44 @@ func (p *topParser) Tick() bool {
 	return progress
 }
 
+// processRDMADataRsp drains the RDMADataRspPort head into the dedicated
+// remoteBypassBuffer.  Returning false leaves the message at the port
+// head so back-pressure propagates upstream (R1's RDMADataRspInside).
+func (p *topParser) processRDMADataRsp(req sim.Msg) bool {
+	if req == nil {
+		return false
+	}
+	if !p.cache.remoteBypassBuffer.CanPush() {
+		p.returnFalse = "Cannot push to remoteBypassBuffer"
+		return false
+	}
+	p.cache.remoteBypassBuffer.Push(req)
+	return true
+}
+
 func (p *topParser) processReq(req sim.Msg, fromLocal bool) bool {
 	if req == nil {
 		return false
 	}
 
 	if p.cache.flushLocalAccess && !strings.Contains(fmt.Sprintf("%s", req.Meta().Src), "RDMA") {
+		// [C2 observability] Per-PID drop counter for flushable
+		// local-origin trans silently dropped during the migration
+		// flush window. No semantic change — just makes the drop
+		// volume observable. PID extraction is best-effort: AccessReq
+		// (Read/Write) and InvReq expose GetPID(); other types (e.g.
+		// InvRsp) bucket under PID(0).
+		var pid vm.PID
+		switch r := req.(type) {
+		case *mem.ReadReq:
+			pid = r.GetPID()
+		case *mem.WriteReq:
+			pid = r.GetPID()
+		case *mem.InvReq:
+			pid = r.GetPID()
+		}
+		p.cache.bottomSender.flushDropCount[pid]++
+
 		p.cache.topPort.RetrieveIncoming()
 
 		return false

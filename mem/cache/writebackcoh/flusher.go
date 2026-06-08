@@ -230,14 +230,40 @@ func (f *flusher) flushCompleted() bool {
 		}
 	}
 
+	// [ITER19b R5] writeBufferToBankBuffers split into Req + Rsp halves.
+	// Both must be drained — Req side carries peer-bypass/regular admit
+	// pushes; Rsp side carries fetched-data and DataReadyRsp pushes.
+	// PRE-iter19 this slice was never checked at all (latent bug).
+	for _, b := range f.cache.writeBufferToBankBuffersReq {
+		if b.Size() > 0 {
+			return false
+		}
+	}
+	for _, b := range f.cache.writeBufferToBankBuffersRsp {
+		if b.Size() > 0 {
+			return false
+		}
+	}
+
+	// [ITER19b LATENT] pure-fetch ingress from dirStage.fetch().
+	if f.cache.writeBufferFetchBuffer.Size() > 0 {
+		return false
+	}
+
 	for _, b := range f.cache.bankStages {
 		if b.inflightTransCount > 0 {
 			return false
 		}
 	}
 
-	// [ITER13 fix #2] sum both split buffers.
+	// [ITER13 fix #2] sum both split eviction-ingress buffers.
 	if f.cache.writeBufferBufferTotalSize() > 0 {
+		return false
+	}
+
+	// [ITER19b LATENT] mshrStageBuffer was split earlier; check both halves.
+	if f.cache.mshrStageBuffer.Size() > 0 ||
+		f.cache.mshrStageBufferRemote.Size() > 0 {
 		return false
 	}
 
@@ -246,6 +272,18 @@ func (f *flusher) flushCompleted() bool {
 		// [ITER10] check both split pending queues.
 		len(f.cache.writeBuffer.pendingLocalEvictions) > 0 ||
 		len(f.cache.writeBuffer.pendingRemoteEvictions) > 0 {
+		return false
+	}
+
+	// [ITER19b R6] pendingDataReady / pendingWriteDone split into
+	// Local + Remote halves. Pre-R6 the single queues were never checked
+	// here, allowing a DataReadyRsp / WriteDoneRsp to sit at ingress while
+	// flushCompleted returned true (silent transaction loss). Post-R6 both
+	// halves must drain before the flush is declared complete.
+	if len(f.cache.writeBuffer.pendingDataReadyLocal) > 0 ||
+		len(f.cache.writeBuffer.pendingDataReadyRemote) > 0 ||
+		len(f.cache.writeBuffer.pendingWriteDoneLocal) > 0 ||
+		len(f.cache.writeBuffer.pendingWriteDoneRemote) > 0 {
 		return false
 	}
 

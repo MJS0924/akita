@@ -27,7 +27,27 @@ func (p *topParser) Tick() bool {
 		progress = true
 	}
 
+	// D4 (ported from SD): dedicated L1-facing InvRsp ingress. L1's
+	// InvRsp lands here instead of topPort, so a full localBypassBuffer
+	// behind a queued ReadReq does not head-block InvRsp delivery.
+	// Mirror of D1 on the L1-facing side.
+	req = p.cache.topInvRspPort.PeekIncoming()
+	if p.processReq(req, true) {
+		p.cache.topInvRspPort.RetrieveIncoming()
+		progress = true
+	}
+
 	req = p.cache.RDMAPort.PeekIncoming()
+	// [iter7 contract] RDMAPort is REQ-only (Read/Write).
+	// Invalidation traffic is split off to RDMAInvPort (InvReq) and
+	// RDMAInvRspPort (InvRsp). Any Inv* message arriving here violates
+	// the wiring contract — fail loudly instead of silently routing.
+	if req != nil {
+		switch req.(type) {
+		case *mem.InvReq, *mem.InvRsp:
+			panic("RDMAPort is REQ-only by contract")
+		}
+	}
 	if p.processReq(req, false) {
 		p.cache.RDMAPort.RetrieveIncoming()
 		progress = true

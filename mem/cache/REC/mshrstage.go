@@ -58,12 +58,13 @@ func (s *mshrStage) processOneReq() bool {
 		req := trans.mshrEntry.Requests[0]
 		t := req.(*transaction)
 
-		// [수정] 트랜잭션 출처에 따라 전송할 타겟 버퍼 분기
+		// [R4] mshrStage emits Nothing or UpdateEntry only (see action set
+		// at L74/L76 below) — both are Data-class. Push to BSBData.
 		var targetBuf sim.Buffer
 		if t.fromLocal {
-			targetBuf = s.cache.localBottomSenderBuffer
+			targetBuf = s.cache.localBSBData
 		} else {
-			targetBuf = s.cache.remoteBottomSenderBuffer
+			targetBuf = s.cache.remoteBSBData
 		}
 
 		if !targetBuf.CanPush() {

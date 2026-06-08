@@ -45,6 +45,16 @@ type Comp struct {
 	deviceID int
 
 	topPort          sim.Port
+	// D4: dedicated L1-facing InvRsp ingress. L1 sends InvRsp back to
+	// the directory using `WithDst(req.Src)` where req.Src was set to
+	// this port's AsRemote() (see bottomSender sendInvalidationRequest /
+	// sendInvalidationRequestByWrite / processInvalidationReq). Without
+	// this split, L1's InvRsp competed with ReadReq at topPort's FIFO;
+	// when localBypassBuffer was full, an L1 ReadReq stalled at the head
+	// blocked InvRsp delivery → inflightInvToOutside never drained →
+	// cross-GPU backpressure (mirror of D1's RDMA-side split, but on
+	// the L1-facing side).
+	topInvRspPort    sim.Port
 	bottomPort       sim.Port
 	remoteBottomPort sim.Port
 	controlPort      sim.Port
@@ -58,6 +68,13 @@ type Comp struct {
 	// win=495 when useRsbHintAlloc=true triggers coarse-alloc InvReq
 	// broadcast bursts).
 	RDMAInvRspPort   sim.Port
+	// S1: dedicated egress port for outbound InvRsp (peer-bound). The
+	// old design drained outbound InvRsp via RDMAInvPort (shared with
+	// outbound InvReq); under a broadcast InvReq burst, the InvRsp
+	// behind queued InvReqs at sendToRDMAInvQue suffered HoL stall.
+	// Splitting the queue + draining via this port lets InvRsp egress
+	// proceed independently of InvReq backpressure.
+	RDMAInvRspOutPort sim.Port
 	ToRDMA           sim.RemotePort
 	ToRDMAInv        sim.RemotePort
 	// D1: remote-side endpoint name for the new InvRsp channel; set by

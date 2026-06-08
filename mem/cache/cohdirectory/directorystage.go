@@ -186,10 +186,10 @@ func (ds *directoryStage) doWriteHit(
 			// branch. (readPermission only ever returns true for
 			// remote reads after the Meta().Src→GetSrcRDMA fix.)
 			trans.action = Nothing
-			if !ds.cache.bottomSenderBuffer.CanPush() {
+			if !ds.cache.bottomSenderTransBuffer.CanPush() {
 				return false
 			}
-			ds.cache.bottomSenderBuffer.Push(trans)
+			ds.cache.bottomSenderTransBuffer.Push(trans)
 			return true
 		}
 		trans.action = UpdateEntry
@@ -208,11 +208,11 @@ func (ds *directoryStage) doWriteHit(
 
 	if trans.action == Nothing {
 		// if ds.isFromLocal(trans) {
-		if !ds.cache.bottomSenderBuffer.CanPush() {
+		if !ds.cache.bottomSenderTransBuffer.CanPush() {
 			return false
 		}
 
-		ds.cache.bottomSenderBuffer.Push(trans)
+		ds.cache.bottomSenderTransBuffer.Push(trans)
 		return true
 	}
 
@@ -223,10 +223,10 @@ func (ds *directoryStage) doWriteMiss(trans *transaction) bool {
 	// if ds.isFromLocal(trans) { // local write request에 대해 directory miss 발생 시, entry 추가 안 함
 	if trans.fromLocal { // local write request에 대해 directory miss 발생 시, entry 추가 안 함
 		trans.action = Nothing
-		if !ds.cache.bottomSenderBuffer.CanPush() {
+		if !ds.cache.bottomSenderTransBuffer.CanPush() {
 			return false
 		}
-		ds.cache.bottomSenderBuffer.Push(trans)
+		ds.cache.bottomSenderTransBuffer.Push(trans)
 		return true
 	}
 

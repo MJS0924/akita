@@ -33,12 +33,21 @@ type Comp struct {
 	deviceID int
 
 	topPort          sim.Port
+	// D4 (ported from SD): dedicated L1-facing InvRsp ingress so L1's
+	// InvRsp is not head-blocked by a full localBypassBuffer behind a
+	// queued ReadReq at topPort. Mirror of D1 on the L1-facing side.
+	topInvRspPort    sim.Port
 	bottomPort       sim.Port
 	remoteBottomPort sim.Port
 	controlPort      sim.Port
 	RDMAPort         sim.Port
 	RDMAInvPort      sim.Port
 	RDMAInvRspPort   sim.Port
+	// S1 (ported from SD): dedicated egress port for outbound InvRsp.
+	// Separates outbound InvRsp from outbound InvReq (sendToRDMAInvQue),
+	// and complies with RDMA's contract: processFromInvInside panics
+	// on InvRsp; only RDMAInvRspInside accepts InvRsp.
+	RDMAInvRspOutPort sim.Port
 	ToRDMA           sim.RemotePort
 	ToRDMAInv        sim.RemotePort
 	ToRDMAInvRsp     sim.RemotePort

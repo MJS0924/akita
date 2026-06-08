@@ -92,8 +92,18 @@ type writeBufferStage struct {
 	// Caps match the actual port buffer (4 each) so total cache buffer
 	// stays nearly unchanged — invalidation/write-through cost models
 	// are not affected.
-	pendingDataReady []*mem.DataReadyRsp
-	pendingWriteDone []*mem.WriteDoneRsp
+	// [R6] Pending bottomPort responses split into Local / Remote halves
+	// keyed by trans.fromLocal (for DataReadyRsp via inflightFetch) and
+	// e.evictionToLocal — actually trans.fromLocal — (for WriteDoneRsp
+	// via inflightEviction). Without the split, a Local DataReadyRsp at
+	// head that needs a full Local-side bankBuf stalls behind it the
+	// Remote DataReadyRsp that could otherwise progress (and vice versa),
+	// re-introducing the cross-GPU symmetric-stall the bottomPort typed
+	// queues were meant to break.
+	pendingDataReadyLocal  []*mem.DataReadyRsp
+	pendingDataReadyRemote []*mem.DataReadyRsp
+	pendingWriteDoneLocal  []*mem.WriteDoneRsp
+	pendingWriteDoneRemote []*mem.WriteDoneRsp
 
 	// [ITER12 INSTRUMENTATION] Track the last reason that
 	// processWriteBufferEvictAndWrite (admit-side) returned false. This
@@ -164,9 +174,31 @@ func (wb *writeBufferStage) drainBottomTyped() bool {
 
 	switch m := msg.(type) {
 	case *mem.DataReadyRsp:
-		wb.pendingDataReady = append(wb.pendingDataReady, m)
+		// [R6] Classify by inflightFetch lookup; if it matches a
+		// known fromLocal trans, route to Local lane, else Remote.
+		// Prefetch responses (no matching inflightFetch) default to
+		// Local — they don't sit on the cross-GPU critical path.
+		trans := wb.findInflightFetchByFetchReadReqID(m.RespondTo)
+		if trans != nil && !trans.fromLocal {
+			wb.pendingDataReadyRemote = append(wb.pendingDataReadyRemote, m)
+		} else {
+			wb.pendingDataReadyLocal = append(wb.pendingDataReadyLocal, m)
+		}
 	case *mem.WriteDoneRsp:
-		wb.pendingWriteDone = append(wb.pendingWriteDone, m)
+		// [R6] Classify by inflightEviction lookup using
+		// e.evictionWriteReq.ID. Route by trans.fromLocal.
+		var fromLocal = true
+		for _, e := range wb.inflightEviction {
+			if e.evictionWriteReq != nil && e.evictionWriteReq.ID == m.RespondTo {
+				fromLocal = e.fromLocal
+				break
+			}
+		}
+		if fromLocal {
+			wb.pendingWriteDoneLocal = append(wb.pendingWriteDoneLocal, m)
+		} else {
+			wb.pendingWriteDoneRemote = append(wb.pendingWriteDoneRemote, m)
+		}
 	default:
 		panic("unknown msg type on bottomPort")
 	}
@@ -176,27 +208,44 @@ func (wb *writeBufferStage) drainBottomTyped() bool {
 }
 
 func (wb *writeBufferStage) processPendingDataReady() bool {
-	if len(wb.pendingDataReady) == 0 {
+	// [R6] Drain Remote half first (peer-incoming priority) — mirrors
+	// dirToBankBuffersRemote and writeBufferBufferRemote precedent.
+	if len(wb.pendingDataReadyRemote) > 0 {
+		head := wb.pendingDataReadyRemote[0]
+		if wb.tryProcessDataReadyRsp(head) {
+			wb.pendingDataReadyRemote = wb.pendingDataReadyRemote[1:]
+			return true
+		}
+		return false
+	}
+	if len(wb.pendingDataReadyLocal) == 0 {
 		return false
 	}
 
-	head := wb.pendingDataReady[0]
+	head := wb.pendingDataReadyLocal[0]
 	if !wb.tryProcessDataReadyRsp(head) {
 		return false
 	}
 
-	wb.pendingDataReady = wb.pendingDataReady[1:]
+	wb.pendingDataReadyLocal = wb.pendingDataReadyLocal[1:]
 	return true
 }
 
 func (wb *writeBufferStage) processPendingWriteDone() bool {
-	if len(wb.pendingWriteDone) == 0 {
+	// [R6] Drain Remote half first.
+	if len(wb.pendingWriteDoneRemote) > 0 {
+		head := wb.pendingWriteDoneRemote[0]
+		wb.applyWriteDoneRsp(head)
+		wb.pendingWriteDoneRemote = wb.pendingWriteDoneRemote[1:]
+		return true
+	}
+	if len(wb.pendingWriteDoneLocal) == 0 {
 		return false
 	}
 
-	head := wb.pendingWriteDone[0]
+	head := wb.pendingWriteDoneLocal[0]
 	wb.applyWriteDoneRsp(head)
-	wb.pendingWriteDone = wb.pendingWriteDone[1:]
+	wb.pendingWriteDoneLocal = wb.pendingWriteDoneLocal[1:]
 	return true
 }
 
@@ -317,7 +366,7 @@ func (wb *writeBufferStage) sendFetchedDataToBank(
 	bankNum := bankID(trans.block,
 		wb.cache.directory.WayAssociativity(),
 		len(wb.cache.dirToBankBuffers))
-	bankBuf := wb.cache.writeBufferToBankBuffers[bankNum]
+	bankBuf := wb.cache.writeBufferToBankBuffersRsp[bankNum] // [R5] bankWriteFetched
 
 	if !bankBuf.CanPush() {
 		trans.fetchedData = nil
@@ -448,7 +497,7 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 			wb.cache.directory.WayAssociativity(),
 			len(wb.cache.dirToBankBuffers),
 		)
-		bankBuf := wb.cache.writeBufferToBankBuffers[bankNum]
+		bankBuf := wb.cache.writeBufferToBankBuffersReq[bankNum] // [R5] bankWriteHit
 		if !bankBuf.CanPush() {
 			wb.lastAdmitFailReason = fmt.Sprintf("bankBuf.CanPush()=false bankNum=%d fromLocal=false (peer-incoming bypass lane, still bank-backpressured)",
 				bankNum)
@@ -492,7 +541,7 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 		wb.cache.directory.WayAssociativity(),
 		len(wb.cache.dirToBankBuffers),
 	)
-	bankBuf := wb.cache.writeBufferToBankBuffers[bankNum]
+	bankBuf := wb.cache.writeBufferToBankBuffersReq[bankNum] // [R5] bankWriteHit
 
 	if !bankBuf.CanPush() {
 		wb.lastAdmitFailReason = fmt.Sprintf("bankBuf.CanPush()=false bankNum=%d fromLocal=%v",
@@ -539,7 +588,7 @@ func (wb *writeBufferStage) processWriteBufferEvictAndPrefetch(
 		wb.cache.directory.WayAssociativity(),
 		len(wb.cache.dirToBankBuffers),
 	)
-	bankBuf := wb.cache.writeBufferToBankBuffers[bankNum]
+	bankBuf := wb.cache.writeBufferToBankBuffersReq[bankNum] // [R5] bankWritePrefetched
 
 	if !bankBuf.CanPush() {
 		return false
@@ -796,7 +845,7 @@ func (wb *writeBufferStage) processDataReadyRsp(
 		wb.cache.directory.WayAssociativity(),
 		len(wb.cache.dirToBankBuffers),
 	)
-	bankBuf := wb.cache.writeBufferToBankBuffers[bankIndex]
+	bankBuf := wb.cache.writeBufferToBankBuffersRsp[bankIndex] // [R5] bankWriteFetched
 
 	if !bankBuf.CanPush() {
 		return false
@@ -920,7 +969,7 @@ func (wb *writeBufferStage) processPrefetch(
 			wb.cache.directory.WayAssociativity(),
 			len(wb.cache.dirToBankBuffers),
 		)
-		bankBuf := wb.cache.writeBufferToBankBuffers[bankIndex]
+		bankBuf := wb.cache.writeBufferToBankBuffersRsp[bankIndex] // [R5] bankWriteFetched derived
 
 		if !bankBuf.CanPush() {
 			return false
@@ -1133,8 +1182,11 @@ func (wb *writeBufferStage) Reset() {
 	wb.inflightEviction = nil
 	wb.numLocalInflightEviction = 0
 	wb.numRemoteInflightEviction = 0
-	wb.pendingDataReady = nil
-	wb.pendingWriteDone = nil
+	// [R6] reset all 4 halves.
+	wb.pendingDataReadyLocal = nil
+	wb.pendingDataReadyRemote = nil
+	wb.pendingWriteDoneLocal = nil
+	wb.pendingWriteDoneRemote = nil
 	wb.numPendingRemoteEvictions = 0
 	wb.numPeerIncomingPending = 0 // [ITER17 F1]
 }

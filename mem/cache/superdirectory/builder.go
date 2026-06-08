@@ -428,6 +428,14 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.Name()+".ToTop")
 	cache.AddPort("Top", cache.topPort)
 
+	// D4: L1-facing InvRsp ingress. L1 sends *mem.InvRsp here so
+	// the inv-rsp path is not head-blocked by a full bypass buffer
+	// behind a queued L1 ReadReq at topPort.
+	cache.topInvRspPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".TopInvRspPort")
+	cache.AddPort("TopInvRsp", cache.topInvRspPort)
+
 	cache.bottomPort = sim.NewPort(cache,
 		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
 		cache.Name()+".BottomPort")
@@ -460,6 +468,16 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
 		cache.Name()+".RDMAInvRspPort")
 	cache.AddPort("RDMAInvRsp", cache.RDMAInvRspPort)
+
+	// S1: dedicated egress port for outbound InvRsp (peer-bound). The
+	// old design drained outbound InvRsp via RDMAInvPort (mixed with
+	// outbound InvReq in sendToRDMAInvQue); a broadcast InvReq burst
+	// HoL-blocked InvRsp egress. New port + new sendToRDMAInvRspQue
+	// drain InvRsp independently.
+	cache.RDMAInvRspOutPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMAInvRspOutPort")
+	cache.AddPort("RDMAInvRspOut", cache.RDMAInvRspOutPort)
 
 	cache.ToRDMA = b.ToRDMA
 }

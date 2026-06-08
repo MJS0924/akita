@@ -34,15 +34,20 @@ type Comp struct {
 	bottomPort  sim.Port
 	controlPort sim.Port
 	RDMAPort    sim.Port
-	ToRDMA      sim.RemotePort
+	RDMAInvPort    sim.Port
+	RDMAInvRspPort sim.Port
+	ToRDMA         sim.RemotePort
+	ToRDMAInv    sim.RemotePort
+	ToRDMAInvRsp sim.RemotePort
 
 	cohDirStageBuffer        sim.Buffer
 	dirStageBuffer           sim.Buffer
 	dirToBankBuffers         []sim.Buffer
 	writeBufferToBankBuffers []sim.Buffer
 	mshrStageBuffer          sim.Buffer
-	bottomSenderBuffer       sim.Buffer
-	invRspBuffer             sim.Buffer
+	bottomSenderTransBuffer sim.Buffer
+	bottomSenderInvBuffer   sim.Buffer
+	invRspBuffer            sim.Buffer
 
 	topParser    *topParser
 	bottomSender *bottomSender

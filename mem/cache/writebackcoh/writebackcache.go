@@ -49,7 +49,14 @@ type Comp struct {
 	// 회피. dirToBankBuffers 는 length(numBanks) 계산 용도로만 유지.
 	dirToBankBuffersLocal    []sim.Buffer
 	dirToBankBuffersRemote   []sim.Buffer
-	writeBufferToBankBuffers []sim.Buffer
+	// [R5] writeBufferToBankBuffers split into REQ / RSP queues per bank.
+	// Req lane = bankWriteHit / bankWritePrefetched (write admit path).
+	// Rsp lane = bankWriteFetched (fetch-response path).
+	// Splitting prevents a write-admit head from blocking a
+	// fetched-response behind it in the same FIFO.
+	writeBufferToBankBuffersReq []sim.Buffer
+	writeBufferToBankBuffersRsp []sim.Buffer
+	writeBufferToBankBuffers    []sim.Buffer
 	// [ITER13 fix #2 — local/remote split]
 	// 'mshrStageBuffer' and 'writeBufferBuffer' historically multiplexed
 	// both local (own L1 originated) and peer-incoming (from peer L2
@@ -323,6 +330,14 @@ func (c *Comp) mshrStageBufferPush(item interface{}, fromLocal bool) {
 // Combined Size for flusher.go drain checks.
 func (c *Comp) writeBufferBufferTotalSize() int {
 	return c.writeBufferBuffer.Size() + c.writeBufferBufferRemote.Size()
+}
+
+// [R5] writeBufferToBankBuffersSize returns the combined Req+Rsp depth
+// for a given bank — used by flusher.go / drain checks that previously
+// queried the single writeBufferToBankBuffers[bank].Size().
+func (c *Comp) writeBufferToBankBuffersSize(bank int) int {
+	return c.writeBufferToBankBuffersReq[bank].Size() +
+		c.writeBufferToBankBuffersRsp[bank].Size()
 }
 
 func (c *Comp) eraseCacheLineFromRWMask(pid vm.PID, addr uint64) {

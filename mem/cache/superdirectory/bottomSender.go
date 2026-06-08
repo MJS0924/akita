@@ -71,7 +71,11 @@ type bottomSender struct {
 	// typed queue drains independently per Tick.
 	sendToTopRspQue       []sim.Msg // local L1 RSPs → topPort
 	sendToRDMADataRspQue  []sim.Msg // peer data RSPs → RDMAPort
-	sendToRDMAInvQue      []sim.Msg // outbound InvReq + InvRsp → RDMAInvPort
+	sendToRDMAInvQue      []sim.Msg // outbound InvReq → RDMAInvPort
+	// S1: outbound InvRsp split off from sendToRDMAInvQue (where it
+	// shared the queue with InvReq → HoL stall under broadcast inv
+	// bursts). Drained via the new RDMAInvRspOutPort.
+	sendToRDMAInvRspQue   []sim.Msg // outbound InvRsp → RDMAInvRspOutPort
 	sendToRemoteTopQue    []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
 	sendToDirQue          []*transaction
 	bypassRspQue          []sim.Msg
@@ -1111,8 +1115,10 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 		WithSrcRDMA(req.DstRDMA).
 		Build()
 
-	// [ITER18 F4/D7] outbound InvRsp → RDMAInvPort (Dst is peer GPU).
-	bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, rspToOutside)
+	// S1: outbound InvRsp → RDMAInvRspOutPort (RDMA's
+	// processFromInvInside now panics on InvRsp; only
+	// RDMAInvRspInside accepts InvRsp).
+	bs.sendToRDMAInvRspQue = append(bs.sendToRDMAInvRspQue, rspToOutside)
 
 	port.RetrieveIncoming()
 
@@ -1281,6 +1287,14 @@ func (bs *bottomSender) sendToTop() bool {
 		progress = true
 	}
 	if bs.drainOneTypedQueue(&bs.sendToRDMAInvQue, bs.cache.RDMAInvPort) {
+		progress = true
+	}
+	// S1: drain outbound InvRsp via the dedicated egress port. Splitting
+	// outbound InvRsp out of sendToRDMAInvQue removes HoL stall under
+	// outbound InvReq bursts and complies with RDMA's contract
+	// (processFromInvInside panics on InvRsp; InvRsp must arrive on
+	// RDMAInvRspInside, which is what RDMAInvRspOutPort connects to).
+	if bs.drainOneTypedQueue(&bs.sendToRDMAInvRspQue, bs.cache.RDMAInvRspOutPort) {
 		progress = true
 	}
 	return progress
@@ -1452,6 +1466,8 @@ func (bs *bottomSender) Reset() {
 	bs.sendToTopRspQue = nil
 	bs.sendToRDMADataRspQue = nil
 	bs.sendToRDMAInvQue = nil
+	// S1: clear outbound InvRsp egress queue.
+	bs.sendToRDMAInvRspQue = nil
 	bs.numPeerInflightRequest = 0
 	bs.sendToRemoteTopQue = nil
 	bs.sendToBottomQue = nil

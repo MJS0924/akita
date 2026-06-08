@@ -18,6 +18,11 @@ import (
 const (
 	topParserPendingRemoteInvCap    = 16 // matches invStageBuffer cap (numReqPerCycle*4)
 	topParserPendingRemoteAccessCap = 4  // matches remoteDirStageBuffer cap (numReqPerCycle)
+	// [L2] Local-side typed queues — mirror the remote-side fix so that
+	// an InvReq sitting behind a ReadReq/WriteReq at topPort head (L1
+	// originated) cannot HoL-block once dirStageBuffer is full.
+	topParserPendingLocalInvCap    = 16
+	topParserPendingLocalAccessCap = 4
 )
 
 type topParser struct {
@@ -32,6 +37,18 @@ type topParser struct {
 	// invalidation generates N× more InvReq than coarser variants).
 	pendingRemoteInv    []*remoteInvPending
 	pendingRemoteAccess []*remoteAccessPending
+	// [L2] Local-side typed queues for topPort. Symmetric with the
+	// remote-side queues above.
+	pendingLocalInv    []*localInvPending
+	pendingLocalAccess []*localAccessPending
+}
+
+type localInvPending struct {
+	req *mem.InvReq
+}
+
+type localAccessPending struct {
+	req sim.Msg // *mem.ReadReq or *mem.WriteReq
 }
 
 type remoteInvPending struct {
@@ -68,9 +85,16 @@ func (p *topParser) Tick() bool {
 		return true
 	}
 
-	// 3) Local L1 path (topPort). L1 only sends ReadReq/WriteReq, no
-	//    InvReq mixed in, so no HoL fix needed here.
-	if p.processLocalOne() {
+	// 3) Local L1 path (topPort). Symmetric typed-queue split so that
+	//    InvReq (e.g., L1 self-invalidation) cannot HoL-block behind a
+	//    stalled ReadReq/WriteReq.
+	if p.drainLocalOne() {
+		madeProgress = true
+	}
+	if p.dispatchLocalInv() {
+		return true
+	}
+	if p.dispatchLocalAccess() {
 		madeProgress = true
 	}
 
@@ -160,9 +184,72 @@ func (p *topParser) dispatchRemoteAccess() bool {
 	return true
 }
 
-func (p *topParser) processLocalOne() bool {
+// [L2] drainLocalOne dequeues one head from topPort into the appropriate
+// typed pending queue (InvReq vs Read/WriteReq). Cap rejection just
+// returns false without RetrieveIncoming so the next Tick retries.
+func (p *topParser) drainLocalOne() bool {
 	msg := p.cache.topPort.PeekIncoming()
 	if msg == nil {
+		return false
+	}
+
+	switch req := msg.(type) {
+	case *mem.InvReq:
+		if len(p.pendingLocalInv) >= topParserPendingLocalInvCap {
+			return false
+		}
+		p.pendingLocalInv = append(p.pendingLocalInv, &localInvPending{req: req})
+	case *mem.ReadReq, *mem.WriteReq:
+		if len(p.pendingLocalAccess) >= topParserPendingLocalAccessCap {
+			return false
+		}
+		p.pendingLocalAccess = append(p.pendingLocalAccess, &localAccessPending{req: msg})
+	default:
+		log.Panic(fmt.Sprintf("[%s]\nErr: Cannot handle req type from topPort\n", p.cache.name))
+	}
+
+	p.cache.topPort.RetrieveIncoming()
+	return true
+}
+
+// [L2] dispatchLocalInv pushes one queued InvReq into invStageBuffer.
+func (p *topParser) dispatchLocalInv() bool {
+	if len(p.pendingLocalInv) == 0 {
+		return false
+	}
+
+	pending := p.pendingLocalInv[0]
+	if !p.cache.invStageBuffer.CanPush() {
+		return false
+	}
+
+	trans := &transaction{
+		id:           sim.GetIDGenerator().Generate(),
+		fromLocal:    true,
+		invalidation: pending.req,
+	}
+
+	if p.cache.debugProcess && pending.req != nil && pending.req.GetAddress() == p.cache.debugAddress0 {
+		fmt.Printf("[%s] [topparser]\tReceived inv req - 0: addr %x\n", p.cache.name, pending.req.GetAddress())
+	}
+
+	p.cache.invStageBuffer.Push(trans)
+	p.cache.inFlightTransactions = append(p.cache.inFlightTransactions, trans)
+	tracing.TraceReqReceive(pending.req, p.cache)
+
+	p.pendingLocalInv = p.pendingLocalInv[1:]
+	return true
+}
+
+// [L2] dispatchLocalAccess pushes one queued ReadReq/WriteReq into
+// dirStageBuffer.
+func (p *topParser) dispatchLocalAccess() bool {
+	if len(p.pendingLocalAccess) == 0 {
+		return false
+	}
+
+	pending := p.pendingLocalAccess[0]
+	if !p.cache.dirStageBuffer.CanPush() {
 		return false
 	}
 
@@ -171,17 +258,15 @@ func (p *topParser) processLocalOne() bool {
 		fromLocal: true,
 	}
 
-	switch req := msg.(type) {
+	switch req := pending.req.(type) {
 	case *mem.ReadReq:
 		trans.toLocal = p.cache.toLocal(req.Address)
 		trans.read = req
 	case *mem.WriteReq:
 		trans.toLocal = p.cache.toLocal(req.Address)
 		trans.write = req
-	case *mem.InvReq:
-		trans.invalidation = req
 	default:
-		log.Panic(fmt.Sprintf("[%s]\nErr: Cannot handle req type\n", p.cache.name))
+		log.Panic("unexpected type in pendingLocalAccess")
 	}
 
 	if p.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == p.cache.debugAddress0 {
@@ -191,21 +276,10 @@ func (p *topParser) processLocalOne() bool {
 		fmt.Printf("[%s] [topparser]\tReceived req - 0: addr %x\n", p.cache.name, trans.accessReq().GetAddress())
 	}
 
-	if trans.invalidation != nil {
-		if !p.cache.invStageBuffer.CanPush() {
-			return false
-		}
-		p.cache.invStageBuffer.Push(trans)
-	} else {
-		if !p.cache.dirStageBuffer.CanPush() {
-			return false
-		}
-		p.cache.dirStageBuffer.Push(trans)
-	}
-
+	p.cache.dirStageBuffer.Push(trans)
 	p.cache.inFlightTransactions = append(p.cache.inFlightTransactions, trans)
-	tracing.TraceReqReceive(msg, p.cache)
+	tracing.TraceReqReceive(pending.req, p.cache)
 
-	p.cache.topPort.RetrieveIncoming()
+	p.pendingLocalAccess = p.pendingLocalAccess[1:]
 	return true
 }
