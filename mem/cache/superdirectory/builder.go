@@ -473,12 +473,14 @@ func (b *Builder) createInternalStages(cache *Comp) {
 	cache.mshrStage = &mshrStage{cache: cache}
 	cache.flusher = &flusher{cache: cache}
 	cache.bottomSender = &bottomSender{
-		cache:                    cache,
-		writeBufferCapacity:      b.writeBufferCapacity,
-		maxInflightRequest:       b.maxInflightFetch,
-		maxInflightInvalidation:  b.maxInflightEviction,
-		maxInvEmitPerCycle:       b.maxInvEmitPerCycle,
-		maxInflightBypassRequest: 1024,
+		cache:                     cache,
+		writeBufferCapacity:       b.writeBufferCapacity,
+		maxInflightRequest:        b.maxInflightFetch,
+		maxInflightInvalidation:   b.maxInflightEviction,
+		maxInvEmitPerCycle:        b.maxInvEmitPerCycle,
+		maxInflightBypassRequest:  1024,
+		maxPeerInflightRequest:    256,                  // [ITER18 F5b]
+		maxOutgoingRemoteInflight: b.maxInflightFetch*3/4, // [ITER18 F2] 3/4 of total cap
 	}
 }
 

@@ -75,7 +75,21 @@ type bottomSender struct {
 	// here; sendToBottom() drains this BEFORE sendToRemoteBottomQue so
 	// invalidations preempt regular requests at the egress.
 	sendToRemoteBottomInvQue []sim.Msg
-	sendToTopQue          []sim.Msg
+	// [ITER17 F4 / D7] sendToTopQue split by EGRESS PORT to eliminate
+	// head-of-line blocking between unrelated traffic classes.  Before
+	// the split: a single FIFO mixed outbound InvReq (→ RDMAInvPort),
+	// outbound InvRsp (→ RDMAInvPort), local L1 RSPs (→ topPort), and
+	// peer data RSPs (→ RDMAPort).  When ANY destination was jammed,
+	// the head item could not drain and ALL types behind it HoL-blocked
+	// — even though the other ports were idle.  Observed in iter16
+	// stencil2d hang where invReqBuffer=16/16, localBottomSenderBuffer=
+	// 16/16, RDMAInvPort.incomingBuf=32/32 all simultaneously full.
+	//
+	// New typed queues drain INDEPENDENTLY each Tick; a stalled port no
+	// longer prevents progress on the other ports.
+	sendToTopRspQue       []sim.Msg // local L1 RSPs → topPort
+	sendToRDMADataRspQue  []sim.Msg // peer data RSPs → RDMAPort
+	sendToRDMAInvQue      []sim.Msg // outbound InvReq + InvRsp → RDMAInvPort
 	sendToRemoteTopQue    []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
 	sendToDirQue          []*transaction
 	bypassRspQue          []sim.Msg
@@ -546,7 +560,8 @@ func (bs *bottomSender) sendInvalidationRequest(
 					WithDstRDMA(sh).
 					Build()
 
-				bs.sendToTopQue = append(bs.sendToTopQue, req)
+				// [ITER17 F4/D7] outbound InvReq → RDMAInvPort.
+				bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, req)
 
 				// Sharer 리스트에서 제거 및 pending 처리
 				e.Sharer = append(e.Sharer[:j], e.Sharer[j+1:]...)
@@ -660,7 +675,8 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 				WithIsWriteInv(true).
 				Build()
 
-			bs.sendToTopQue = append(bs.sendToTopQue, req)
+			// [ITER17 F4/D7] outbound write-induced InvReq → RDMAInvPort.
+			bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, req)
 
 			trans.pendingEviction = append(trans.pendingEviction, sh)
 			progress = true
@@ -859,7 +875,15 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 		// topPort로 보내면 도달 불가 → RDMAPort 전용 큐를 통해 전송
 		bs.sendToRemoteTopQue = append(bs.sendToRemoteTopQue, msg)
 	} else {
-		bs.sendToTopQue = append(bs.sendToTopQue, msg)
+		// [ITER17 F4/D7] classify DataReadyRsp by egress port.
+		dst := fmt.Sprintf("%s", msg.Meta().Dst)
+		if strings.Contains(dst, "RDMAInv") {
+			bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, msg)
+		} else if strings.Contains(dst, "RDMA") {
+			bs.sendToRDMADataRspQue = append(bs.sendToRDMADataRspQue, msg)
+		} else {
+			bs.sendToTopRspQue = append(bs.sendToTopRspQue, msg)
+		}
 	}
 
 	port.RetrieveIncoming()
@@ -942,7 +966,15 @@ func (bs *bottomSender) processWriteDoneRsp(msg *mem.WriteDoneRsp, port sim.Port
 		// topPort로 보내면 도달 불가 → RDMAPort 전용 큐를 통해 전송
 		bs.sendToRemoteTopQue = append(bs.sendToRemoteTopQue, msg)
 	} else {
-		bs.sendToTopQue = append(bs.sendToTopQue, msg)
+		// [ITER17 F4/D7] classify WriteDoneRsp by egress port.
+		dst := fmt.Sprintf("%s", msg.Meta().Dst)
+		if strings.Contains(dst, "RDMAInv") {
+			bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, msg)
+		} else if strings.Contains(dst, "RDMA") {
+			bs.sendToRDMADataRspQue = append(bs.sendToRDMADataRspQue, msg)
+		} else {
+			bs.sendToTopRspQue = append(bs.sendToTopRspQue, msg)
+		}
 	}
 
 	port.RetrieveIncoming()
@@ -985,8 +1017,8 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 		WithSrcRDMA(req.DstRDMA).
 		Build()
 
-	// [핵심 변경] 직접 Send() 하지 않고 상단 큐에 적재하여 포트 블로킹 우회
-	bs.sendToTopQue = append(bs.sendToTopQue, rspToOutside)
+	// [ITER17 F4/D7] outbound InvRsp → RDMAInvPort (Dst is peer GPU).
+	bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, rspToOutside)
 
 	port.RetrieveIncoming()
 
@@ -1136,42 +1168,43 @@ func (bs *bottomSender) sendRemoteRspToTop() bool {
 	return true
 }
 
-// / [FIX: head-of-line blocking] RDMAPort 혼잡 시 뒤에 있는 topPort 응답까지 막히는 문제 수정.
-// RDMAPort(데이터 채널 WriteDoneRsp)만 혼잡 시 skip; RDMAInvPort·topPort는 순서 보장을 위해 원래대로 return false.
-// 원래 코드(return false)로 되돌리려면 아래 루프를 제거하고 sendToTopQue[0]만 처리하는 원래 로직으로 교체.
+// [ITER17 F4/D7] Drain each typed sub-queue INDEPENDENTLY.  A stalled
+// egress port can no longer HoL-block the other ports.  Replaces the
+// single sendToTopQue iteration that conditionally skipped RDMAPort
+// but still serialized RDMAInvPort and topPort.
 func (bs *bottomSender) sendToTop() bool {
-	for i := 0; i < len(bs.sendToTopQue); i++ {
-		msg := bs.sendToTopQue[i]
-		dst := fmt.Sprintf("%s", msg.Meta().Dst)
-		port := bs.cache.topPort
-		isRDMADataPort := false
-		if strings.Contains(dst, "RDMAInv") {
-			port = bs.cache.RDMAInvPort
-			msg.Meta().Src = port.AsRemote()
-		} else if strings.Contains(dst, "RDMA") {
-			port = bs.cache.RDMAPort
-			msg.Meta().Src = port.AsRemote()
-			isRDMADataPort = true
-		}
-
-		if !port.CanSend() {
-			bs.cache.stallTopPortBusy++
-			if isRDMADataPort {
-				continue // safe to skip: RDMAPort(데이터 채널) WriteDoneRsp만 건너뜀
-			}
-			return false // RDMAInvPort·topPort는 순서 보장 필요 — 원래 동작 유지
-		}
-
-		err := port.Send(msg)
-		if err != nil {
-			continue
-		}
-
-		bs.sendToTopQue[i] = nil
-		bs.sendToTopQue = append(bs.sendToTopQue[:i], bs.sendToTopQue[i+1:]...)
-		return true
+	progress := false
+	if bs.drainOneTypedQueue(&bs.sendToTopRspQue, bs.cache.topPort) {
+		progress = true
 	}
-	return false
+	if bs.drainOneTypedQueue(&bs.sendToRDMADataRspQue, bs.cache.RDMAPort) {
+		progress = true
+	}
+	if bs.drainOneTypedQueue(&bs.sendToRDMAInvQue, bs.cache.RDMAInvPort) {
+		progress = true
+	}
+	return progress
+}
+
+// drainOneTypedQueue pops the head of `q` and Sends it via `port` (if
+// the port has room).  Returns true if a message was sent.  Each queue
+// is type-pure so no HoL across queues is possible.
+func (bs *bottomSender) drainOneTypedQueue(q *[]sim.Msg, port sim.Port) bool {
+	if len(*q) == 0 {
+		return false
+	}
+	if !port.CanSend() {
+		bs.cache.stallTopPortBusy++
+		return false
+	}
+	msg := (*q)[0]
+	msg.Meta().Src = port.AsRemote()
+	if err := port.Send(msg); err != nil {
+		return false
+	}
+	(*q)[0] = nil
+	*q = (*q)[1:]
+	return true
 }
 
 // [수정] 분할된 2개의 Bottom 포트 및 큐 처리
@@ -1345,7 +1378,10 @@ func (bs *bottomSender) Reset() {
 	bs.inflightInvToOutside = nil
 	bs.pendingLocalWriteAfterInv = nil
 	bs.pendingRemoteWriteAfterInv = nil
-	bs.sendToTopQue = nil
+	// [ITER17 F4/D7] clear typed sub-queues.
+	bs.sendToTopRspQue = nil
+	bs.sendToRDMADataRspQue = nil
+	bs.sendToRDMAInvQue = nil
 	bs.sendToRemoteTopQue = nil
 	bs.sendToBottomQue = nil
 	bs.sendToRemoteBottomQue = nil

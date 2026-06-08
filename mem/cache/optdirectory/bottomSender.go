@@ -31,6 +31,12 @@ type bottomSender struct {
 	localInflightBypassRequest []*transaction
 	remoteInflightRequest      []*transaction
 
+	// [ITER18 F2/F5b] caps mirror REC iter17 — bound peer-bypass admit
+	// and remote-branch share of total inflight.
+	maxPeerInflightRequest    int
+	numPeerInflightRequest    int
+	maxOutgoingRemoteInflight int
+
 	inflightInvToOutside []*transaction
 	inflightInvToBottom  []*invTrans
 
@@ -48,7 +54,10 @@ type bottomSender struct {
 	// here; sendToBottom() drains this BEFORE remoteSendToBottomQue so
 	// invalidations preempt regular requests at the egress.
 	invRemoteSendToBottomQue []sim.Msg
-	sendToTopQue          []sim.Msg
+	// [ITER18 F4/D7] split sendToTopQue by egress port (mirrors REC).
+	sendToTopRspQue       []sim.Msg
+	sendToRDMADataRspQue  []sim.Msg
+	sendToRDMAInvQue      []sim.Msg
 	sendToRemoteTopQue    []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
 	bypassRspQue          []sim.Msg
 
@@ -274,7 +283,8 @@ func (bs *bottomSender) processNewTransaction(trans *transaction, isLocal bool) 
 
 // [수정] Local/Remote 배열 분리 저장
 func (bs *bottomSender) sendRequestToBottom(trans *transaction, isLocal bool) bool {
-	if bs.tooManyInflightRequest(isLocal) {
+	// [ITER18 F5a] origin (trans.fromLocal), not BSB side (isLocal).
+	if bs.tooManyInflightRequest(trans.fromLocal) {
 		bs.cache.stallInflightFetch++
 		return false
 	}
@@ -300,6 +310,10 @@ func (bs *bottomSender) sendRequestToBottom(trans *transaction, isLocal bool) bo
 	} else {
 		bs.remoteSendToBottomQue = append(bs.remoteSendToBottomQue, req)
 		bs.remoteInflightRequest = append(bs.remoteInflightRequest, trans)
+	}
+	// [ITER18 F5b] track peer-bypass inflight.
+	if !trans.fromLocal {
+		bs.numPeerInflightRequest++
 	}
 
 	trans.reqToBottom = append(trans.reqToBottom, &req)
@@ -346,7 +360,8 @@ func (bs *bottomSender) sendRequestToBottom(trans *transaction, isLocal bool) bo
 }
 
 func (bs *bottomSender) sendMultipleRequest(trans *transaction, isLocal bool) bool {
-	if bs.tooManyInflightRequest(isLocal) {
+	// [ITER18 F5a] origin (trans.fromLocal), not BSB side (isLocal).
+	if bs.tooManyInflightRequest(trans.fromLocal) {
 		bs.cache.stallInflightFetch++
 		return false
 	}
@@ -441,7 +456,8 @@ func (bs *bottomSender) sendMultipleRequest(trans *transaction, isLocal bool) bo
 }
 
 func (bs *bottomSender) sendInvalidationRequest(trans *transaction, isLocal bool) bool {
-	if trans.action != InvalidateEntry && bs.tooManyInflightRequest(isLocal) {
+	// [ITER18 F5a] origin (trans.fromLocal), not BSB side (isLocal).
+	if trans.action != InvalidateEntry && bs.tooManyInflightRequest(trans.fromLocal) {
 		// return bs.sendRequestToBottom(trans, isLocal) || progress에서
 		// snedRequestToBottom이 false를 반환하는 경우가 있음, 이때 transaction이 버려지는 현상 방지
 		bs.cache.stallInflightFetch++
@@ -498,7 +514,8 @@ func (bs *bottomSender) sendInvalidationRequest(trans *transaction, isLocal bool
 				WithIsWriteInv(trans.action == InvalidateAndUpdateEntry).
 				Build()
 
-			bs.sendToTopQue = append(bs.sendToTopQue, req)
+			// [ITER18 F4/D7] outbound InvReq → RDMAInvPort.
+			bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, req)
 			trans.pendingEviction = append(trans.pendingEviction, sh)
 			progress = true
 
@@ -659,7 +676,15 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 	} else if !trans.fromLocal && !strings.Contains(fmt.Sprintf("%s", msg.Meta().Dst), "RDMA") {
 		bs.sendToRemoteTopQue = append(bs.sendToRemoteTopQue, msg)
 	} else {
-		bs.sendToTopQue = append(bs.sendToTopQue, msg)
+		// [ITER18 F4/D7] classify by egress port.
+		dst := fmt.Sprintf("%s", msg.Meta().Dst)
+		if strings.Contains(dst, "RDMAInv") {
+			bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, msg)
+		} else if strings.Contains(dst, "RDMA") {
+			bs.sendToRDMADataRspQue = append(bs.sendToRDMADataRspQue, msg)
+		} else {
+			bs.sendToTopRspQue = append(bs.sendToTopRspQue, msg)
+		}
 	}
 
 	port.RetrieveIncoming()
@@ -732,7 +757,15 @@ func (bs *bottomSender) processWriteDoneRsp(msg *mem.WriteDoneRsp, port sim.Port
 	} else if !trans.fromLocal && !strings.Contains(fmt.Sprintf("%s", msg.Meta().Dst), "RDMA") {
 		bs.sendToRemoteTopQue = append(bs.sendToRemoteTopQue, msg)
 	} else {
-		bs.sendToTopQue = append(bs.sendToTopQue, msg)
+		// [ITER18 F4/D7] classify by egress port.
+		dst := fmt.Sprintf("%s", msg.Meta().Dst)
+		if strings.Contains(dst, "RDMAInv") {
+			bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, msg)
+		} else if strings.Contains(dst, "RDMA") {
+			bs.sendToRDMADataRspQue = append(bs.sendToRDMADataRspQue, msg)
+		} else {
+			bs.sendToTopRspQue = append(bs.sendToTopRspQue, msg)
+		}
 	}
 
 	port.RetrieveIncoming()
@@ -760,7 +793,8 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 		WithRspTo(req.ReqFrom).
 		Build()
 
-	bs.sendToTopQue = append(bs.sendToTopQue, rspToOutside)
+	// [ITER18 F4/D7] outbound InvRsp → RDMAInvPort.
+	bs.sendToRDMAInvQue = append(bs.sendToRDMAInvQue, rspToOutside)
 	port.RetrieveIncoming()
 
 	// [핵심 추가] 처리가 완료된 트랜잭션을 Inflight 배열에서 안전하게 삭제합니다.
@@ -968,42 +1002,37 @@ func (bs *bottomSender) sendRemoteRspToTop() bool {
 	return true
 }
 
-// [FIX: head-of-line blocking] RDMAPort 혼잡 시 뒤에 있는 topPort 응답까지 막히는 문제 수정.
-// RDMAPort(데이터 채널 WriteDoneRsp)만 혼잡 시 skip; RDMAInvPort·topPort는 순서 보장을 위해 원래대로 return false.
-// 원래 코드(return false)로 되돌리려면 아래 루프를 제거하고 sendToTopQue[0]만 처리하는 원래 로직으로 교체.
+// [ITER18 F4/D7] Drain each typed sub-queue INDEPENDENTLY (mirrors REC iter17).
 func (bs *bottomSender) sendToTop() bool {
-	for i := 0; i < len(bs.sendToTopQue); i++ {
-		msg := bs.sendToTopQue[i]
-		dst := fmt.Sprintf("%s", msg.Meta().Dst)
-		port := bs.cache.topPort
-		isRDMADataPort := false
-		if strings.Contains(dst, "RDMAInv") {
-			port = bs.cache.RDMAInvPort
-			msg.Meta().Src = port.AsRemote()
-		} else if strings.Contains(dst, "RDMA") {
-			port = bs.cache.RDMAPort
-			msg.Meta().Src = port.AsRemote()
-			isRDMADataPort = true
-		}
-
-		if !port.CanSend() {
-			bs.cache.stallTopPortBusy++
-			if isRDMADataPort {
-				continue // safe to skip: RDMAPort(데이터 채널) WriteDoneRsp만 건너뜀
-			}
-			return false // RDMAInvPort·topPort는 순서 보장 필요 — 원래 동작 유지
-		}
-
-		err := port.Send(msg)
-		if err != nil {
-			continue
-		}
-
-		bs.sendToTopQue[i] = nil
-		bs.sendToTopQue = append(bs.sendToTopQue[:i], bs.sendToTopQue[i+1:]...)
-		return true
+	progress := false
+	if bs.drainOneTypedQueue(&bs.sendToTopRspQue, bs.cache.topPort) {
+		progress = true
 	}
-	return false
+	if bs.drainOneTypedQueue(&bs.sendToRDMADataRspQue, bs.cache.RDMAPort) {
+		progress = true
+	}
+	if bs.drainOneTypedQueue(&bs.sendToRDMAInvQue, bs.cache.RDMAInvPort) {
+		progress = true
+	}
+	return progress
+}
+
+func (bs *bottomSender) drainOneTypedQueue(q *[]sim.Msg, port sim.Port) bool {
+	if len(*q) == 0 {
+		return false
+	}
+	if !port.CanSend() {
+		bs.cache.stallTopPortBusy++
+		return false
+	}
+	msg := (*q)[0]
+	msg.Meta().Src = port.AsRemote()
+	if err := port.Send(msg); err != nil {
+		return false
+	}
+	(*q)[0] = nil
+	*q = (*q)[1:]
+	return true
 }
 
 func (bs *bottomSender) sendToBottom() bool {
@@ -1099,6 +1128,13 @@ func (bs *bottomSender) tooManyInflightInvalidationToBottom() bool {
 // use the full budget when local is idle. Mirrors the writebackcoh
 // L2 writeBufferStage tooManyInflightEvictions scheme.
 func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
+	// [ITER18 F5b] Peer-bypass lane — bounded by maxPeerInflightRequest.
+	if !isLocal {
+		if bs.maxPeerInflightRequest > 0 &&
+			bs.numPeerInflightRequest >= bs.maxPeerInflightRequest {
+			return true
+		}
+	}
 	total := len(bs.localInflightRequest) + len(bs.remoteInflightRequest)
 	if total >= bs.maxInflightRequest {
 		return true
@@ -1106,6 +1142,11 @@ func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
 	if isLocal {
 		localLimit := bs.maxInflightRequest - bs.maxInflightRequest/4
 		return len(bs.localInflightRequest) >= localLimit
+	}
+	// [ITER18 F2] Remote: optional sub-cap.
+	if bs.maxOutgoingRemoteInflight > 0 &&
+		len(bs.remoteInflightRequest) >= bs.maxOutgoingRemoteInflight {
+		return true
 	}
 	return false
 }
@@ -1122,7 +1163,11 @@ func (bs *bottomSender) Reset() {
 	bs.inflightInvToOutside = nil
 	bs.pendingLocalWriteAfterInv = nil
 	bs.pendingRemoteWriteAfterInv = nil
-	bs.sendToTopQue = nil
+	// [ITER18 F4/D7+F5b] clear typed sub-queues + peer counter.
+	bs.sendToTopRspQue = nil
+	bs.sendToRDMADataRspQue = nil
+	bs.sendToRDMAInvQue = nil
+	bs.numPeerInflightRequest = 0
 	bs.sendToRemoteTopQue = nil
 	bs.sendToBottomQue = nil
 	bs.remoteSendToBottomQue = nil
@@ -1161,14 +1206,21 @@ func (bs *bottomSender) findInvalidationByID(ID string, list []*invTrans) int {
 
 // [수정] 배열에서 제거하는 헬퍼 함수
 func (bs *bottomSender) removeInflightRequest(i int, isLocal bool) {
+	var trans *transaction
 	if isLocal {
+		trans = bs.localInflightRequest[i]
 		copy(bs.localInflightRequest[i:], bs.localInflightRequest[i+1:])
 		bs.localInflightRequest[len(bs.localInflightRequest)-1] = nil
 		bs.localInflightRequest = bs.localInflightRequest[:len(bs.localInflightRequest)-1]
 	} else {
+		trans = bs.remoteInflightRequest[i]
 		copy(bs.remoteInflightRequest[i:], bs.remoteInflightRequest[i+1:])
 		bs.remoteInflightRequest[len(bs.remoteInflightRequest)-1] = nil
 		bs.remoteInflightRequest = bs.remoteInflightRequest[:len(bs.remoteInflightRequest)-1]
+	}
+	// [ITER18 F5b] decrement peer counter if trans was peer-origin.
+	if trans != nil && !trans.fromLocal && bs.numPeerInflightRequest > 0 {
+		bs.numPeerInflightRequest--
 	}
 }
 
