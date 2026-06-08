@@ -352,7 +352,7 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		return false
 	}
 
-	if trans.writeToHomeNode && !s.cache.writeBufferBuffer.CanPush() {
+	if trans.writeToHomeNode && !s.cache.writeBufferBufferCanPush(trans.fromLocal) {
 		return false
 	}
 
@@ -401,7 +401,7 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		trans.evictingDirtyMask = block.DirtyMask
 
 		trans.action = writeBufferFlush
-		s.cache.writeBufferBuffer.Push(trans)
+		s.cache.writeBufferBufferPush(trans, trans.fromLocal)
 
 		if s.cache.debugProcess && trans.action == bankWritePrefetched {
 			fmt.Printf("[%s]\t[WARNING]\twrong trans action\n", s.cache.name)
@@ -463,17 +463,17 @@ func (s *bankStage) writeData(
 func (s *bankStage) finalizeBankWriteFetched(
 	trans *transaction,
 ) bool {
-	if !s.cache.mshrStageBuffer.CanPush() {
+	if !s.cache.mshrStageBufferCanPush(trans.fromLocal) {
 		return false
 	}
 
-	if trans.writeToHomeNode && !s.cache.writeBufferBuffer.CanPush() {
+	if trans.writeToHomeNode && !s.cache.writeBufferBufferCanPush(trans.fromLocal) {
 		return false
 	}
 
 	mshrEntry := trans.mshrEntry
 	block := mshrEntry.Block
-	s.cache.mshrStageBuffer.Push(mshrEntry)
+	s.cache.mshrStageBufferPush(mshrEntry, trans.fromLocal)
 
 	err := s.cache.storage.Write(block.CacheAddress, mshrEntry.Data)
 	if err != nil {
@@ -492,7 +492,7 @@ func (s *bankStage) finalizeBankWriteFetched(
 		trans.evictingDirtyMask = block.DirtyMask
 
 		trans.action = writeBufferFlush
-		s.cache.writeBufferBuffer.Push(trans)
+		s.cache.writeBufferBufferPush(trans, trans.fromLocal)
 	}
 
 	// Deferred-invalidation: see directoryStage.doInvalidation. The
@@ -527,10 +527,10 @@ func (s *bankStage) finalizeBankWritePrefetched(
 	trans *transaction,
 ) bool {
 	// 1. MSHR 버퍼와 WriteBuffer 버퍼 모두 여유 공간이 있는지 확인
-	if !s.cache.mshrStageBuffer.CanPush() {
+	if !s.cache.mshrStageBufferCanPush(trans.fromLocal) {
 		return false
 	}
-	if trans.action == bankEvictAndPrefetch && !s.cache.writeBufferBuffer.CanPush() {
+	if trans.action == bankEvictAndPrefetch && !s.cache.writeBufferBufferCanPush(trans.fromLocal) {
 		return false
 	}
 
@@ -549,7 +549,7 @@ func (s *bankStage) finalizeBankWritePrefetched(
 
 	// 3. MSHR 깨우기 (필요 시)
 	if trans.mshrEntry != nil {
-		s.cache.mshrStageBuffer.Push(trans.mshrEntry)
+		s.cache.mshrStageBufferPush(trans.mshrEntry, trans.fromLocal)
 	}
 
 	// 4. 새로운 Prefetch 데이터를 뱅크에 기록
@@ -581,7 +581,7 @@ func (s *bankStage) finalizeBankWritePrefetched(
 		delete(s.cache.evictingList, trans.evictingAddr)
 
 		// WriteBufferStage로 방출(Push)
-		s.cache.writeBufferBuffer.Push(trans)
+		s.cache.writeBufferBufferPush(trans, trans.fromLocal)
 
 		// [핵심 수정] 하위로 보냈으므로 Downward 카운터 차감
 		s.downwardInflightTransCount--
@@ -657,7 +657,7 @@ func (s *bankStage) removeTransaction(trans *transaction) {
 func (s *bankStage) finalizeBankEviction(
 	trans *transaction,
 ) bool {
-	if !s.cache.writeBufferBuffer.CanPush() {
+	if !s.cache.writeBufferBufferCanPush(trans.fromLocal) {
 		return false
 	}
 
@@ -694,7 +694,7 @@ func (s *bankStage) finalizeBankEviction(
 	// }
 
 	delete(s.cache.evictingList, trans.evictingAddr)
-	s.cache.writeBufferBuffer.Push(trans)
+	s.cache.writeBufferBufferPush(trans, trans.fromLocal)
 
 	s.inflightTransCount--
 	s.downwardInflightTransCount--

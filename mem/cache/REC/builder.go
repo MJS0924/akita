@@ -27,14 +27,15 @@ type Builder struct {
 	interleavingUnitCount int
 	interleavingUnitIndex int
 
-	numBanks            int
-	byteSize            uint64
-	numMSHREntry        int
-	numReqPerCycle      int
-	writeBufferCapacity int
-	maxInflightFetch    int
-	maxInflightEviction int
-	maxInvEmitPerCycle  int
+	numBanks                  int
+	byteSize                  uint64
+	numMSHREntry              int
+	numReqPerCycle            int
+	writeBufferCapacity       int
+	maxInflightFetch          int
+	maxInflightEviction       int
+	maxInvEmitPerCycle        int
+	maxOutgoingRemoteInflight int
 
 	cohDirLatency int
 	dirLatency    int
@@ -172,6 +173,18 @@ func (b Builder) WithMaxInflightEviction(n int) Builder {
 // 0 (default) disables the cap. See cohdirectory.Builder.WithMaxInvEmitPerCycle.
 func (b Builder) WithMaxInvEmitPerCycle(n int) Builder {
 	b.maxInvEmitPerCycle = n
+	return b
+}
+
+// WithMaxOutgoingRemoteInflight sets the sub-cap on the remote branch
+// of bottomSender.remoteInflightRequest. Smaller than maxInflightFetch
+// (the total inflight cap) so the local branch always has headroom
+// for ack-return / bypass-response flow that must drain even when
+// remote is saturated. Closes the cross-GPU cycle observed at the
+// bottomSender layer (stencil2d REC sim 19.798 ms stall). n<=0 keeps
+// the legacy unbounded behaviour.
+func (b Builder) WithMaxOutgoingRemoteInflight(n int) Builder {
+	b.maxOutgoingRemoteInflight = n
 	return b
 }
 
@@ -342,6 +355,14 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.Name()+".RDMAInvPort")
 	cache.AddPort("RDMAInv", cache.RDMAInvPort)
 
+	// D1 (ported from SD 307dbe6): dedicated InvRsp ingress isolated from
+	// RDMAInvPort's InvReq backlog, so a full invReqBuffer cannot
+	// head-block InvRsp delivery.
+	cache.RDMAInvRspPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMAInvRspPort")
+	cache.AddPort("RDMAInvRsp", cache.RDMAInvRspPort)
+
 	cache.ToRDMA = b.ToRDMA
 }
 
@@ -354,12 +375,13 @@ func (b *Builder) createInternalStages(cache *Comp) {
 	cache.mshrStage = &mshrStage{cache: cache}
 	cache.flusher = &flusher{cache: cache}
 	cache.bottomSender = &bottomSender{
-		cache:                    cache,
-		writeBufferCapacity:      b.writeBufferCapacity,
-		maxInflightRequest:       b.maxInflightFetch,
-		maxInflightInvalidation:  b.maxInflightEviction,
-		maxInflightBypassRequest: 1024,
-		maxInvEmitPerCycle:       b.maxInvEmitPerCycle,
+		cache:                     cache,
+		writeBufferCapacity:       b.writeBufferCapacity,
+		maxInflightRequest:        b.maxInflightFetch,
+		maxInflightInvalidation:   b.maxInflightEviction,
+		maxInflightBypassRequest:  1024,
+		maxInvEmitPerCycle:        b.maxInvEmitPerCycle,
+		maxOutgoingRemoteInflight: b.maxOutgoingRemoteInflight,
 	}
 }
 

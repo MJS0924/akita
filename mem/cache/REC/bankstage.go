@@ -129,20 +129,20 @@ func (e bankPipelineElem) TaskID() string {
 }
 
 func (s *bankStage) Tick() (madeProgress bool) {
+	// [FIX da6a521 #2 패턴 적용] Remote 먼저, Local 나중에 처리해
+	// dirStage 의 invBuf→remoteBuf→localBuf priority 가 bank 단계까지 전파되도록 함.
+	// local trans 가 bankBuf head 에 쌓여도 remote 가 뒤에서 영원히 밀리지 않게.
 	for i := 0; i < s.cache.numReqPerCycle; i++ {
-		// [수정] Local과 Remote 각각 Finalize 수행
-		madeProgress = s.finalizeTrans(true) || madeProgress  // Local 처리
-		madeProgress = s.finalizeTrans(false) || madeProgress // Remote 처리
+		madeProgress = s.finalizeTrans(false) || madeProgress // Remote 먼저
+		madeProgress = s.finalizeTrans(true) || madeProgress  // Local 나중
 	}
 
-	// [수정] 양쪽 파이프라인 모두 Tick
-	madeProgress = s.localPipeline.Tick() || madeProgress
 	madeProgress = s.remotePipeline.Tick() || madeProgress
+	madeProgress = s.localPipeline.Tick() || madeProgress
 
 	for i := 0; i < s.cache.numReqPerCycle; i++ {
-		// [수정] 양쪽 큐에서 각각 Pull 시도
-		madeProgress = s.pullFromBuf(true) || madeProgress  // Local 당겨오기
-		madeProgress = s.pullFromBuf(false) || madeProgress // Remote 당겨오기
+		madeProgress = s.pullFromBuf(false) || madeProgress // Remote 먼저
+		madeProgress = s.pullFromBuf(true) || madeProgress  // Local 나중
 	}
 
 	return madeProgress

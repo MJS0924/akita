@@ -409,6 +409,10 @@ func (b *Builder) configureCache(cacheModule *Comp) {
 	cacheModule.promoteAtEvictBiasVictim = b.promoteAtEvictBiasVictim
 	cacheModule.promoteAtEvictMultiBank = b.promoteAtEvictMultiBank
 
+	// [BANK-LEVEL PROMOTE/DEMOTE TRACKING] allocate per-bank counters.
+	cacheModule.promoteCountByBank = make([]uint64, b.numBanks)
+	cacheModule.demoteCountByBank = make([]uint64, b.numBanks)
+
 	if b.eventLogger != nil {
 		cacheModule.eventLogger = b.eventLogger
 	} else {

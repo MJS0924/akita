@@ -212,6 +212,23 @@ type Comp struct {
 	// converted a victim into a promotion at eviction time.
 	promoteAtEvictCount uint64
 
+	// [BANK-LEVEL PROMOTE/DEMOTE TRACKING]
+	// Per-bank counters: index = bankID (0 coarsest .. numBanks-1 finest).
+	// Incremented in bankStage.FinalizePromotionEntry / FinalizeDemotionEntry
+	// at the point the action actually commits.
+	//
+	// SD promotes/demotes move an entry across banks (coarser ↔ finer).
+	// Tracking per-bank rates exposes where the hierarchy is most active
+	// (e.g., heavy promote from bank 4 → 3 indicates locality coarsening,
+	// heavy demote from bank 0 → 1 indicates utilization collapse). The
+	// global promoteAtEvictCount only counts evict-time promotions at the
+	// finest bank under the §4 feature; these per-bank counters cover ALL
+	// promotion/demotion paths regardless of trigger.
+	//
+	// Allocated to size numBanks in builder after numBanks is set.
+	promoteCountByBank []uint64
+	demoteCountByBank  []uint64
+
 	// OP5 deviation regression slots (PHASE C-2). Increment sites are
 	// intentionally absent in the post-fix code: a non-zero value means
 	// either (a) a future change reintroduced the buggy branch and wired
@@ -240,10 +257,21 @@ func (c *Comp) incEvent(name string) {
 // EventCounts returns a copy of the in-memory event counters. Per-bank
 // CBF FPR counters are merged in under the "CBF_*_<bank>" namespace so
 // they flow through the existing eventCountsProvider -> sqlite pipeline.
+// [BANK-LEVEL TRACKING] Per-bank promote/demote counters are merged in
+// under the "promote_bank<N>" / "demote_bank<N>" namespace using the
+// same mechanism, so they reach summary.csv and sqlite without any
+// changes to the reporting layer.
 func (c *Comp) EventCounts() map[string]uint64 {
 	out := make(map[string]uint64, len(c.eventCounts)+32)
 	for k, v := range c.eventCounts {
 		out[k] = v
+	}
+	// Per-bank promote/demote counters.
+	for bank, v := range c.promoteCountByBank {
+		out[fmt.Sprintf("promote_bank%d", bank)] = v
+	}
+	for bank, v := range c.demoteCountByBank {
+		out[fmt.Sprintf("demote_bank%d", bank)] = v
 	}
 	if c.directory != nil {
 		for bank, s := range c.directory.CBFStats() {
@@ -335,6 +363,17 @@ func (c *Comp) AvgEvictUtilization() float64 {
 // (coarsest). Earlier versions of this method counted each valid
 // sub-entry as 1 cacheline irrespective of bank, which under-reports
 // coverage by a factor of up to 256× for coarse banks.
+//
+// [COVERAGE FORMULA VERIFICATION]
+// totalCacheLines = Σ (per valid entry: validSubEntries × cachelinesPerSub)
+//                 = Σ (per valid entry: validSubEntries × regionSize / cacheLineSize)
+// where regionSize = 1<<regionLen[bankID], cacheLineSize = 1<<log2BlockSize.
+// This MATCHES the user-specified formula
+//   coverage = Σ (subentries × regionSize/cacheLineSize)
+// when "subentries" means VALID sub-entries (the only sub-entries that
+// actually track address space) and the sum is over all valid entries
+// across all banks. See also MaxCoverageCacheLines below for the
+// always-valid (= directory capacity) variant.
 func (c *Comp) CurrentValidEntryUtilization() (float64, int, int) {
 	banks := c.directory.GetBanks()
 	var sum float64
@@ -369,6 +408,62 @@ func (c *Comp) CurrentValidEntryUtilization() (float64, int, int) {
 		return 0, 0, 0
 	}
 	return sum / float64(count), count, totalCacheLines
+}
+
+// [COVERAGE FORMULA VERIFICATION HELPERS]
+
+// MaxCoverageCacheLines returns the theoretical maximum number of cache
+// lines this directory could track when every entry's every sub-entry
+// is valid:
+//
+//	max_coverage = Σ_banks (numEntriesInBank × numSubEntriesPerEntry × cachelinesPerSubentry)
+//	             = Σ_banks (numEntriesInBank × (1<<log2NumSubEntry) × (1<<(regionLen[bank]-log2BlockSize)))
+//
+// This is a static configuration property (set by builder); useful as a
+// denominator for "how much of the address space is the directory
+// CURRENTLY tracking" ratio.
+func (c *Comp) MaxCoverageCacheLines() int {
+	banks := c.directory.GetBanks()
+	numSub := 1 << c.log2NumSubEntry
+	total := 0
+	for bankIdx, bank := range banks {
+		cachelinesPerSub := 1 << (c.regionLen[bankIdx] - int(c.log2BlockSize))
+		// numEntriesInBank = (number of sets in this bank) × wayAssociativity
+		nEntries := 0
+		for _, set := range bank {
+			nEntries += len(set.CohEntries)
+		}
+		total += nEntries * numSub * cachelinesPerSub
+	}
+	return total
+}
+
+// CoverageByBank returns the per-bank breakdown of current valid cache-
+// line coverage (valid sub-entries × cachelinesPerSub). The slice index
+// is bankID. The sum over the slice equals the totalCacheLines that
+// CurrentValidEntryUtilization() returns, providing the contribution of
+// each bank to the directory's tracked address-space coverage.
+func (c *Comp) CoverageByBank() []int {
+	banks := c.directory.GetBanks()
+	out := make([]int, len(banks))
+	for bankIdx, bank := range banks {
+		cachelinesPerSub := 1 << (c.regionLen[bankIdx] - int(c.log2BlockSize))
+		for _, set := range bank {
+			for _, entry := range set.CohEntries {
+				if entry == nil || !entry.IsValidEntry() {
+					continue
+				}
+				validSub := 0
+				for k := 0; k < len(entry.SubEntry); k++ {
+					if entry.SubEntry[k].IsValid {
+						validSub++
+					}
+				}
+				out[bankIdx] += validSub * cachelinesPerSub
+			}
+		}
+	}
+	return out
 }
 
 func (c *Comp) EvictCount() uint64 {

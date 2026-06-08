@@ -397,6 +397,13 @@ func (s *bankStage) FinalizePromotionEntry(trans *transaction, bottomSenderBuffe
 		bottomSenderBuffer.Push(trans)
 	}
 
+	// [BANK-LEVEL TRACKING] count promotion at the DESTINATION bank
+	// (trans.bankID is the bank the promoted entry was inserted into —
+	// the coarser bank for a coarsening promotion).
+	if trans.bankID >= 0 && trans.bankID < len(s.cache.promoteCountByBank) {
+		s.cache.promoteCountByBank[trans.bankID]++
+	}
+
 	if s.cache.debugPromotion {
 		fmt.Printf("[%s]\tFinalize Promotion Entry: Addr %x, bankID %d, valid [",
 			s.cache.name, int(blk.Tag)+index*(1<<s.cache.regionLen[trans.bankID]), trans.bankID)
@@ -424,6 +431,13 @@ func (s *bankStage) FinalizeDemotionEntry(trans *transaction, bottomSenderBuffer
 
 	if trans.action == EvictAndDemotionEntry {
 		bottomSenderBuffer.Push(trans)
+	}
+
+	// [BANK-LEVEL TRACKING] count demotion at the DESTINATION bank
+	// (trans.bankID is the bank the demoted entry was placed into —
+	// the finer bank for a demotion).
+	if trans.bankID >= 0 && trans.bankID < len(s.cache.demoteCountByBank) {
+		s.cache.demoteCountByBank[trans.bankID]++
 	}
 
 	if s.cache.debugPromotion {

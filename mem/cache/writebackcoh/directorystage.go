@@ -428,7 +428,8 @@ func (ds *directoryStage) writeBufferReservedForRemote(trans *transaction) bool 
 		return false
 	}
 	wb := ds.cache.writeBuffer
-	used := len(wb.pendingEvictions) + len(wb.inflightEviction)
+	// [ITER10] sum split pending queues.
+	used := len(wb.pendingLocalEvictions) + len(wb.pendingRemoteEvictions) + len(wb.inflightEviction)
 	return used >= wb.writeBufferCapacity*7/8
 }
 

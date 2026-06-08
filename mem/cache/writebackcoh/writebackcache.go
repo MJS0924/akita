@@ -3,6 +3,7 @@ package writebackcoh
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/sarchlab/akita/v4/mem/cache/writebackcoh/internal"
 	"github.com/sarchlab/akita/v4/mem/mem"
@@ -49,8 +50,22 @@ type Comp struct {
 	dirToBankBuffersLocal    []sim.Buffer
 	dirToBankBuffersRemote   []sim.Buffer
 	writeBufferToBankBuffers []sim.Buffer
+	// [ITER13 fix #2 — local/remote split]
+	// 'mshrStageBuffer' and 'writeBufferBuffer' historically multiplexed
+	// both local (own L1 originated) and peer-incoming (from peer L2
+	// via RDMA→remoteTopPort→dirStage→bankStage) transactions in the
+	// same single-slot FIFO (cap=numReqPerCycle=4). Under cross-GPU
+	// contention, local-eviction can fully occupy the 4 slots while
+	// peer's bankStage.finalize* paths see CanPush()=false and stall —
+	// preventing peer ACK and closing the symmetric cycle (stencil2d
+	// sim 17.50 ms hang). The buffer with no suffix retains the LOCAL
+	// (fromLocal=true) traffic; the *Remote variant absorbs the peer
+	// (fromLocal=false) traffic. Each is cap=numReqPerCycle. Pop sites
+	// drain Remote first (mirroring dirToBankBuffersRemote precedent).
 	mshrStageBuffer          sim.Buffer
-	writeBufferBuffer        sim.Buffer // eviction 전용 (writeBufferFlush, writeBufferEvictAndFetch, writeBufferEvictAndWrite)
+	mshrStageBufferRemote    sim.Buffer
+	writeBufferBuffer        sim.Buffer // eviction 전용 (writeBufferFlush, writeBufferEvictAndFetch, writeBufferEvictAndWrite) — LOCAL only
+	writeBufferBufferRemote  sim.Buffer // peer-incoming eviction 전용
 	writeBufferFetchBuffer   sim.Buffer // 순수 fetch 전용 (dirStage.fetch() → writeBufferFetch)
 
 	topParser   *topParser
@@ -106,7 +121,13 @@ type Comp struct {
 	// in-memory counters. Reduces akita_sim_*.sqlite trace size dramatically
 	// for events that report.go only reads as totals at the end of the run.
 	// See report.go's eventCountsProvider for consumption.
-	eventCounts map[string]uint64
+	// [FIX #4] eventCountsMu guards incEvent vs EventCounts. The visualizer
+	// HTTP server (separate goroutine) can call EventCounts() concurrently
+	// with simulator ticks that call incEvent() — without this mutex,
+	// Go runtime detects "concurrent map iteration and map write" and panics
+	// in the final report stage. Observed in REC_halfset/CD_2/CD_1/CD_6 runs.
+	eventCounts   map[string]uint64
+	eventCountsMu sync.RWMutex
 
 	returnValue   bool
 	debugProcess  bool
@@ -115,6 +136,8 @@ type Comp struct {
 }
 
 func (c *Comp) incEvent(name string) {
+	c.eventCountsMu.Lock()
+	defer c.eventCountsMu.Unlock()
 	if c.eventCounts == nil {
 		c.eventCounts = make(map[string]uint64)
 	}
@@ -123,6 +146,8 @@ func (c *Comp) incEvent(name string) {
 
 // EventCounts returns a copy of the in-memory event counters.
 func (c *Comp) EventCounts() map[string]uint64 {
+	c.eventCountsMu.RLock()
+	defer c.eventCountsMu.RUnlock()
 	out := make(map[string]uint64, len(c.eventCounts))
 	for k, v := range c.eventCounts {
 		out[k] = v
@@ -263,6 +288,41 @@ func (c *Comp) eraseRWMask(trans *transaction) {
 			wm[i] = 0
 		}
 	}
+}
+
+// [ITER13 fix #2 — split buffer helpers] Route Push/CanPush by
+// trans.fromLocal so peer-incoming traffic cannot be HoL-blocked by
+// local in mshrStageBuffer or writeBufferBuffer.
+func (c *Comp) writeBufferBufferCanPush(fromLocal bool) bool {
+	if fromLocal {
+		return c.writeBufferBuffer.CanPush()
+	}
+	return c.writeBufferBufferRemote.CanPush()
+}
+func (c *Comp) writeBufferBufferPush(item interface{}, fromLocal bool) {
+	if fromLocal {
+		c.writeBufferBuffer.Push(item)
+	} else {
+		c.writeBufferBufferRemote.Push(item)
+	}
+}
+func (c *Comp) mshrStageBufferCanPush(fromLocal bool) bool {
+	if fromLocal {
+		return c.mshrStageBuffer.CanPush()
+	}
+	return c.mshrStageBufferRemote.CanPush()
+}
+func (c *Comp) mshrStageBufferPush(item interface{}, fromLocal bool) {
+	if fromLocal {
+		c.mshrStageBuffer.Push(item)
+	} else {
+		c.mshrStageBufferRemote.Push(item)
+	}
+}
+
+// Combined Size for flusher.go drain checks.
+func (c *Comp) writeBufferBufferTotalSize() int {
+	return c.writeBufferBuffer.Size() + c.writeBufferBufferRemote.Size()
 }
 
 func (c *Comp) eraseCacheLineFromRWMask(pid vm.PID, addr uint64) {

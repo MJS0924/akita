@@ -19,7 +19,13 @@ func (s *mshrStage) Tick() bool {
 		return s.processOneReq()
 	}
 
-	item := s.cache.mshrStageBuffer.Pop()
+	// [ITER13 fix #2] Pop Remote first (peer-incoming has priority);
+	// fall back to Local. Mirrors the bankStage.pullFromBuf 'Remote
+	// drains before Local' invariant.
+	item := s.cache.mshrStageBufferRemote.Pop()
+	if item == nil {
+		item = s.cache.mshrStageBuffer.Pop()
+	}
 	if item == nil || len(item.(*internal.MSHREntry).Requests) == 0 {
 		return false
 	}
@@ -32,6 +38,7 @@ func (s *mshrStage) Tick() bool {
 func (s *mshrStage) Reset() {
 	s.processingMSHREntry = nil
 	s.cache.mshrStageBuffer.Clear()
+	s.cache.mshrStageBufferRemote.Clear()
 }
 
 func (s *mshrStage) processOneReq() bool {

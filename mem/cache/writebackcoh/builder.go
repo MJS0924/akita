@@ -28,12 +28,13 @@ type Builder struct {
 	interleavingUnitCount int
 	interleavingUnitIndex int
 
-	byteSize            uint64
-	numMSHREntry        int
-	numReqPerCycle      int
-	writeBufferCapacity int
-	maxInflightFetch    int
-	maxInflightEviction int
+	byteSize                 uint64
+	numMSHREntry             int
+	numReqPerCycle           int
+	writeBufferCapacity      int
+	maxInflightFetch         int
+	maxInflightEviction      int
+	maxOutgoingRemotePending int
 
 	cohDirLatency int
 	dirLatency    int
@@ -158,6 +159,17 @@ func (b Builder) WithMaxInflightFetch(n int) Builder {
 // write buffer can write to a low-level module.
 func (b Builder) WithMaxInflightEviction(n int) Builder {
 	b.maxInflightEviction = n
+	return b
+}
+
+// WithMaxOutgoingRemotePending caps the sum of pending+inflight remote-
+// bound evictions per L2 cache. Smaller than writeBufferCapacity so that
+// the per-cache wB total cannot reach the full-cap from sender-side
+// remote evictions alone — guarantees headroom at the receiver L2 for
+// incoming-write-triggered evictions, closing the symmetric cross-GPU
+// wB-saturation cycle (stencil2d REC sim 19.95ms hang). n=0 disables.
+func (b Builder) WithMaxOutgoingRemotePending(n int) Builder {
+	b.maxOutgoingRemotePending = n
 	return b
 }
 
@@ -352,10 +364,11 @@ func (b *Builder) createInternalStages(cache *Comp) {
 	cache.mshrStage = &mshrStage{cache: cache}
 	cache.flusher = &flusher{cache: cache}
 	cache.writeBuffer = &writeBufferStage{
-		cache:               cache,
-		writeBufferCapacity: b.writeBufferCapacity,
-		maxInflightFetch:    b.maxInflightFetch,
-		maxInflightEviction: b.maxInflightEviction,
+		cache:                    cache,
+		writeBufferCapacity:      b.writeBufferCapacity,
+		maxInflightFetch:         b.maxInflightFetch,
+		maxInflightEviction:      b.maxInflightEviction,
+		maxOutgoingRemotePending: b.maxOutgoingRemotePending,
 	}
 }
 
@@ -514,12 +527,22 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 		cache.Name()+".WriteBufferToBankBuffer",
 		cache.numReqPerCycle,
 	)
+	// [ITER13 fix #2] local/remote split — each cap=numReqPerCycle so
+	// total slots stay 2× the original, but local cannot HoL-block peer.
 	cache.mshrStageBuffer = sim.NewBuffer(
 		cache.Name()+".MSHRStageBuffer",
 		cache.numReqPerCycle,
 	)
+	cache.mshrStageBufferRemote = sim.NewBuffer(
+		cache.Name()+".MSHRStageBufferRemote",
+		cache.numReqPerCycle,
+	)
 	cache.writeBufferBuffer = sim.NewBuffer(
 		cache.Name()+".WriteBufferBuffer",
+		cache.numReqPerCycle,
+	)
+	cache.writeBufferBufferRemote = sim.NewBuffer(
+		cache.Name()+".WriteBufferBufferRemote",
 		cache.numReqPerCycle,
 	)
 	// [FIX: head-of-line] writeBufferFetch 항목 전용 버퍼.

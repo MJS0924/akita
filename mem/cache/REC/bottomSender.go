@@ -16,6 +16,26 @@ type bottomSender struct {
 	maxInflightBypassRequest int
 	maxInflightRequest       int
 	maxInflightInvalidation  int
+	// [OUTGOING-REMOTE CAP FIX, REC layer] Sub-cap of
+	// maxInflightRequest that ONLY bounds the remote branch
+	// (remoteInflightRequest). Keeps the remote inflight from
+	// consuming the full maxInflightRequest budget so local-origin
+	// reverse-flow (ack-return, bypass response, etc.) always has
+	// guaranteed headroom. <= 0 disables. Mirrors the L2
+	// outgoing-remote pending cap pattern at the bottomSender layer.
+	maxOutgoingRemoteInflight int
+
+	// [RDMA-LAYER DIAG] Counters for responses that arrived but
+	// matched no inflight (bypass / local / remote) — silently
+	// discarded in processWriteDoneRsp / processDataReadyRsp. The
+	// counterpart of RDMA's lostRspFromL2Count, but at the REC layer
+	// (responses arriving from peer GPU via the RDMA → REC.bottomPort
+	// path). Non-zero suggests responses are dropping somewhere
+	// upstream of REC's bookkeeping.
+	lostWriteDoneRspCount uint64
+	lostDataReadyRspCount uint64
+	lostWriteDoneRspSampleID string
+	lostDataReadyRspSampleID string
 
 	// Phase 2 inv-emit budget (see cohdirectory/bottomSender.go for
 	// rationale). Filtered by message type when draining the shared
@@ -80,19 +100,24 @@ func (bs *bottomSender) Tick() bool {
 
 	madeProgress := false
 
-	// madeProgress = bs.processReturnRsp() || madeProgress
-	// madeProgress = bs.processInputReq() || madeProgress
-	// madeProgress = bs.processInvalidationRsp() || madeProgress
-
-	// madeProgress = bs.sendToBottom() || madeProgress
-	// madeProgress = bs.sendToTop() || madeProgress
-
+	// [ITER6 RESPONSE PRIORITY] Tick re-ordered to drain RESPONSES first
+	// (sendBypassRspToTop, sendRemoteRspToTop, sendToTop, processReturnRsp,
+	// processInvalidationRsp) before sending new requests (processInputReq,
+	// processBypassReq, processInvalidationReq, sendToBottom). This
+	// ensures that within each tick the upstream sees the freshest
+	// state (lower inflict counts) and is more likely to make
+	// forward progress, breaking the closed wait cycle.
 	temp := false
-	// [추가] Bypass 버퍼를 가장 먼저(또는 병렬로) 확인하여 빠른 처리 보장
-	temp = bs.processBypassReq()
+
+	// === RESPONSE PHASE: drain all responses first ===
+	temp = bs.sendBypassRspToTop()
+	madeProgress = madeProgress || temp
+	temp = bs.sendRemoteRspToTop()
+	madeProgress = madeProgress || temp
+	temp = bs.sendToTop()
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
-		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.0: %v\n", bs.cache.deviceID, temp)
+		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.5: %v\n", bs.cache.deviceID, temp)
 	}
 
 	temp = bs.processReturnRsp()
@@ -101,19 +126,31 @@ func (bs *bottomSender) Tick() bool {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.1: %v\n", bs.cache.deviceID, temp)
 	}
 
+	temp = bs.processInvalidationRsp()
+	madeProgress = madeProgress || temp
+	if bs.cache.printReturn {
+		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.3: %v\n", bs.cache.deviceID, temp)
+	}
+
+	// === REQUEST PHASE: process new requests after responses ===
+	// [ITER14 workflow fix #6] processInputReq (peer-driven) runs
+	// BEFORE processBypassReq (local L1 only). processInputReq drains
+	// both remote+local BSB which carry peer + local mixed; doing it
+	// first lets peer-incoming trans (already at remote BSB head) make
+	// progress before local L1's bypass eats sendToBottomQue capacity.
 	temp = bs.processInputReq()
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.2: %v\n", bs.cache.deviceID, temp)
 	}
 
-	temp = bs.processInvalidationReq()
+	temp = bs.processBypassReq()
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
-		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.3: %v\n", bs.cache.deviceID, temp)
+		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.0: %v\n", bs.cache.deviceID, temp)
 	}
 
-	temp = bs.processInvalidationRsp()
+	temp = bs.processInvalidationReq()
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.3: %v\n", bs.cache.deviceID, temp)
@@ -126,20 +163,6 @@ func (bs *bottomSender) Tick() bool {
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.4: %v\n", bs.cache.deviceID, temp)
-	}
-
-	// [추가] 일반 응답보다 Bypass 응답을 최우선으로 전송 (우선순위 라우팅)
-	temp = bs.sendBypassRspToTop()
-	madeProgress = madeProgress || temp
-
-	// [FIX] Dst에 "RDMA"가 없는 remote 응답(write eviction 등)을 RDMAPort로 전송
-	temp = bs.sendRemoteRspToTop()
-	madeProgress = madeProgress || temp
-
-	temp = bs.sendToTop()
-	madeProgress = madeProgress || temp
-	if bs.cache.printReturn {
-		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.5: %v\n", bs.cache.deviceID, temp)
 	}
 
 	return madeProgress
@@ -203,9 +226,17 @@ func (bs *bottomSender) processBypassReq() bool {
 func (bs *bottomSender) processInputReq() bool {
 	progress := false
 
+	// [ITER14 instrumentation fix] Do NOT overwrite returnFalse2 in the
+	// "Peek returned nil" branches when the OTHER buffer's processItem
+	// already failed with a precise reason. The previous code masked
+	// the actual send*-fail reason set by processNewTransaction, making
+	// hang diagnosis impossible. Now: if buffer was non-empty and
+	// processItem failed, returnFalse2 preserves the exact send* reason.
+
 	// 1. Remote 버퍼 우선 확인 (원격 응답/요청을 먼저 빼주어 네트워크 데드락 완화)
 	item := bs.cache.remoteBottomSenderBuffer.Peek()
-	if item != nil {
+	remoteSawItem := item != nil
+	if remoteSawItem {
 		if bs.processItem(item, false) {
 			bs.cache.remoteBottomSenderBuffer.Pop()
 			progress = true
@@ -214,11 +245,18 @@ func (bs *bottomSender) processInputReq() bool {
 
 	// 2. Local 버퍼 확인
 	item = bs.cache.localBottomSenderBuffer.Peek()
-	if item != nil {
+	localSawItem := item != nil
+	if localSawItem {
 		if bs.processItem(item, true) {
 			bs.cache.localBottomSenderBuffer.Pop()
 			progress = true
 		}
+	}
+
+	// Only mark "both empty" when both Peeks returned nil; otherwise
+	// preserve the send*-failure reason already in returnFalse2.
+	if !progress && !remoteSawItem && !localSawItem {
+		bs.returnFalse2 = "both BSB empty (no items to process)"
 	}
 
 	return progress
@@ -229,6 +267,7 @@ func (bs *bottomSender) processItem(item interface{}, isLocal bool) bool {
 	case *transaction:
 		return bs.processNewTransaction(req, isLocal)
 	}
+	bs.returnFalse2 = fmt.Sprintf("processItem: unknown type %T", item)
 	return false
 }
 
@@ -237,16 +276,28 @@ func (bs *bottomSender) processNewTransaction(trans *transaction, isLocal bool) 
 	switch trans.action {
 	case Nothing, InsertNewEntry, UpdateEntry:
 		progress = bs.sendRequestToBottom(trans, isLocal)
+		if !progress {
+			bs.returnFalse2 = fmt.Sprintf("processNewTransaction: sendRequestToBottom returned false (action=%v, isLocal=%v, fromLocal=%v)", trans.action, isLocal, trans.fromLocal)
+		}
 	case EvictAndInsertNewEntry, InvalidateEntry: // entry 전체에 대한 invalidation, invalidation ack에서 사용량을 확인하여 demotion 결정
 		progress = bs.sendInvalidationRequest(trans, isLocal)
+		if !progress {
+			bs.returnFalse2 = fmt.Sprintf("processNewTransaction: sendInvalidationRequest returned false (action=%v, isLocal=%v, fromLocal=%v)", trans.action, isLocal, trans.fromLocal)
+		}
 	case InvalidateAndUpdateEntry: // subentry 하나에 대한 invalidation
 		progress = bs.sendInvalidationRequestByWrite(trans, isLocal)
+		if !progress {
+			bs.returnFalse2 = fmt.Sprintf("processNewTransaction: sendInvalidationRequestByWrite returned false (action=%v, isLocal=%v, fromLocal=%v)", trans.action, isLocal, trans.fromLocal)
+		}
 	case RemoteWriteHitPreserveWriter:
 		// OP5b/REC fix: same wire behavior as InvalidateAndUpdateEntry
 		// (send invalidations to non-writer sharers carried in
 		// trans.invalidationList) but the directory state mutation in
 		// bankstage preserves the writer instead of clearing all sharers.
 		progress = bs.sendInvalidationRequestByWrite(trans, isLocal)
+		if !progress {
+			bs.returnFalse2 = fmt.Sprintf("processNewTransaction: sendInvalidationRequestByWrite (RemoteWriteHitPreserveWriter) returned false (isLocal=%v, fromLocal=%v)", isLocal, trans.fromLocal)
+		}
 	default:
 		panic("unknown transaction action")
 	}
@@ -282,6 +333,7 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 ) bool {
 	if bs.tooManyInflightRequest(trans.fromLocal) {
 		bs.cache.stallInflightFetch++
+		bs.returnFalse2 = fmt.Sprintf("sendRequestToBottom: tooManyInflightRequest=true (localInflight=%d/%d, fromLocal=%v)", len(bs.localInflightRequest), bs.maxInflightRequest, trans.fromLocal)
 		return false
 	}
 
@@ -368,11 +420,13 @@ func (bs *bottomSender) sendInvalidationRequest(
 	// through and hide inv pressure on the fetch path.
 	if trans.action != InvalidateEntry && bs.tooManyInflightRequest(isLocal) {
 		bs.cache.stallInflightFetch++
+		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequest: tooManyInflightRequest=true (localInflight=%d/%d, action=%v)", len(bs.localInflightRequest), bs.maxInflightRequest, trans.action)
 		return false
 	}
 
 	if bs.tooManyInflightInvalidation() {
 		bs.cache.stallInflightInv++
+		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequest: tooManyInflightInvalidation=true (inflightInvToOutside=%d/%d)", len(bs.inflightInvToOutside), bs.maxInflightInvalidation)
 		return false
 	}
 
@@ -522,12 +576,14 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 	// fetch cap (matches CD strict semantics).
 	if bs.tooManyInflightRequest(isLocal) {
 		bs.cache.stallInflightFetch++
+		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequestByWrite: tooManyInflightRequest=true (localInflight=%d/%d)", len(bs.localInflightRequest), bs.maxInflightRequest)
 		return false
 	}
 
 	// 1. Inflight Invalidation 제한 검사
 	if bs.tooManyInflightInvalidation() {
 		bs.cache.stallInflightInv++
+		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequestByWrite: tooManyInflightInvalidation=true (inflightInvToOutside=%d/%d)", len(bs.inflightInvToOutside), bs.maxInflightInvalidation)
 		return false
 	}
 
@@ -604,6 +660,12 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 		} else {
 			bs.pendingRemoteWriteAfterInv = append(bs.pendingRemoteWriteAfterInv, trans)
 		}
+		// [ITER11 FIX] missing progress=true. When i != -1 (already in
+		// inflightInvToOutside) AND validTargets == 0, the original code
+		// reached this branch with progress=false (init), causing the BSB
+		// head to never pop. Setting progress=true here ensures the trans
+		// is consumed once it's been moved to pendingWriteAfterInv.
+		progress = true
 	}
 
 	// 5. 메시지 생성이 모두 끝났으므로 invalidationList 비움
@@ -728,6 +790,9 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 		// if msg.ID == "14861018" {
 		// 	fmt.Fprintf(os.Stderr, "\tDiscard\n")
 		// }
+		// [RDMA-LAYER DIAG] Silent drop counter.
+		bs.lostDataReadyRspCount++
+		bs.lostDataReadyRspSampleID = msg.GetRspTo()
 		port.RetrieveIncoming()
 		return true
 	}
@@ -809,6 +874,9 @@ func (bs *bottomSender) processWriteDoneRsp(msg *mem.WriteDoneRsp, port sim.Port
 		if bs.cache.debugProcess && msg.Origin.GetAddress() == bs.cache.debugAddress {
 			fmt.Printf("[%s] [bottomSender]\tDiscard write rsp - 3.4: addr %x\n", bs.cache.name, msg.Origin.GetAddress())
 		}
+		// [RDMA-LAYER DIAG] Silent drop counter.
+		bs.lostWriteDoneRspCount++
+		bs.lostWriteDoneRspSampleID = msg.GetRspTo()
 		port.RetrieveIncoming()
 		return true
 	}
@@ -1177,7 +1245,39 @@ func (bs *bottomSender) sendToDir() bool {
 // starved by a local burst, while remote-dominant workloads can
 // use the full budget when local is idle. Mirrors the writebackcoh
 // L2 writeBufferStage tooManyInflightEvictions scheme.
+//
+// [OUTGOING-REMOTE CAP FIX, REC layer] Additionally cap the remote
+// branch at maxOutgoingRemoteInflight (default = 3/4 of
+// maxInflightRequest). With cap=128 and outgoing-remote cap=96, the
+// remaining 32 slots stay headroom for local-origin replies/flows
+// that must still drain when remote is saturated. Mirrors the L2-
+// level pattern (numPendingRemoteEvictions + numRemoteInflightEviction
+// <= maxOutgoingRemotePending) that closes the cross-GPU writeBuffer
+// cycle; this REC variant closes the parallel cycle observed at the
+// bottomSender layer (stencil2d REC sim 19.798 ms stall, where
+// remoteInflightRequest=123 of total cap=128 saturated REC's
+// inflight bookkeeping, head-blocking incoming requests at
+// remoteDirStageBuffer).
 func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
+	// [ITER15 PEER-INCOMING BYPASS LANE]
+	// iter14 instrumentation (preserved returnFalse2) captured the exact
+	// hang reason at stencil2d sim 17.12 ms / 615 windows:
+	//   GPU[3].REC.bottomSender.returnFalse2 =
+	//   "processNewTransaction: sendRequestToBottom returned false
+	//    (action=3, isLocal=false, fromLocal=false)"
+	// State at hang: localInflightRequest=0, remoteInflightRequest=128.
+	// total = 0+128 = 128 = maxInflightRequest → cap hit. The shared
+	// cap blocks ALL peer-incoming (fromLocal=false) sendRequestToBottom
+	// admissions even though local sender is idle. Without that lane
+	// open, the peer cannot get its req admitted into our REC pipeline
+	// → no ACK back to peer → peer's own cap stays held → symmetric
+	// cross-GPU cycle. Mirrors the L2 writebackcoh wB peer-incoming
+	// bypass introduced in iter13 fix #1, applied here at the REC
+	// inflight bookkeeping. Sender-side caps are unchanged so total
+	// system load remains bounded.
+	if !isLocal {
+		return false
+	}
 	total := len(bs.localInflightRequest) + len(bs.remoteInflightRequest)
 	if total >= bs.maxInflightRequest {
 		return true
@@ -1185,6 +1285,11 @@ func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
 	if isLocal {
 		localLimit := bs.maxInflightRequest - bs.maxInflightRequest/4
 		return len(bs.localInflightRequest) >= localLimit
+	}
+	// Remote: cap at maxOutgoingRemoteInflight if configured (>0).
+	if bs.maxOutgoingRemoteInflight > 0 &&
+		len(bs.remoteInflightRequest) >= bs.maxOutgoingRemoteInflight {
+		return true
 	}
 	return false
 }

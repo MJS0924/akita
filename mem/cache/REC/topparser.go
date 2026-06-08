@@ -40,6 +40,15 @@ func (p *topParser) Tick() bool {
 		progress = true
 	}
 
+	// D1 (ported from SD 307dbe6): drain the dedicated InvRsp ingress.
+	// Isolated from RDMAInvPort's InvReq backlog so it cannot be
+	// head-blocked by a full invReqBuffer.
+	req = p.cache.RDMAInvRspPort.PeekIncoming()
+	if p.processReq(req, false) {
+		p.cache.RDMAInvRspPort.RetrieveIncoming()
+		progress = true
+	}
+
 	return progress
 }
 

@@ -31,15 +31,17 @@ type directoryStage struct {
 }
 
 func (ds *directoryStage) Tick() (madeProgress bool) {
-	// 양쪽 모두 Tick 진행
-	madeProgress = ds.acceptNewTransaction(true) || madeProgress  // Local
-	madeProgress = ds.acceptNewTransaction(false) || madeProgress // Remote
+	// [FIX da6a521 #2 패턴 적용] Remote 먼저, Local 나중에 처리.
+	// cross-GPU forward progress 보장 — local trans가 remote 처리를
+	// 가로막아 inter-GPU cycle deadlock에 빠지는 것을 방지한다.
+	madeProgress = ds.acceptNewTransaction(false) || madeProgress // Remote 먼저
+	madeProgress = ds.acceptNewTransaction(true) || madeProgress  // Local 나중
 
-	madeProgress = ds.localPipeline.Tick() || madeProgress
 	madeProgress = ds.remotePipeline.Tick() || madeProgress
+	madeProgress = ds.localPipeline.Tick() || madeProgress
 
-	madeProgress = ds.processTransaction(true) || madeProgress
-	madeProgress = ds.processTransaction(false) || madeProgress
+	madeProgress = ds.processTransaction(false) || madeProgress // Remote 먼저
+	madeProgress = ds.processTransaction(true) || madeProgress  // Local 나중
 
 	return madeProgress
 }

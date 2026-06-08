@@ -236,13 +236,16 @@ func (f *flusher) flushCompleted() bool {
 		}
 	}
 
-	if f.cache.writeBufferBuffer.Size() > 0 {
+	// [ITER13 fix #2] sum both split buffers.
+	if f.cache.writeBufferBufferTotalSize() > 0 {
 		return false
 	}
 
 	if len(f.cache.writeBuffer.inflightFetch) > 0 ||
 		len(f.cache.writeBuffer.inflightEviction) > 0 ||
-		len(f.cache.writeBuffer.pendingEvictions) > 0 {
+		// [ITER10] check both split pending queues.
+		len(f.cache.writeBuffer.pendingLocalEvictions) > 0 ||
+		len(f.cache.writeBuffer.pendingRemoteEvictions) > 0 {
 		return false
 	}
 

@@ -36,8 +36,10 @@ type Comp struct {
 	controlPort      sim.Port
 	RDMAPort         sim.Port
 	RDMAInvPort      sim.Port
+	RDMAInvRspPort   sim.Port
 	ToRDMA           sim.RemotePort
 	ToRDMAInv        sim.RemotePort
+	ToRDMAInvRsp     sim.RemotePort
 
 	// [수정 코드] 자원을 Local과 Remote로 완전 분리
 	localDirStageBuffer  sim.Buffer
