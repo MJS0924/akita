@@ -125,6 +125,7 @@ func (s *mshrStage) respondRead(
 	if !fromLocal {
 		dataReady.Src = s.cache.remoteTopPort.AsRemote()
 		s.cache.remoteTopPort.Send(dataReady)
+		s.cache.peerReadServedCount++ // [DIAG] peer read served via MSHR path
 	} else {
 		s.cache.topPort.Send(dataReady)
 	}
@@ -143,6 +144,7 @@ func (s *mshrStage) respondWrite(write *mem.WriteReq, fromLocal bool) {
 	if !fromLocal {
 		writeDoneRsp.Src = s.cache.remoteTopPort.AsRemote()
 		s.cache.remoteTopPort.Send(writeDoneRsp)
+		s.cache.peerWriteAckSent++ // [ITER20 DIAG A]
 	} else {
 		s.cache.topPort.Send(writeDoneRsp)
 	}

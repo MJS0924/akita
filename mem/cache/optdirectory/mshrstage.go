@@ -53,11 +53,13 @@ func (s *mshrStage) processOneReq() bool {
 		t := trans.(*transaction)
 
 		// [수정] 트랜잭션 출처에 따라 타겟 버퍼 분기
+		// [BSB-CLASS-SPLIT] mshr-coalesced trans forward as data-class
+		// (t.action = Nothing, set below) -> Data lane.
 		var targetBuf sim.Buffer
 		if t.fromLocal {
-			targetBuf = s.cache.localBottomSenderBuffer
+			targetBuf = s.cache.localBottomSenderBufferData
 		} else {
-			targetBuf = s.cache.remoteBottomSenderBuffer
+			targetBuf = s.cache.remoteBottomSenderBufferData
 		}
 
 		if !targetBuf.CanPush() {

@@ -875,9 +875,10 @@ func (ds *directoryStage) doWriteHit(
 		// would silently disable super's motion logic.
 		if ds.readPermission(trans, subEntry.Sharer) {
 			trans.action = Nothing
-			targetBuffer := ds.cache.localBottomSenderBuffer
+			// [BSB-CLASS-SPLIT] read-hit fast-path is data-class (Nothing).
+			targetBuffer := ds.cache.localBottomSenderBufferData
 			if !isLocal {
-				targetBuffer = ds.cache.remoteBottomSenderBuffer
+				targetBuffer = ds.cache.remoteBottomSenderBufferData
 			}
 			if !targetBuffer.CanPush() {
 				*ds.returnFalse += "Cannot push to bottom sender buffer"
@@ -901,9 +902,13 @@ func (ds *directoryStage) doWriteHit(
 		trans.evictingPID = block.PID
 	}
 
-	targetBuffer := ds.cache.localBottomSenderBuffer
+	// [BSB-CLASS-SPLIT] only the action==Nothing branch below pushes here,
+	// and Nothing is data-class -> route to the Data lane. (The
+	// InvalidateAndUpdateEntry branch falls through to writeToBank and is
+	// class-routed in bankstage.finalizeTrans.)
+	targetBuffer := ds.cache.localBottomSenderBufferData
 	if !isLocal {
-		targetBuffer = ds.cache.remoteBottomSenderBuffer
+		targetBuffer = ds.cache.remoteBottomSenderBufferData
 	}
 	if trans.action == Nothing {
 		if !targetBuffer.CanPush() {
@@ -925,9 +930,12 @@ func (ds *directoryStage) doWriteMiss(trans *transaction, isLocal bool) bool {
 		ds.cache.doWriteMissRemote++
 	}
 	*ds.returnFalse += "[doWriteMiss] "
-	targetBuffer := ds.cache.localBottomSenderBuffer
+	// [BSB-CLASS-SPLIT] the only direct push below sets action=Nothing
+	// (data-class) -> Data lane. The remote-alloc path falls through to
+	// writeToBank and is class-routed in bankstage.finalizeTrans.
+	targetBuffer := ds.cache.localBottomSenderBufferData
 	if !isLocal {
-		targetBuffer = ds.cache.remoteBottomSenderBuffer
+		targetBuffer = ds.cache.remoteBottomSenderBufferData
 	}
 	if trans.fromLocal { // local write request에 대해 directory miss 발생 시, entry 추가 안 함
 		trans.action = Nothing

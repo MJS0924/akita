@@ -59,7 +59,7 @@ func (f *flusher) existInflightTransaction() bool {
 		return true
 	}
 
-	if len(f.cache.bottomSender.inflightInvToOutside) > 0 {
+	if f.cache.bottomSender.inflightInvToOutsideLen() > 0 {
 		return true
 	}
 
@@ -257,7 +257,7 @@ func (f *flusher) flushCompleted() bool {
 	// dispatched toward local L2 must complete before flush declares done.
 	if len(f.cache.bottomSender.localInflightRequest) > 0 ||
 		len(f.cache.bottomSender.remoteInflightRequest) > 0 ||
-		len(f.cache.bottomSender.inflightInvToOutside) > 0 ||
+		f.cache.bottomSender.inflightInvToOutsideLen() > 0 ||
 		len(f.cache.bottomSender.inflightInvToBottom) > 0 {
 		return false
 	}

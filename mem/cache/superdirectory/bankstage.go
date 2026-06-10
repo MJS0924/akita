@@ -192,21 +192,32 @@ func (s *bankStage) pullFromBuf(isLocal bool) bool {
 
 func (s *bankStage) finalizeTrans(isLocal bool) bool {
 	var postBuf *bufferImpl
-	var bottomSenderBuf sim.Buffer
+	var bsbData sim.Buffer
+	var bsbInv sim.Buffer
 	var mshrStageBuf sim.Buffer
 
 	// 목적지 버퍼 라우팅
+	// [BSB-CLASS-SPLIT] choose the Data + Inv class lanes per side; the
+	// per-element switch below picks bottomSenderBuf = bsbData or bsbInv by
+	// trans.action so an inv-class push cannot consume data-class headroom.
 	if isLocal {
 		postBuf = s.localPostPipelineBuf
-		bottomSenderBuf = s.cache.localBottomSenderBuffer
+		bsbData = s.cache.localBottomSenderBufferData
+		bsbInv = s.cache.localBottomSenderBufferInv
 		mshrStageBuf = s.cache.localMshrStageBuffer
 	} else {
 		postBuf = s.remotePostPipelineBuf
-		bottomSenderBuf = s.cache.remoteBottomSenderBuffer
+		bsbData = s.cache.remoteBottomSenderBufferData
+		bsbInv = s.cache.remoteBottomSenderBufferInv
 		mshrStageBuf = s.cache.remoteMshrStageBuffer
 	}
 
-	if !bottomSenderBuf.CanPush() {
+	// [BSB-CLASS-SPLIT] Conservative admission: require headroom on BOTH
+	// class lanes before draining the post-pipeline, because the action of
+	// the head element is not known without popping (mirrors REC bankstage).
+	// 1-slot CanPush checks only; no semantic change vs the old single
+	// CanPush guard other than the lane decoupling.
+	if !bsbData.CanPush() || !bsbInv.CanPush() {
 		s.cache.stallBottomBufFull++
 		return false
 	}
@@ -227,6 +238,20 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 		}
 
 		done := false
+
+		// [BSB-CLASS-SPLIT] Route inv-bearing actions to the Inv lane,
+		// everything else to the Data lane. Mirrors REC bankstage.go
+		// action classification exactly (super adds the Evict*Promotion/
+		// Demotion evict-driven actions, which are inv-class).
+		bottomSenderBuf := bsbData
+		switch trans.action {
+		case EvictAndInsertNewEntry,
+			InvalidateAndUpdateEntry,
+			InvalidateEntry,
+			EvictAndPromotionEntry,
+			EvictAndDemotionEntry:
+			bottomSenderBuf = bsbInv
+		}
 
 		switch trans.action {
 		case InsertNewEntry:

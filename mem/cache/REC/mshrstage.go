@@ -68,6 +68,15 @@ func (s *mshrStage) processOneReq() bool {
 		}
 
 		if !targetBuf.CanPush() {
+			// [DOWRITE-TRACE] MSHR entry cannot drain because its target BSB
+			// lane is full -> mshr.Remove below is skipped -> the entry stays
+			// -> peer WRITEs to this line keep getting rejected at doWrite.
+			if s.cache.debugProcess {
+				if tLine, _ := getCacheLineID(s.cache.debugAddress, s.cache.log2BlockSize); trans.mshrEntry.Address == tLine {
+					fmt.Printf("[%s][TRACE] mshrStage STALL line=%x BSBData full (req fromLocal=%v) -> MSHR entry NOT freed\n",
+						s.cache.name, trans.mshrEntry.Address, t.fromLocal)
+				}
+			}
 			return progress
 		}
 
@@ -91,6 +100,12 @@ func (s *mshrStage) processOneReq() bool {
 		progress = true
 	}
 
+	if s.cache.debugProcess {
+		if tLine, _ := getCacheLineID(s.cache.debugAddress, s.cache.log2BlockSize); trans.mshrEntry.Address == tLine {
+			fmt.Printf("[%s][TRACE] mshrStage MSHR-FREED line=%x (entry removed, peer writes can now proceed)\n",
+				s.cache.name, trans.mshrEntry.Address)
+		}
+	}
 	s.cache.mshr.Remove(trans.mshrEntry.PID, trans.mshrEntry.Address)
 
 	// [수정] 처리가 완료되었으므로 알맞은 버퍼에서 Pop

@@ -34,10 +34,10 @@ func TestBankFetchedRspNotBlockedByBypassAdmit(t *testing.T) {
 
 	// One bank with capacity 2 on REQ side (admit), 4 on RSP side.
 	cache.writeBufferToBankBuffersReq = []sim.Buffer{
-		sim.NewBuffer("bank0Req", 2),
+		sim.NewBuffer("Bank0Req", 2),
 	}
 	cache.writeBufferToBankBuffersRsp = []sim.Buffer{
-		sim.NewBuffer("bank0Rsp", 4),
+		sim.NewBuffer("Bank0Rsp", 4),
 	}
 
 	// Fill the REQ buffer to capacity to model bypass-admit HoL.
@@ -76,10 +76,20 @@ func TestBankFetchedRspNotBlockedByBypassAdmit(t *testing.T) {
 			reqSizeBefore, cache.writeBufferToBankBuffersReq[0].Size())
 	}
 
-	// Combined-size helper must still see both sides.
-	cache.writeBufferToBankBuffersRsp[0].Push(&transaction{})
-	wantTotal := cache.writeBufferToBankBuffersReq[0].Size() +
-		cache.writeBufferToBankBuffersRsp[0].Size()
+	// [BANK LOCAL/REMOTE SPLIT] Combined-size helper now sums the four
+	// Local/Remote halves of the Req/Rsp lanes. Seed each half and verify
+	// the helper sees the total.
+	cache.writeBufferToBankBuffersReqLocal = []sim.Buffer{sim.NewBuffer("Bank0ReqLocal", 4)}
+	cache.writeBufferToBankBuffersReqRemote = []sim.Buffer{sim.NewBuffer("Bank0ReqRemote", 4)}
+	cache.writeBufferToBankBuffersRspLocal = []sim.Buffer{sim.NewBuffer("Bank0RspLocal", 4)}
+	cache.writeBufferToBankBuffersRspRemote = []sim.Buffer{sim.NewBuffer("Bank0RspRemote", 4)}
+	cache.writeBufferToBankBuffersReqLocal[0].Push(&transaction{})
+	cache.writeBufferToBankBuffersReqRemote[0].Push(&transaction{})
+	cache.writeBufferToBankBuffersRspLocal[0].Push(&transaction{})
+	wantTotal := cache.writeBufferToBankBuffersReqLocal[0].Size() +
+		cache.writeBufferToBankBuffersReqRemote[0].Size() +
+		cache.writeBufferToBankBuffersRspLocal[0].Size() +
+		cache.writeBufferToBankBuffersRspRemote[0].Size()
 	got := cache.writeBufferToBankBuffersSize(0)
 	if got != wantTotal {
 		t.Fatalf("R5: writeBufferToBankBuffersSize(0)=%d, want %d", got, wantTotal)

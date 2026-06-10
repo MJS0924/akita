@@ -197,21 +197,28 @@ func (s *bankStage) pullFromBuf(isLocal bool) bool {
 // [수정] 파라미터로 isLocal 플래그 추가
 func (s *bankStage) finalizeTrans(isLocal bool) bool {
 	var postBuf *bufferImpl
-	var bottomSenderBuf sim.Buffer
+	var bsbData sim.Buffer
+	var bsbInv sim.Buffer
 	var mshrStageBuf sim.Buffer
 
 	// 목적지 버퍼 라우팅
+	// [BSB-CLASS-SPLIT] choose the Data + Inv class lanes per side; the
+	// per-element switch below picks bottomSenderBuf by trans.action.
 	if isLocal {
 		postBuf = s.localPostPipelineBuf
-		bottomSenderBuf = s.cache.localBottomSenderBuffer
+		bsbData = s.cache.localBottomSenderBufferData
+		bsbInv = s.cache.localBottomSenderBufferInv
 		mshrStageBuf = s.cache.localMshrStageBuffer
 	} else {
 		postBuf = s.remotePostPipelineBuf
-		bottomSenderBuf = s.cache.remoteBottomSenderBuffer
+		bsbData = s.cache.remoteBottomSenderBufferData
+		bsbInv = s.cache.remoteBottomSenderBufferInv
 		mshrStageBuf = s.cache.remoteMshrStageBuffer
 	}
 
-	if !bottomSenderBuf.CanPush() {
+	// [BSB-CLASS-SPLIT] require headroom on BOTH class lanes before draining
+	// the post-pipeline (head action unknown without popping; mirrors REC).
+	if !bsbData.CanPush() || !bsbInv.CanPush() {
 		s.returnFalse0 = "Cannot push to bottomSenderBuffer"
 		s.cache.stallBottomBufFull++
 		return false
@@ -225,6 +232,16 @@ func (s *bankStage) finalizeTrans(isLocal bool) bool {
 	for i := 0; i < postBuf.Size(); i++ {
 		trans := postBuf.Get(i).(bankPipelineElem).trans
 		done := false
+
+		// [BSB-CLASS-SPLIT] route inv-bearing actions to the Inv lane,
+		// everything else (read/no-inv data path) to the Data lane.
+		bottomSenderBuf := bsbData
+		switch trans.action {
+		case EvictAndInsertNewEntry,
+			InvalidateAndUpdateEntry,
+			InvalidateEntry:
+			bottomSenderBuf = bsbInv
+		}
 
 		// [수정] 각 Action 함수에 목적지 버퍼(bottomSenderBuf, mshrStageBuf)를 인자로 넘겨줍니다.
 		switch trans.action {

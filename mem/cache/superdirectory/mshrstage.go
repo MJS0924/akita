@@ -88,11 +88,13 @@ func (s *mshrStage) processOneReq() bool {
 		e := &blk.SubEntry[index]
 
 		// [수정] 트랜잭션 출처에 따라 전송할 타겟 버퍼 분기
+		// [BSB-CLASS-SPLIT] mshr-coalesced trans are data-class
+		// (Nothing/UpdateEntry, set below) -> Data lane.
 		var targetBuf sim.Buffer
 		if t.fromLocal {
-			targetBuf = s.cache.localBottomSenderBuffer
+			targetBuf = s.cache.localBottomSenderBufferData
 		} else {
-			targetBuf = s.cache.remoteBottomSenderBuffer
+			targetBuf = s.cache.remoteBottomSenderBufferData
 		}
 
 		if !targetBuf.CanPush() {
@@ -240,11 +242,13 @@ func (s *mshrStage) processOneReqAfterPromotion() bool {
 		}
 
 		// 1. 출처에 따른 타겟 버퍼 라우팅
+		// [BSB-CLASS-SPLIT] mshr promotion/demotion wake-ups forward as
+		// data-class (action set to Nothing below) -> Data lane.
 		var targetBuf sim.Buffer
 		if t.fromLocal {
-			targetBuf = s.cache.localBottomSenderBuffer
+			targetBuf = s.cache.localBottomSenderBufferData
 		} else {
-			targetBuf = s.cache.remoteBottomSenderBuffer
+			targetBuf = s.cache.remoteBottomSenderBufferData
 		}
 
 		// 2. 버퍼 여유 공간 확인 (Backpressure 처리)
@@ -356,11 +360,13 @@ func (s *mshrStage) processOneReqAfterDemotion() bool {
 		}
 
 		// 1. 출처에 따른 타겟 버퍼 라우팅
+		// [BSB-CLASS-SPLIT] mshr promotion/demotion wake-ups forward as
+		// data-class (action set to Nothing below) -> Data lane.
 		var targetBuf sim.Buffer
 		if t.fromLocal {
-			targetBuf = s.cache.localBottomSenderBuffer
+			targetBuf = s.cache.localBottomSenderBufferData
 		} else {
-			targetBuf = s.cache.remoteBottomSenderBuffer
+			targetBuf = s.cache.remoteBottomSenderBufferData
 		}
 
 		// 2. 버퍼 여유 공간 확인 (Backpressure 처리)

@@ -62,8 +62,24 @@ type Comp struct {
 	localMshrStageBuffer  sim.Buffer
 	remoteMshrStageBuffer sim.Buffer
 
-	localBottomSenderBuffer  sim.Buffer
-	remoteBottomSenderBuffer sim.Buffer
+	// [BSB-CLASS-SPLIT] The single localBottomSenderBuffer /
+	// remoteBottomSenderBuffer was a request-only FIFO mixing data-class
+	// transactions (Nothing/InsertNewEntry/UpdateEntry -> sendRequestToBottom)
+	// with inv-class transactions (EvictAndInsertNewEntry/InvalidateEntry/
+	// InvalidateAndUpdateEntry -> sendInvalidationRequest). An inv-class head
+	// stalled on tooManyInflightInvalidation() (or a data-class head stalled
+	// on tooManyInflightRequest()) head-of-line blocked every trans behind it
+	// in the SAME buffer, so the buffer never drained -> bankStage backpressure
+	// climbed to remoteDirStageBuffer -> RDMAPort.IncomingBuf (relu_hmg
+	// ~win134 deadlock). Splitting by class (mirroring REC) decouples the two
+	// drain paths. The two lanes PARTITION the original numReqPerCycle-deep
+	// capacity (12 data + 4 inv at numReqPerCycle=16) so total admission is
+	// unchanged. Identical to the superdirectory change (shared remote-path
+	// design across HMG unit-size 4 / CD 0 / largeblock 1).
+	localBottomSenderBufferData  sim.Buffer
+	localBottomSenderBufferInv   sim.Buffer
+	remoteBottomSenderBufferData sim.Buffer
+	remoteBottomSenderBufferInv  sim.Buffer
 
 	writeBufferToBankBuffers []sim.Buffer
 	invReqBuffer             sim.Buffer

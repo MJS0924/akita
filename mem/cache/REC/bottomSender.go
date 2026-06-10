@@ -37,6 +37,9 @@ type bottomSender struct {
 	lostDataReadyRspCount uint64
 	lostWriteDoneRspSampleID string
 	lostDataReadyRspSampleID string
+	// [ITER20 DIAG C] eviction-acks (WriteDoneRsp routed to sendToRemoteTopQue)
+	// successfully egressed via RDMADataRspPort toward the original sender.
+	evictAckEgressedCount uint64
 
 	// [C2 observability] Per-PID counter of flushable local-origin
 	// transactions silently dropped during a flush window
@@ -66,9 +69,35 @@ type bottomSender struct {
 	// separately and cap at maxPeerInflightRequest (default 256).
 	maxPeerInflightRequest int
 	numPeerInflightRequest int
+	// [PEER R/W SPLIT] peer-inflight READS only (subset of numPeerInflightRequest).
+	// Reads are held to maxPeerInflightRequest-reserve so incoming WRITES
+	// (evictions → DRAM sink) always retain a forwarding slot.
+	numPeerInflightRead int
 
-	inflightInvToOutside []*transaction
-	inflightInvToBottom  []*invTrans
+	// [DIAG] peerRspRecvCount = DataReadyRsp messages the dir received back
+	// from the L2 (response path). peerRspClearedRemote = how many cleared a
+	// remoteInflightRequest entry (decremented numPeerInflightRequest). If
+	// the L2's peerReadServedCount is high but peerRspRecvCount stays low,
+	// the L2's DataReadyRsp never reaches the dir. If recv is high but
+	// cleared is low, the responses arrive but don't match the 256 stuck.
+	peerRspRecvCount       uint64
+	peerRspClearedRemote   uint64
+
+	// [ORIGIN-SPLIT] inflightInvToOutside partitioned by ORIGIN
+	// (trans.fromLocal). Previously a single slice + single
+	// maxInflightInvalidation bounded BOTH own-origin (fromLocal=true,
+	// evict/write-driven) invalidations AND peer-serve-originated
+	// (fromLocal=false, peer write/evict via RDMA) invalidations. An
+	// own-origin inv-storm saturating all slots blocked every peer-serve
+	// invalidation from being admitted → the peer's write/evict never
+	// completes → no InvRsp/ack → the cross-GPU cycle holds. This is the
+	// inv-path analogue of the already-fixed tooManyInflightRequest. The
+	// cap is now an asymmetric soft split (own = max - max/4; peer keeps
+	// the full cap incl. reserve), so an own inv-storm always leaves
+	// headroom for peer-serve invalidations.
+	inflightInvToOutsideOwn    []*transaction
+	inflightInvToOutsideRemote []*transaction
+	inflightInvToBottom        []*invTrans
 
 	// Split pendingWriteAfterInv by trans.fromLocal direction to avoid
 	// head-of-line stall under asymmetric soft cap (see superdirectory
@@ -392,7 +421,7 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 	trans *transaction,
 	isLocal bool,
 ) bool {
-	if bs.tooManyInflightRequest(trans.fromLocal) {
+	if bs.tooManyInflightRequest(trans.fromLocal, trans.write != nil) {
 		bs.cache.stallInflightFetch++
 		bs.returnFalse2 = fmt.Sprintf("sendRequestToBottom: tooManyInflightRequest=true (localInflight=%d/%d, fromLocal=%v)", len(bs.localInflightRequest), bs.maxInflightRequest, trans.fromLocal)
 		return false
@@ -429,10 +458,21 @@ func (bs *bottomSender) sendRequestToBottom( // 단일 request만 전송
 		bs.sendToRemoteBottomQue = append(bs.sendToRemoteBottomQue, req)
 		bs.remoteInflightRequest = append(bs.remoteInflightRequest, trans)
 	}
+	// [DOWRITE-TRACE] traced cache line reached the L2 forward (past doWrite).
+	if bs.cache.debugProcess {
+		tLine, _ := getCacheLineID(bs.cache.debugAddress, bs.cache.log2BlockSize)
+		if l, _ := getCacheLineID(trans.accessReq().GetAddress(), bs.cache.log2BlockSize); l == tLine {
+			fmt.Printf("[%s][TRACE] sendRequestToBottom FORWARD-TO-L2 addr=%x isLocal=%v fromLocal=%v write=%v\n",
+				bs.cache.name, trans.accessReq().GetAddress(), isLocal, trans.fromLocal, trans.write != nil)
+		}
+	}
 	// [ITER17 F5b] Track peer-bypass inflight count so tooManyInflightRequest
 	// can cap it. Origin = trans.fromLocal (peer if !fromLocal).
 	if !trans.fromLocal {
 		bs.numPeerInflightRequest++
+		if trans.read != nil { // [PEER R/W SPLIT] track peer reads separately
+			bs.numPeerInflightRead++
+		}
 	}
 
 	bs.cache.bottomSendCount++
@@ -492,15 +532,15 @@ func (bs *bottomSender) sendInvalidationRequest(
 	// own sender cap), so using `isLocal` here was a semantic mismatch
 	// that let local sender flood the cap without throttling. Mirror
 	// of sendRequestToBottom:334 which already uses trans.fromLocal.
-	if trans.action != InvalidateEntry && bs.tooManyInflightRequest(trans.fromLocal) {
+	if trans.action != InvalidateEntry && bs.tooManyInflightRequest(trans.fromLocal, trans.write != nil) {
 		bs.cache.stallInflightFetch++
 		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequest: tooManyInflightRequest=true (localInflight=%d/%d, action=%v, fromLocal=%v)", len(bs.localInflightRequest), bs.maxInflightRequest, trans.action, trans.fromLocal)
 		return false
 	}
 
-	if bs.tooManyInflightInvalidation() {
+	if bs.tooManyInflightInvalidation(trans.fromLocal) {
 		bs.cache.stallInflightInv++
-		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequest: tooManyInflightInvalidation=true (inflightInvToOutside=%d/%d)", len(bs.inflightInvToOutside), bs.maxInflightInvalidation)
+		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequest: tooManyInflightInvalidation=true (own=%d remote=%d max=%d fromLocal=%v)", len(bs.inflightInvToOutsideOwn), len(bs.inflightInvToOutsideRemote), bs.maxInflightInvalidation, trans.fromLocal)
 		return false
 	}
 
@@ -565,10 +605,10 @@ func (bs *bottomSender) sendInvalidationRequest(
 
 	// 3. 무효화 대상이 있을 때만 Inflight 큐에 등록하고 메시지 생성
 	if hasValidTargets {
-		// (참고: superdirectory의 findTransactionByID는 반환값이 1개(int)이므로 i만 받습니다)
-		i := bs.findInvTransactionByID(trans.accessReq().Meta().ID, bs.inflightInvToOutside)
-		if i == -1 {
-			bs.inflightInvToOutside = append(bs.inflightInvToOutside, trans)
+		// [ORIGIN-SPLIT] duplicate guard across BOTH origin lists; register
+		// into the list matching trans.fromLocal.
+		if !bs.inflightInvToOutsideContains(trans.accessReq().Meta().ID) {
+			bs.appendInflightInvToOutside(trans)
 			progress = true
 		}
 
@@ -637,7 +677,24 @@ func (bs *bottomSender) sendInvalidationRequest(
 	// 4. Bottom으로의 추가 요청 하달
 	// EvictAndInsertNewEntry만 실제 데이터 요청이 발생하므로 Bottom으로 보냄
 	if trans.action == EvictAndInsertNewEntry {
-		return bs.sendRequestToBottom(trans, isLocal) || progress
+		if bs.sendRequestToBottom(trans, isLocal) {
+			return true
+		}
+		// [ACK-LEAK FIX sister] The invalidation half already progressed
+		// (InvReqs queued above), so the caller will pop this trans from the
+		// BSB. If the data-write half is rejected here (inflight cap), the
+		// write must NOT be lost with it — park it in the same bounded
+		// pendingWriteAfterInv retry queue used by the InvalidateAndUpdate
+		// path. processPendingWriteAfterInv re-issues it when the cap frees.
+		if progress {
+			trans.action = Nothing
+			if trans.fromLocal {
+				bs.pendingLocalWriteAfterInv = append(bs.pendingLocalWriteAfterInv, trans)
+			} else {
+				bs.pendingRemoteWriteAfterInv = append(bs.pendingRemoteWriteAfterInv, trans)
+			}
+		}
+		return progress
 	}
 
 	return progress
@@ -651,16 +708,16 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 	// fetch cap (matches CD strict semantics).
 	// [ITER17 F5a] Pass trans.fromLocal (origin) instead of isLocal
 	// (BSB side) — mirror of sendInvalidationRequest:421.
-	if bs.tooManyInflightRequest(trans.fromLocal) {
+	if bs.tooManyInflightRequest(trans.fromLocal, trans.write != nil) {
 		bs.cache.stallInflightFetch++
 		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequestByWrite: tooManyInflightRequest=true (localInflight=%d/%d)", len(bs.localInflightRequest), bs.maxInflightRequest)
 		return false
 	}
 
 	// 1. Inflight Invalidation 제한 검사
-	if bs.tooManyInflightInvalidation() {
+	if bs.tooManyInflightInvalidation(trans.fromLocal) {
 		bs.cache.stallInflightInv++
-		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequestByWrite: tooManyInflightInvalidation=true (inflightInvToOutside=%d/%d)", len(bs.inflightInvToOutside), bs.maxInflightInvalidation)
+		bs.returnFalse2 = fmt.Sprintf("sendInvalidationRequestByWrite: tooManyInflightInvalidation=true (own=%d remote=%d max=%d fromLocal=%v)", len(bs.inflightInvToOutsideOwn), len(bs.inflightInvToOutsideRemote), bs.maxInflightInvalidation, trans.fromLocal)
 		return false
 	}
 
@@ -677,8 +734,8 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 
 	progress := false
 
-	i := bs.findInvTransactionByID(trans.accessReq().Meta().ID, bs.inflightInvToOutside)
-	if i == -1 {
+	// [ORIGIN-SPLIT] duplicate guard across BOTH origin lists.
+	if !bs.inflightInvToOutsideContains(trans.accessReq().Meta().ID) {
 		// [핵심 변경 2] 자원이 꽉 차서 Demoted Entry 생성에 실패하면 즉시 조기 리턴.
 		// false를 반환하므로 processInputReq에서 Pop() 되지 않고, 다음 Tick에 재시도합니다.
 		// if !bs.insertDemotedEntry(trans) {
@@ -686,8 +743,9 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 		// }
 
 		// (이전 답변의 좀비 트랜잭션 방지 로직: 타겟이 있을 때만 Inflight 큐에 넣음)
+		// [ORIGIN-SPLIT] register into the list matching trans.fromLocal.
 		if len(validTargets) > 0 {
-			bs.inflightInvToOutside = append(bs.inflightInvToOutside, trans)
+			bs.appendInflightInvToOutside(trans)
 		}
 		progress = true
 	}
@@ -835,6 +893,7 @@ func (bs *bottomSender) processRspMsg(msg sim.Msg, port sim.Port) bool {
 }
 
 func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port) bool {
+	bs.peerRspRecvCount++ // [DIAG] a DataReadyRsp reached the dir from the L2
 	isBypass := false
 	isLocal := false
 
@@ -1046,9 +1105,15 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 	}
 
 	req := inflightInv.req
+	// [ITER19 INV-RSP ROUTE FIX] Rewrite InvRsp Dst RDMAInvInside ->
+	// RDMAInvRspInside. Paired with draining sendToRDMAInvRspQue on the new
+	// RDMAInvRspOutPort (ForInvRsp) below, so the InvRsp reaches RDMA's
+	// processFromInvRspInside instead of landing on the InvReq connection.
+	rspDst := sim.RemotePort(strings.Replace(
+		string(req.Meta().Src), ".RDMAInvInside", ".RDMAInvRspInside", 1))
 	rspToOutside := mem.InvRspBuilder{}.
 		WithSrc(bs.cache.topPort.AsRemote()).
-		WithDst(req.Meta().Src).
+		WithDst(rspDst).
 		WithRspTo(req.ReqFrom).
 		WithNumInv(inflightInv.numInv).
 		WithAccessed(inflightInv.accessed).
@@ -1085,12 +1150,13 @@ func (bs *bottomSender) processInvalidationRsp() bool {
 func (bs *bottomSender) processInvRsp(rsp *mem.InvRsp) bool {
 	// fmt.Printf("[%s.BS]\tF.0. Process InvRsp: rspTo %s, SrcRDMA %s\n", bs.cache.Name(), rsp.RespondTo, rsp.SrcRDMA)
 
-	i := bs.findInvTransactionByID(rsp.RespondTo, bs.inflightInvToOutside)
+	// [ORIGIN-SPLIT] search BOTH origin lists for the matching inv-inflight.
+	list, i := bs.findInflightInvToOutsideByID(rsp.RespondTo)
 	if i == -1 {
 		// fmt.Printf("[%s]\tF. Cannot find transaction for InvRsp with RspTo %s\n", bs.cache.Name(), rsp.RespondTo)
 		return true
 	}
-	trans := bs.inflightInvToOutside[i]
+	trans := (*list)[i]
 
 	for j, sh := range trans.pendingEviction {
 		// fmt.Printf("[%s]\tF.1.0. Check pending eviction: %s\n", bs.cache.Name(), sh)
@@ -1110,7 +1176,7 @@ func (bs *bottomSender) processInvRsp(rsp *mem.InvRsp) bool {
 
 	// [수정] 대기 목록이 비워지면 안전한 헬퍼 함수를 사용하여 Inflight에서 트랜잭션 제거
 	if len(trans.pendingEviction) == 0 {
-		bs.removeInflightInvToOutside(i)
+		bs.removeInflightInvToOutsideFrom(list, i)
 		// fmt.Printf("[%s]\tF.2. Remove inflight invalidation to outside\n", bs.cache.Name())
 
 		// write에 의한 invalidation 완료 후 처리.
@@ -1122,7 +1188,18 @@ func (bs *bottomSender) processInvRsp(rsp *mem.InvRsp) bool {
 		// evict-insert 경로). 따라서 InvalidateAndUpdateEntry 경우에만
 		// 재큐잉 (이쪽은 sendInvalidationRequest 가 sendRequestToBottom 을
 		// 호출하지 않고 defer 함).
-		if trans.write != nil && trans.action == InvalidateAndUpdateEntry {
+		//
+		// [ACK-LEAK FIX] RemoteWriteHitPreserveWriter (OP5b) defers its L2
+		// write behind the invalidations EXACTLY like InvalidateAndUpdateEntry
+		// (sendInvalidationRequestByWrite never calls sendRequestToBottom up
+		// front), but this requeue gate predated OP5b and excluded it — the
+		// deferred peer write was silently LOST here once the last InvRsp
+		// arrived: never forwarded to the home L2, so no WriteDoneRsp was
+		// ever produced, permanently pinning one numRemoteInflEvictOwn slot
+		// at the sender. Reciprocal leaks across 4 GPUs pinned all own-
+		// eviction slots (96 cap) -> stencil2d REC freeze at win79.
+		if trans.write != nil && (trans.action == InvalidateAndUpdateEntry ||
+			trans.action == RemoteWriteHitPreserveWriter) {
 			trans.action = Nothing
 			if trans.fromLocal {
 				bs.pendingLocalWriteAfterInv = append(bs.pendingLocalWriteAfterInv, trans)
@@ -1208,6 +1285,7 @@ func (bs *bottomSender) sendRemoteRspToTop() bool {
 	if err != nil {
 		return false
 	}
+	bs.evictAckEgressedCount++ // [ITER20 DIAG C]
 
 	bs.sendToRemoteTopQue[0] = nil
 	bs.sendToRemoteTopQue = bs.sendToRemoteTopQue[1:]
@@ -1231,9 +1309,11 @@ func (bs *bottomSender) sendToTop() bool {
 	if bs.drainOneTypedQueue(&bs.sendToRDMAInvQue, bs.cache.RDMAInvPort) {
 		progress = true
 	}
-	// [R3] Drain the InvRsp lane independently — same egress port but
-	// queue is type-pure so a stalled InvReq head cannot block it.
-	if bs.drainOneTypedQueue(&bs.sendToRDMAInvRspQue, bs.cache.RDMAInvPort) {
+	// [ITER19 INV-RSP ROUTE FIX] Drain the InvRsp lane on the dedicated
+	// RDMAInvRspOutPort (on ForInvRsp), NOT RDMAInvPort (on ForInv). The
+	// InvRsp Dst is now RDMA.RDMAInvRspInside which is only reachable on
+	// ForInvRsp. InvReq egress stays on RDMAInvPort -> req/rsp fully split.
+	if bs.drainOneTypedQueue(&bs.sendToRDMAInvRspQue, bs.cache.RDMAInvRspOutPort) {
 		progress = true
 	}
 	return progress
@@ -1377,7 +1457,7 @@ func (bs *bottomSender) sendToDir() bool {
 // remoteInflightRequest=123 of total cap=128 saturated REC's
 // inflight bookkeeping, head-blocking incoming requests at
 // remoteDirStageBuffer).
-func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
+func (bs *bottomSender) tooManyInflightRequest(isLocal bool, isWrite bool) bool {
 	// [ITER15 PEER-INCOMING BYPASS LANE]
 	// iter14 instrumentation (preserved returnFalse2) captured the exact
 	// hang reason at stencil2d sim 17.12 ms / 615 windows:
@@ -1395,33 +1475,61 @@ func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
 	// inflight bookkeeping. Sender-side caps are unchanged so total
 	// system load remains bounded.
 	if !isLocal {
-		// [ITER17 F5b] Cap the peer-bypass lane at maxPeerInflightRequest
-		// so a hot dest GPU cannot accumulate unbounded inflight from
-		// peer-incoming traffic.
-		if bs.maxPeerInflightRequest > 0 &&
-			bs.numPeerInflightRequest >= bs.maxPeerInflightRequest {
-			return true
+		// [PEER R/W SPLIT] Reserve a sub-pool of the peer-inflight cap for
+		// incoming WRITES (peer evictions → home DRAM, a guaranteed sink:
+		// they always complete and ACK, freeing the slot). Without the
+		// reserve, incoming READS (→ home L2, which can stall) saturate the
+		// whole maxPeerInflightRequest, so the dir cannot forward a single
+		// eviction → that eviction never reaches DRAM → no WriteDoneRsp ACK
+		// → the sender's outgoing-eviction slot stays held → symmetric
+		// cross-GPU tail deadlock (win79: GPU[3] hot home, all 256 peer-
+		// inflight were READs, peerWriteAckSent confirms writes flowed until
+		// the cap saturated with reads). Partition of the existing cap —
+		// NOT an increase. Writes may use the full cap (incl. the reserve);
+		// reads are held to maxPeerInflightRequest-reserve.
+		if bs.maxPeerInflightRequest <= 0 {
+			return false
 		}
-		return false
+		if isWrite {
+			return bs.numPeerInflightRequest >= bs.maxPeerInflightRequest
+		}
+		reserveWrite := bs.maxPeerInflightRequest / 4
+		return bs.numPeerInflightRead >= bs.maxPeerInflightRequest-reserveWrite
 	}
-	total := len(bs.localInflightRequest) + len(bs.remoteInflightRequest)
-	if total >= bs.maxInflightRequest {
-		return true
-	}
-	if isLocal {
-		localLimit := bs.maxInflightRequest - bs.maxInflightRequest/4
-		return len(bs.localInflightRequest) >= localLimit
-	}
-	// Remote: cap at maxOutgoingRemoteInflight if configured (>0).
-	if bs.maxOutgoingRemoteInflight > 0 &&
-		len(bs.remoteInflightRequest) >= bs.maxOutgoingRemoteInflight {
-		return true
-	}
-	return false
+	// [ITER20 FIX] LOCAL inflight cap ONLY — not the shared (local+remote)
+	// total. win80 deadlock root: the shared `total >= maxInflightRequest`
+	// check let a saturated REMOTE branch HoL-block LOCAL forwarding even
+	// when local was nearly idle — captured at the hang as
+	// returnFalse2="tooManyInflightRequest localInflight=9/128" while
+	// remoteInflight≈119 pinned total≥128. The blocked local path jams
+	// L1→dir→L2→writeBuffer, freezing the GPU and starving the cross-GPU
+	// eviction-ack flow. Peer-incoming (remote) admissions are bounded
+	// separately by maxPeerInflightRequest in the !isLocal lane above, so
+	// dropping the shared total adds no unbounded growth and no cap
+	// increase. Mirrors the L2 writebackcoh numLocal/numRemoteInflight
+	// Eviction split (ITER16).
+	localLimit := bs.maxInflightRequest - bs.maxInflightRequest/4
+	return len(bs.localInflightRequest) >= localLimit
 }
 
-func (bs *bottomSender) tooManyInflightInvalidation() bool {
-	return len(bs.inflightInvToOutside) >= bs.maxInflightInvalidation
+// tooManyInflightInvalidation gates an outbound invalidation admit by ORIGIN
+// against the shared maxInflightInvalidation budget, using the SAME asymmetric
+// soft-cap pattern as tooManyInflightRequest: own-origin (fromLocal=true) is
+// held to max - max/4 so a local eviction/write inv-storm always leaves the
+// reserve free for peer-serve (fromLocal=false) invalidations, which may use
+// the full cap. The total occupancy (both lists) is still hard-bounded by
+// maxInflightInvalidation. [ORIGIN-SPLIT] inv-path analogue of the already-
+// fixed tooManyInflightRequest.
+func (bs *bottomSender) tooManyInflightInvalidation(fromLocal bool) bool {
+	total := bs.inflightInvToOutsideLen()
+	if total >= bs.maxInflightInvalidation {
+		return true
+	}
+	if fromLocal {
+		localLimit := bs.maxInflightInvalidation - bs.maxInflightInvalidation/4
+		return len(bs.inflightInvToOutsideOwn) >= localLimit
+	}
+	return false
 }
 
 func (bs *bottomSender) tooManyInflightInvalidationToBottom() bool {
@@ -1435,7 +1543,9 @@ func (bs *bottomSender) Reset() {
 	bs.remoteInflightRequest = nil
 
 	bs.inflightInvToBottom = nil
-	bs.inflightInvToOutside = nil
+	// [ORIGIN-SPLIT] clear both inv-inflight origin lists.
+	bs.inflightInvToOutsideOwn = nil
+	bs.inflightInvToOutsideRemote = nil
 	bs.pendingLocalWriteAfterInv = nil
 	bs.pendingRemoteWriteAfterInv = nil
 	// [ITER17 F4/D7] clear typed sub-queues.
@@ -1492,6 +1602,56 @@ func (bs *bottomSender) findInvTransactionByID(ID string, list []*transaction) i
 	return -1
 }
 
+// [ORIGIN-SPLIT] inflightInvToOutsideLen reports the combined depth of the
+// two ORIGIN inv-inflight lists.
+func (bs *bottomSender) inflightInvToOutsideLen() int {
+	return len(bs.inflightInvToOutsideOwn) + len(bs.inflightInvToOutsideRemote)
+}
+
+// inflightInvToOutsideContains reports whether either ORIGIN list already
+// holds an inv-inflight transaction with the given access-req ID (the
+// duplicate guard the append sites used to express via findInvTransactionByID
+// == -1).
+func (bs *bottomSender) inflightInvToOutsideContains(ID string) bool {
+	if bs.findInvTransactionByID(ID, bs.inflightInvToOutsideOwn) != -1 {
+		return true
+	}
+	return bs.findInvTransactionByID(ID, bs.inflightInvToOutsideRemote) != -1
+}
+
+// appendInflightInvToOutside registers an inv-inflight transaction into the
+// list matching its ORIGIN (trans.fromLocal).
+func (bs *bottomSender) appendInflightInvToOutside(trans *transaction) {
+	if trans.fromLocal {
+		bs.inflightInvToOutsideOwn = append(bs.inflightInvToOutsideOwn, trans)
+	} else {
+		bs.inflightInvToOutsideRemote = append(bs.inflightInvToOutsideRemote, trans)
+	}
+}
+
+// findInflightInvToOutsideByID searches BOTH ORIGIN lists for a transaction
+// matching the response's RespondTo ID, returning the owning slice pointer
+// and the index, or (nil, -1) if not found.
+func (bs *bottomSender) findInflightInvToOutsideByID(ID string) (*[]*transaction, int) {
+	if i := bs.findInvTransactionByID(ID, bs.inflightInvToOutsideOwn); i != -1 {
+		return &bs.inflightInvToOutsideOwn, i
+	}
+	if i := bs.findInvTransactionByID(ID, bs.inflightInvToOutsideRemote); i != -1 {
+		return &bs.inflightInvToOutsideRemote, i
+	}
+	return nil, -1
+}
+
+// removeInflightInvToOutsideFrom removes index i from the given ORIGIN list.
+func (bs *bottomSender) removeInflightInvToOutsideFrom(list *[]*transaction, i int) {
+	if i < 0 || i >= len(*list) {
+		panic(fmt.Sprintf("Trying to remove inflightInvToOutside at out of bounds index %d", i))
+	}
+	copy((*list)[i:], (*list)[i+1:])
+	(*list)[len(*list)-1] = nil
+	*list = (*list)[:len(*list)-1]
+}
+
 func (bs *bottomSender) findInvalidationByID(ID string, list []*invTrans) int {
 	for i, tr := range list {
 		if tr.req.Meta().ID == ID {
@@ -1528,6 +1688,9 @@ func (bs *bottomSender) removeInflightRequest(i int, isLocal bool) {
 	// was peer-originated. Use the trans.fromLocal flag to detect.
 	if trans != nil && !trans.fromLocal && bs.numPeerInflightRequest > 0 {
 		bs.numPeerInflightRequest--
+		if trans.read != nil && bs.numPeerInflightRead > 0 { // [PEER R/W SPLIT]
+			bs.numPeerInflightRead--
+		}
 	}
 }
 
@@ -1545,16 +1708,6 @@ func (bs *bottomSender) removeInflightBypassRequest(i int) {
 	bs.localInflightBypassRequest = bs.localInflightBypassRequest[:len(bs.localInflightBypassRequest)-1]
 }
 
-// [추가] 외부 무효화 리스트에서 트랜잭션을 안전하게 삭제하는 헬퍼 함수
-func (bs *bottomSender) removeInflightInvToOutside(i int) {
-	if i < 0 || i >= len(bs.inflightInvToOutside) {
-		panic(fmt.Sprintf("Trying to remove inflightInvToOutside at out of bounds index %d", i))
-	}
-
-	// 뒤의 원소들을 앞으로 당김
-	copy(bs.inflightInvToOutside[i:], bs.inflightInvToOutside[i+1:])
-	// 마지막 원소 포인터 명시적 해제 (메모리 누수 방지)
-	bs.inflightInvToOutside[len(bs.inflightInvToOutside)-1] = nil
-	// 슬라이스 길이 축소
-	bs.inflightInvToOutside = bs.inflightInvToOutside[:len(bs.inflightInvToOutside)-1]
-}
+// [ORIGIN-SPLIT] removeInflightInvToOutside is superseded by the per-origin
+// removeInflightInvToOutsideFrom(list, i) helper above; the single-list
+// version is removed because the inv-inflight list is now origin-partitioned.

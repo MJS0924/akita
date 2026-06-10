@@ -93,8 +93,27 @@ type Comp struct {
 	localMshrStageBuffer  sim.Buffer
 	remoteMshrStageBuffer sim.Buffer
 
-	localBottomSenderBuffer  sim.Buffer
-	remoteBottomSenderBuffer sim.Buffer
+	// [BSB-CLASS-SPLIT] The single localBottomSenderBuffer /
+	// remoteBottomSenderBuffer was a request-only FIFO that mixed
+	// data-class transactions (Nothing/InsertNewEntry/UpdateEntry ->
+	// sendRequestToBottom) with inv-class transactions
+	// (EvictAndInsertNewEntry/InvalidateEntry/InvalidateAndUpdateEntry/
+	// EvictAndPromotionEntry/EvictAndDemotionEntry ->
+	// sendInvalidationRequest). When the head was an inv-class trans
+	// stalled on tooManyInflightInvalidation() (or a data-class trans
+	// stalled on tooManyInflightRequest()), it head-of-line blocked
+	// every trans behind it in the SAME buffer -> the buffer never
+	// drained -> bankStage.finalizeTrans saw !CanPush -> backpressure
+	// climbed remoteDirToBankBuffers -> remoteDirStageBuffer ->
+	// RDMAPort.IncomingBuf (the relu_sd ~win134 deadlock). Splitting by
+	// class (mirroring REC remoteBSBData/remoteBSBInv) lets a data-class
+	// trans drain on its own Peek/Pop even while an inv-class trans is
+	// capped, and vice versa. The two lanes PARTITION the original 16-deep
+	// capacity (12 data + 4 inv) so total admission budget is unchanged.
+	localBottomSenderBufferData  sim.Buffer
+	localBottomSenderBufferInv   sim.Buffer
+	remoteBottomSenderBufferData sim.Buffer
+	remoteBottomSenderBufferInv  sim.Buffer
 
 	writeBufferToBankBuffers []sim.Buffer
 	invReqBuffer             sim.Buffer

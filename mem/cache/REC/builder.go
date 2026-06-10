@@ -272,6 +272,11 @@ func (b Builder) Build(name string) *Comp {
 	middleware := &middleware{Comp: cache}
 	cache.AddMiddleware(middleware)
 
+	// [DEADLOCK DUMP] post-mortem response-egress state on engine halt.
+	if se, ok := b.engine.(*sim.SerialEngine); ok {
+		se.RegisterStopHook(cache.DumpDeadlockState)
+	}
+
 	return cache
 }
 
@@ -377,6 +382,13 @@ func (b *Builder) createPorts(cache *Comp) {
 		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
 		cache.Name()+".RDMAInvRspPort")
 	cache.AddPort("RDMAInvRsp", cache.RDMAInvRspPort)
+
+	// [ITER19] Dedicated InvRsp EGRESS port (on ForInvRsp). Same sizing as
+	// the sibling inv ports — a new lane, not a cap increase.
+	cache.RDMAInvRspOutPort = sim.NewPort(cache,
+		cache.numReqPerCycle*2, cache.numReqPerCycle*2,
+		cache.Name()+".RDMAInvRspOutPort")
+	cache.AddPort("RDMAInvRspOut", cache.RDMAInvRspOutPort)
 
 	cache.ToRDMA = b.ToRDMA
 }

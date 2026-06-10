@@ -48,6 +48,11 @@ type Comp struct {
 	// ingress added in iter7.
 	RDMAInvPort      sim.Port
 	RDMAInvRspPort   sim.Port
+	// [ITER19] Dedicated InvRsp EGRESS port on the ForInvRsp connection
+	// (mirrors SD/HMG RDMAInvRspOutPort). Keeps outbound InvRsp off the
+	// InvReq connection (RDMAInvPort/ForInv) and off the InvRsp ingress
+	// (RDMAInvRspPort, polled by topparser), so req/rsp stay fully split.
+	RDMAInvRspOutPort sim.Port
 	ToRDMA           sim.RemotePort
 	ToRDMADataReq    sim.RemotePort // [R2] paired with R1 RDMADataReqInside
 	ToRDMADataRsp    sim.RemotePort // [R2] paired with R1 RDMADataRspInside
@@ -163,6 +168,20 @@ type Comp struct {
 	stallBottomPortBusy uint64 // bottomSender: bottomPort/RDMAPort can't send
 	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
 	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
+
+	// [DOWRITE-TRACE] origin-split doWrite outcome counters. The shared
+	// stall counters above cannot tell whether a PEER (remote, fromLocal=
+	// false) request is being rejected/served vs a LOCAL one. These split by
+	// origin to confirm whether peer evictions are rejected at the MSHR-hit-
+	// for-write branch (directorystage.go doWrite). Removable; diagnostic-only.
+	stallMSHRHitWriteLocal  uint64 // doWrite: write hit an existing MSHR entry -> return false (local origin)
+	stallMSHRHitWriteRemote uint64 // doWrite: write hit an existing MSHR entry -> return false (PEER origin) <-- key
+	doWriteMSHRHitLocal     uint64 // doWrite -> doWriteMSHRHit success (local)
+	doWriteMSHRHitRemote    uint64 // doWrite -> doWriteMSHRHit success (peer)
+	doWriteHitLocal         uint64 // doWrite -> doWriteHit (local)
+	doWriteHitRemote        uint64 // doWrite -> doWriteHit (peer)
+	doWriteMissLocal        uint64 // doWrite -> doWriteMiss (local)
+	doWriteMissRemote       uint64 // doWrite -> doWriteMiss (peer)
 
 	// Queueing-delay accumulators (Method E2). Track per-trans wait time
 	// in two phases:

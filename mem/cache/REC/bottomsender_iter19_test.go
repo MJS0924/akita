@@ -19,10 +19,10 @@ import (
 //   into sendToRDMAInvQue (REQ only) and sendToRDMAInvRspQue (RSP only)
 //   draining independently — mirrors the SD S1 split already in tree.
 //
-// R4 — Data drain on localBottomSenderBuffer is not blocked by an
+// R4 — Data drain on localBSBData is not blocked by an
 //   invalidation stall on invReqBuffer.
 //   The bottomSender's Tick processes processInputReq (reads/writes
-//   on localBottomSenderBuffer) and processInvalidationReq (InvReqs
+//   on localBSBData) and processInvalidationReq (InvReqs
 //   on invReqBuffer) as independent stages. R4 asserts the structural
 //   independence so the InvReq backlog cannot HoL-block data drain.
 
@@ -108,16 +108,16 @@ func TestIter19_R3_ResetClearsRspQueue(t *testing.T) {
 // ---------------------------------------------------------------- R4
 
 // TestBSBDataDrainNotBlockedByInvStall validates that the bottomSender
-// buffers (local/remoteBottomSenderBuffer) drain independently of the
+// buffers (local/remoteBSBData) drain independently of the
 // invReqBuffer. Pattern: fill invReqBuffer to capacity and seed
-// localBottomSenderBuffer with data trans; verify the data buffer
+// localBSBData with data trans; verify the data buffer
 // still pops while the InvReq buffer is stuck.
 func TestBSBDataDrainNotBlockedByInvStall(t *testing.T) {
 	cache := &Comp{
 		state:                   cacheStateRunning,
-		localBottomSenderBuffer: sim.NewBuffer("localBSB", 8),
-		remoteBottomSenderBuffer: sim.NewBuffer("remoteBSB", 8),
-		invReqBuffer:            sim.NewBuffer("invReqBuf", 2),
+		localBSBData:  sim.NewBuffer("LocalBSB", 8),
+		remoteBSBData: sim.NewBuffer("RemoteBSB", 8),
+		invReqBuffer:  sim.NewBuffer("InvReqBuf", 2),
 	}
 
 	// Fill invReqBuffer to capacity.
@@ -125,7 +125,7 @@ func TestBSBDataDrainNotBlockedByInvStall(t *testing.T) {
 	cache.invReqBuffer.Push(mem.InvReqBuilder{}.WithAddress(0x200).Build())
 
 	// Seed [REQ, RSP, REQ, RSP, ...] equivalent: data trans go to
-	// localBottomSenderBuffer (the "RSP" half from R4's perspective —
+	// localBSBData (the "RSP" half from R4's perspective —
 	// it carries normal data traffic that must drain), and the InvReq
 	// stall is modeled by the saturated invReqBuffer.
 	for i := 0; i < 4; i++ {
@@ -133,18 +133,18 @@ func TestBSBDataDrainNotBlockedByInvStall(t *testing.T) {
 			id:        sim.GetIDGenerator().Generate(),
 			fromLocal: true,
 		}
-		cache.localBottomSenderBuffer.Push(trans)
+		cache.localBSBData.Push(trans)
 	}
 
 	invBufSizeBefore := cache.invReqBuffer.Size()
-	dataBufSizeBefore := cache.localBottomSenderBuffer.Size()
+	dataBufSizeBefore := cache.localBSBData.Size()
 
 	// Drain the data buffer (mirrors processInputReq advancing). The
 	// invReqBuffer must remain at its (full) capacity — the inv stall
 	// does NOT prevent data progress.
-	for cache.localBottomSenderBuffer.Size() > 0 {
-		if cache.localBottomSenderBuffer.Pop() == nil {
-			t.Fatalf("R4: localBottomSenderBuffer Pop returned nil mid-drain")
+	for cache.localBSBData.Size() > 0 {
+		if cache.localBSBData.Pop() == nil {
+			t.Fatalf("R4: localBSBData Pop returned nil mid-drain")
 		}
 		if cache.invReqBuffer.Size() != invBufSizeBefore {
 			t.Fatalf("R4: data drain leaked into invReqBuffer (size %d -> %d)",
@@ -152,25 +152,25 @@ func TestBSBDataDrainNotBlockedByInvStall(t *testing.T) {
 		}
 	}
 
-	if cache.localBottomSenderBuffer.Size() != 0 {
-		t.Fatalf("R4: expected localBottomSenderBuffer fully drained (was %d, now %d)",
-			dataBufSizeBefore, cache.localBottomSenderBuffer.Size())
+	if cache.localBSBData.Size() != 0 {
+		t.Fatalf("R4: expected localBSBData fully drained (was %d, now %d)",
+			dataBufSizeBefore, cache.localBSBData.Size())
 	}
 	if cache.invReqBuffer.Size() != invBufSizeBefore {
 		t.Fatalf("R4: invReqBuffer must remain stuck (size %d -> %d)",
 			invBufSizeBefore, cache.invReqBuffer.Size())
 	}
 
-	// Symmetric: remoteBottomSenderBuffer drains independently too.
+	// Symmetric: remoteBSBData drains independently too.
 	for i := 0; i < 4; i++ {
 		trans := &transaction{
 			id:        sim.GetIDGenerator().Generate(),
 			fromLocal: false,
 		}
-		cache.remoteBottomSenderBuffer.Push(trans)
+		cache.remoteBSBData.Push(trans)
 	}
-	for cache.remoteBottomSenderBuffer.Size() > 0 {
-		cache.remoteBottomSenderBuffer.Pop()
+	for cache.remoteBSBData.Size() > 0 {
+		cache.remoteBSBData.Pop()
 	}
 	if cache.invReqBuffer.Size() != invBufSizeBefore {
 		t.Fatalf("R4: remoteBSB drain leaked into invReqBuffer")

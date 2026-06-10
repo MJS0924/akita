@@ -33,6 +33,12 @@ type Comp struct {
 	remoteTopPort sim.Port
 	topPort       sim.Port
 	bottomPort    sim.Port
+	// [L2 LOCAL/REMOTE SPLIT] dedicated egress for REMOTE-destined (cross-GPU
+	// RDMA) evictions/fetches, mirroring the REC dir's BottomPort/RemoteBottom
+	// Port split. The single bottomPort's one CanSend/tick re-coupled local-DRAM
+	// and remote-RDMA traffic (own-DRAM-evict could starve the remote-RDMA-evict
+	// / serve flush). With its own port + CanSend, remote drains independently.
+	remoteBottomPort sim.Port
 	controlPort   sim.Port
 
 	cohDirStageBuffer        sim.Buffer
@@ -54,9 +60,23 @@ type Comp struct {
 	// Rsp lane = bankWriteFetched (fetch-response path).
 	// Splitting prevents a write-admit head from blocking a
 	// fetched-response behind it in the same FIFO.
-	writeBufferToBankBuffersReq []sim.Buffer
-	writeBufferToBankBuffersRsp []sim.Buffer
-	writeBufferToBankBuffers    []sim.Buffer
+	//
+	// [BANK LOCAL/REMOTE SPLIT] Each Req/Rsp lane is further split into
+	// Local (fromLocal=true: own-L1 traffic) and Remote (fromLocal=false:
+	// peer-serve traffic) halves, mirroring dirToBankBuffersLocal/Remote and
+	// the directoryStage local/remote pipeline split. This lets the bank's
+	// REMOTE (peer-serve) pull proceed independently of LOCAL bank work,
+	// breaking the cross-GPU writeback deadlock. The unsuffixed
+	// writeBufferToBankBuffersReq/Rsp slices are retained ONLY for length
+	// queries (writeBufferToBankBuffersSize / flusher drain); pushes and
+	// pulls route through the Local/Remote halves.
+	writeBufferToBankBuffersReq       []sim.Buffer
+	writeBufferToBankBuffersRsp       []sim.Buffer
+	writeBufferToBankBuffersReqLocal  []sim.Buffer
+	writeBufferToBankBuffersReqRemote []sim.Buffer
+	writeBufferToBankBuffersRspLocal  []sim.Buffer
+	writeBufferToBankBuffersRspRemote []sim.Buffer
+	writeBufferToBankBuffers          []sim.Buffer
 	// [ITER13 fix #2 — local/remote split]
 	// 'mshrStageBuffer' and 'writeBufferBuffer' historically multiplexed
 	// both local (own L1 originated) and peer-incoming (from peer L2
@@ -87,13 +107,34 @@ type Comp struct {
 	directory           internal.Directory
 	mshr                internal.MSHR
 	maxLocalMshr        int // [추가] Local 요청이 점유할 수 있는 최대 MSHR 개수 (예약 제어용): 전체의 75%로 설정
+	// [ORIGIN-SPLIT] Symmetric reservation for fromLocal=false (peer-serve)
+	// misses. Previously ONLY fromLocal=true was bounded (maxLocalMshr) and
+	// the IsFull residual was shared, so peer-serve could consume the whole
+	// residual (own starves) and own filling to maxLocalMshr left peer-serve
+	// only the gap (peer starves). maxLocalMshr + maxRemoteMshr partition
+	// numMSHREntry (sum = numMSHREntry, NO net increase): own gets a 3/4
+	// quota, peer-serve a guaranteed 1/4 reserve, so neither can monopolize.
+	maxRemoteMshr       int
 	// MSHR 분포 추적 카운터 (deadlock 분석용).
 	mshrLocalAdded    uint64 // fromLocal=true 로 추가된 MSHR entry 총 횟수
 	mshrRemoteAdded   uint64 // fromLocal=false 로 추가된 MSHR entry 총 횟수
 	mshrLocalRemoved  uint64 // fromLocal=true MSHR entry 제거 총 횟수
 	mshrRemoteRemoved uint64 // fromLocal=false MSHR entry 제거 총 횟수
+	// [ITER20 DIAG A] WriteDoneRsp produced for a peer-incoming (fromLocal=false)
+	// write — home L2 served a remote GPU's dirty eviction and emitted the ack
+	// via remoteTopPort. Compare with the sender's writeDoneReceivedCount.
+	peerWriteAckSent uint64
+	// [DIAG] peer READ served: home L2 read its data and emitted DataReadyRsp
+	// via remoteTopPort. peerReadServeFailCount = remoteTopPort.Send returned
+	// an error (egress blocked). If served is high but the dir's
+	// numPeerInflightRequest stays pinned, responses are produced but not
+	// clearing the dir (routing/match). If served is ~0, the L2 never reaches
+	// the serve point (stuck upstream).
+	peerReadServedCount     uint64
+	peerReadServeFailCount  uint64
 	stallMSHRTotalFull uint64 // IsFull로 reject된 횟수 (모두에게 적용)
 	stallMSHRLocalCap  uint64 // local cap으로 reject된 횟수
+	stallMSHRRemoteCap uint64 // [ORIGIN-SPLIT] remote(peer-serve) cap으로 reject된 횟수
 	// Deferred-invalidation counters. Armed: doInvalidation acked an
 	// InvReq on a still-locked block and set PendingInvalidation.
 	// Applied: bankStage.applyPendingInvalidation consumed the flag and
@@ -335,9 +376,31 @@ func (c *Comp) writeBufferBufferTotalSize() int {
 // [R5] writeBufferToBankBuffersSize returns the combined Req+Rsp depth
 // for a given bank — used by flusher.go / drain checks that previously
 // queried the single writeBufferToBankBuffers[bank].Size().
+//
+// [BANK LOCAL/REMOTE SPLIT] Now sums all four Local/Remote halves.
 func (c *Comp) writeBufferToBankBuffersSize(bank int) int {
-	return c.writeBufferToBankBuffersReq[bank].Size() +
-		c.writeBufferToBankBuffersRsp[bank].Size()
+	return c.writeBufferToBankBuffersReqLocal[bank].Size() +
+		c.writeBufferToBankBuffersReqRemote[bank].Size() +
+		c.writeBufferToBankBuffersRspLocal[bank].Size() +
+		c.writeBufferToBankBuffersRspRemote[bank].Size()
+}
+
+// [BANK LOCAL/REMOTE SPLIT] Route the Req-lane bank buffer for a bank by
+// fromLocal. Mirrors directoryStage.bankBufFor for the dir-to-bank lane.
+func (c *Comp) writeBufferToBankBufferReq(bank int, fromLocal bool) sim.Buffer {
+	if fromLocal {
+		return c.writeBufferToBankBuffersReqLocal[bank]
+	}
+	return c.writeBufferToBankBuffersReqRemote[bank]
+}
+
+// [BANK LOCAL/REMOTE SPLIT] Route the Rsp-lane bank buffer for a bank by
+// fromLocal.
+func (c *Comp) writeBufferToBankBufferRsp(bank int, fromLocal bool) sim.Buffer {
+	if fromLocal {
+		return c.writeBufferToBankBuffersRspLocal[bank]
+	}
+	return c.writeBufferToBankBuffersRspRemote[bank]
 }
 
 func (c *Comp) eraseCacheLineFromRWMask(pid vm.PID, addr uint64) {

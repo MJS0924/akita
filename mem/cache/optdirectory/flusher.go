@@ -258,7 +258,11 @@ func (f *flusher) flushCompleted() bool {
 	}
 
 	// [수정] 양방향 BottomSender 버퍼 확인
-	if f.cache.localBottomSenderBuffer.Size() > 0 || f.cache.remoteBottomSenderBuffer.Size() > 0 {
+	// [BSB-CLASS-SPLIT] check all four class lanes for the idle/drained test.
+	if f.cache.localBottomSenderBufferData.Size() > 0 ||
+		f.cache.localBottomSenderBufferInv.Size() > 0 ||
+		f.cache.remoteBottomSenderBufferData.Size() > 0 ||
+		f.cache.remoteBottomSenderBufferInv.Size() > 0 {
 		return false
 	}
 

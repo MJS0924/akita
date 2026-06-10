@@ -221,26 +221,32 @@ func (bs *bottomSender) processBypassReq() bool {
 }
 
 // [수정] 양쪽 큐를 모두 확인하여 데드락 방지
+// [BSB-CLASS-SPLIT] Drain all FOUR class lanes each Tick so an inv-class
+// trans stalled on tooManyInflightInvalidation() (or a data-class trans
+// stalled on tooManyInflightRequest()) only stalls ITS OWN lane; the other
+// three keep draining via independent Peek/Pop. Order: Remote-Inv,
+// Remote-Data, Local-Inv, Local-Data — remote-first preserves the cross-GPU
+// forward-progress rule (a returning peer's request path keeps moving so the
+// RSP that frees its inflight cap can be produced), inv-before-data preserves
+// the egress-priority rule. Mirrors REC bottomSender.processInputReq.
 func (bs *bottomSender) processInputReq() bool {
 	progress := false
 
-	// 1. Remote 버퍼 우선 확인 (원격 응답/요청을 먼저 빼주어 네트워크 데드락 완화)
-	item := bs.cache.remoteBottomSenderBuffer.Peek()
-	if item != nil {
-		if bs.processItem(item, false) {
-			bs.cache.remoteBottomSenderBuffer.Pop()
+	drainOne := func(buf sim.Buffer, isLocal bool) {
+		item := buf.Peek()
+		if item == nil {
+			return
+		}
+		if bs.processItem(item, isLocal) {
+			buf.Pop()
 			progress = true
 		}
 	}
 
-	// 2. Local 버퍼 확인
-	item = bs.cache.localBottomSenderBuffer.Peek()
-	if item != nil {
-		if bs.processItem(item, true) {
-			bs.cache.localBottomSenderBuffer.Pop()
-			progress = true
-		}
-	}
+	drainOne(bs.cache.remoteBottomSenderBufferInv, false)
+	drainOne(bs.cache.remoteBottomSenderBufferData, false)
+	drainOne(bs.cache.localBottomSenderBufferInv, true)
+	drainOne(bs.cache.localBottomSenderBufferData, true)
 
 	return progress
 }
@@ -1106,9 +1112,17 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 	}
 
 	req := inflightInv.req
+	// [ITER19 INV-RSP ROUTE FIX] The forwarded cross-GPU InvReq carries
+	// Src=RDMA.RDMAInvInside (stamped by rdma processInvReq). Copying that
+	// verbatim into the InvRsp Dst routes onto the InvRsp connection where
+	// RDMAInvInside is NOT a member -> "port ...RDMAInvInside not found".
+	// Rewrite to RDMA.RDMAInvRspInside (the only RDMA port on ForInvRsp),
+	// drained by processFromInvRspInside.
+	rspDst := sim.RemotePort(strings.Replace(
+		string(req.Meta().Src), ".RDMAInvInside", ".RDMAInvRspInside", 1))
 	rspToOutside := mem.InvRspBuilder{}.
 		WithSrc(bs.cache.topPort.AsRemote()).
-		WithDst(req.Meta().Src).
+		WithDst(rspDst).
 		WithRspTo(req.ReqFrom).
 		WithNumInv(inflightInv.numInv).
 		WithAccessed(inflightInv.accessed).
@@ -1451,8 +1465,11 @@ func (bs *bottomSender) tooManyInflightInvalidationToBottom() bool {
 }
 
 func (bs *bottomSender) Reset() {
-	bs.cache.localBottomSenderBuffer.Clear()
-	bs.cache.remoteBottomSenderBuffer.Clear()
+	// [BSB-CLASS-SPLIT] clear all four class lanes.
+	bs.cache.localBottomSenderBufferData.Clear()
+	bs.cache.localBottomSenderBufferInv.Clear()
+	bs.cache.remoteBottomSenderBufferData.Clear()
+	bs.cache.remoteBottomSenderBufferInv.Clear()
 	bs.cache.localBypassBuffer.Clear()
 
 	bs.localInflightRequest = nil

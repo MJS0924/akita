@@ -58,6 +58,18 @@ func (f *flusher) existInflightTransaction() bool {
 		return true
 	}
 
+	// [FLUSH-CYCLE FIX] Stay in PreFlushing until the writeBuffer<->bank
+	// eviction ring also drains. flushCompleted() already gates on this
+	// (ITER13 fix #2), but the PreFlushing->Flushing transition did NOT —
+	// so the L2 flipped to Flushing with un-drained displacement victims
+	// still in writeBufferBuffer{,Remote}, and the flush-evicts then
+	// collided with them in the bank ring -> intra-L2 circular buffer
+	// deadlock at end-of-program cache flush. During PreFlushing the L2
+	// keeps serving + draining normally, so this lets the ring empty first.
+	if f.cache.writeBufferBufferTotalSize() > 0 {
+		return true
+	}
+
 	return false
 }
 
@@ -108,9 +120,17 @@ func (f *flusher) processFlush() bool {
 	}
 
 	trans := &transaction{
-		flush:             f.processingFlush,
-		victim:            block,
-		action:            bankEvict,
+		flush:   f.processingFlush,
+		victim:  block,
+		action:  bankEvict,
+		// [FLUSH-CYCLE FIX] This is the cache's OWN flush of a local-DRAM-home
+		// dirty block; it is hard-pushed to dirToBankBuffersLocal (the LOCAL
+		// bank lane) above. fromLocal must match the lane: without it the zero
+		// value (false) made finalizeBankEviction route the victim into
+		// writeBufferBufferRemote (the PEER-incoming buffer) — colliding with
+		// peer writes and wedging the only finalizer that has no deferFlush
+		// escape. fromLocal=true targets the local writeBufferBuffer/own lane.
+		fromLocal:         true,
 		evictingAddr:      block.Tag,
 		evictingDirtyMask: block.DirtyMask,
 	}
@@ -147,6 +167,7 @@ func (f *flusher) startProcessingFlush(
 		f.cache.discardInflightTransactions()
 		clearPort(f.cache.topPort)
 		clearPort(f.cache.bottomPort)
+		clearPort(f.cache.remoteBottomPort)
 	}
 
 	f.cache.state = cacheStatePreFlushing
@@ -166,6 +187,7 @@ func (f *flusher) handleCacheRestart(
 
 	clearPort(f.cache.topPort)
 	clearPort(f.cache.bottomPort)
+	clearPort(f.cache.remoteBottomPort)
 
 	f.cache.state = cacheStateRunning
 
@@ -245,13 +267,8 @@ func (f *flusher) flushCompleted() bool {
 		}
 	}
 
-	// [ITER19b LATENT] pure-fetch ingress from dirStage.fetch().
-	if f.cache.writeBufferFetchBuffer.Size() > 0 {
-		return false
-	}
-
 	for _, b := range f.cache.bankStages {
-		if b.inflightTransCount > 0 {
+		if b.inflightTransCount() > 0 {
 			return false
 		}
 	}
@@ -261,25 +278,17 @@ func (f *flusher) flushCompleted() bool {
 		return false
 	}
 
-	// [ITER19b LATENT] mshrStageBuffer was split earlier; check both halves.
-	if f.cache.mshrStageBuffer.Size() > 0 ||
-		f.cache.mshrStageBufferRemote.Size() > 0 {
-		return false
-	}
-
 	if len(f.cache.writeBuffer.inflightFetch) > 0 ||
 		len(f.cache.writeBuffer.inflightEviction) > 0 ||
 		// [ITER10] check both split pending queues.
+		// [ORIGIN-SPLIT] remote pending is now two origin half-queues.
 		len(f.cache.writeBuffer.pendingLocalEvictions) > 0 ||
-		len(f.cache.writeBuffer.pendingRemoteEvictions) > 0 {
+		f.cache.writeBuffer.pendingRemoteEvictionsLen() > 0 {
 		return false
 	}
 
 	// [ITER19b R6] pendingDataReady / pendingWriteDone split into
-	// Local + Remote halves. Pre-R6 the single queues were never checked
-	// here, allowing a DataReadyRsp / WriteDoneRsp to sit at ingress while
-	// flushCompleted returned true (silent transaction loss). Post-R6 both
-	// halves must drain before the flush is declared complete.
+	// Local + Remote halves. Both must drain before flush completes.
 	if len(f.cache.writeBuffer.pendingDataReadyLocal) > 0 ||
 		len(f.cache.writeBuffer.pendingDataReadyRemote) > 0 ||
 		len(f.cache.writeBuffer.pendingWriteDoneLocal) > 0 ||

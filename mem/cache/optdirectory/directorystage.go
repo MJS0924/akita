@@ -225,11 +225,13 @@ func (ds *directoryStage) doWriteHit(
 		// trivial sharer-list append (no MSHR, no block lock, no bank
 		// pipeline traversal). Mirrors REC's read-hit fast-path so the
 		// CD vs REC comparison stays apples-to-apples.
+		// [BSB-CLASS-SPLIT] read-hit fast-path is data-class
+		// (Nothing/UpdateEntry, set below) -> Data lane.
 		var buf sim.Buffer
 		if trans.fromLocal {
-			buf = ds.cache.localBottomSenderBuffer
+			buf = ds.cache.localBottomSenderBufferData
 		} else {
-			buf = ds.cache.remoteBottomSenderBuffer
+			buf = ds.cache.remoteBottomSenderBufferData
 		}
 		if !buf.CanPush() {
 			ds.cache.stallBottomBufFull++
@@ -266,11 +268,12 @@ func (ds *directoryStage) doWriteHit(
 	}
 
 	if trans.action == Nothing {
+		// [BSB-CLASS-SPLIT] write-hit no-inv fast-path is data-class -> Data lane.
 		var buf sim.Buffer
 		if trans.fromLocal {
-			buf = ds.cache.localBottomSenderBuffer
+			buf = ds.cache.localBottomSenderBufferData
 		} else {
-			buf = ds.cache.remoteBottomSenderBuffer
+			buf = ds.cache.remoteBottomSenderBufferData
 		}
 
 		if !buf.CanPush() {
@@ -290,11 +293,14 @@ func (ds *directoryStage) doWriteHit(
 func (ds *directoryStage) doWriteMiss(trans *transaction) bool {
 	// if ds.isFromLocal(trans) { // local write request에 대해 directory miss 발생 시, entry 추가 안 함
 	if trans.fromLocal { // local write request에 대해 directory miss 발생 시, entry 추가 안 함
+		// [BSB-CLASS-SPLIT] local write-miss forwards as data-class
+		// (action=Nothing) -> Data lane. The remote-alloc path below falls
+		// through to writeToBank and is class-routed in bankstage.finalizeTrans.
 		var buf sim.Buffer
 		if trans.fromLocal {
-			buf = ds.cache.localBottomSenderBuffer
+			buf = ds.cache.localBottomSenderBufferData
 		} else {
-			buf = ds.cache.remoteBottomSenderBuffer
+			buf = ds.cache.remoteBottomSenderBufferData
 		}
 
 		trans.action = Nothing

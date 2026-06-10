@@ -89,7 +89,7 @@ func TestIter17_F2_FullLocalNotBlockedByRemoteSaturation(t *testing.T) {
 	}
 	// LOCAL completely empty, REMOTE completely saturated.
 	wb.pendingLocalEvictions = nil
-	wb.pendingRemoteEvictions = make([]*transaction, 256)
+	wb.pendingRemoteEvictionsPeer = make([]*transaction, 256)
 	wb.numLocalInflightEviction = 0
 	wb.numRemoteInflightEviction = 0
 
@@ -109,7 +109,7 @@ func TestIter17_F2_FullPeerNotBlockedByLocalSaturation(t *testing.T) {
 		writeBufferPeerCapacity: 256,
 	}
 	wb.pendingLocalEvictions = make([]*transaction, 1024)
-	wb.pendingRemoteEvictions = nil
+	wb.pendingRemoteEvictionsPeer = nil
 	wb.numLocalInflightEviction = 0
 	wb.numRemoteInflightEviction = 0
 
@@ -143,7 +143,7 @@ func TestIter17_F2_PeerCapDisableFallsBackToLocalCap(t *testing.T) {
 		writeBufferCapacity:     16,
 		writeBufferPeerCapacity: 0, // disabled
 	}
-	wb.pendingRemoteEvictions = make([]*transaction, 16)
+	wb.pendingRemoteEvictionsPeer = make([]*transaction, 16)
 	wb.numRemoteInflightEviction = 0
 
 	if !wb.writeBufferFull(false) {

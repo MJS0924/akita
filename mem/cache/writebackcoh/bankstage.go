@@ -15,13 +15,52 @@ type bankStage struct {
 	cache  *Comp
 	bankID int
 
-	pipeline           pipelining.Pipeline
-	pipelineWidth      int
-	postPipelineBuf    *bufferImpl
-	inflightTransCount int
+	// [BANK LOCAL/REMOTE SPLIT] Pipeline + post buffer fully separated into
+	// Local (own-L1, fromLocal=true) and Remote (peer-serve, fromLocal=false)
+	// lanes, mirroring directoryStage.localPipeline/remotePipeline +
+	// localBuf/remoteBuf. Remote work is ticked/pulled/finalized FIRST so a
+	// stalled local lane can never block peer-serve completions (the closing
+	// edge of the cross-GPU writeback deadlock). pipelineWidth is shared.
+	localPipeline  pipelining.Pipeline
+	remotePipeline pipelining.Pipeline
+	pipelineWidth  int
+	localPostBuf   *bufferImpl
+	remotePostBuf  *bufferImpl
 
-	// Count the trans that needs to be sent to the write buffer.
-	downwardInflightTransCount int
+	localInflightTransCount  int
+	remoteInflightTransCount int
+
+	// Count the trans that needs to be sent to the write buffer, per lane.
+	localDownwardInflightTransCount  int
+	remoteDownwardInflightTransCount int
+}
+
+// inflightTransCount exposes the combined local+remote in-flight count so
+// drain/flush checks (flusher.go) see total bank occupancy unchanged.
+func (s *bankStage) inflightTransCount() int {
+	return s.localInflightTransCount + s.remoteInflightTransCount
+}
+
+// decInflight decrements the in-flight counter for the lane the
+// transaction belongs to (fromLocal -> local lane, else remote lane).
+// Used by finalize* handlers in place of the pre-split single-counter
+// decrement; routing by fromLocal keeps each lane's accounting exact.
+func (s *bankStage) decInflight(fromLocal bool) {
+	if fromLocal {
+		s.localInflightTransCount--
+	} else {
+		s.remoteInflightTransCount--
+	}
+}
+
+// decDownward decrements the downward (eviction → writeBuffer) counter for
+// the lane the transaction belongs to.
+func (s *bankStage) decDownward(fromLocal bool) {
+	if fromLocal {
+		s.localDownwardInflightTransCount--
+	} else {
+		s.remoteDownwardInflightTransCount--
+	}
 }
 
 type bufferImpl struct {
@@ -101,6 +140,15 @@ func (b *bufferImpl) Get(i int) interface{} {
 	return b.elements[i]
 }
 
+// newBankBuffer constructs a scannable (*bufferImpl) buffer. Used for the
+// remote/local dir-to-bank ingress buffers so pullFromBuf can pull a
+// completion-bearing HIT past a head-of-line eviction (see pullFromBuf's
+// [ITER19 DIR_L2_CYCLE FIX]). Behaves as a plain FIFO for all other
+// (Peek/Pop/Push) callers, so it is a drop-in for sim.NewBuffer.
+func newBankBuffer(name string, capacity int) *bufferImpl {
+	return &bufferImpl{name: name, capacity: capacity}
+}
+
 func (b *bufferImpl) Remove(i int) {
 	element := b.elements[i]
 
@@ -125,26 +173,52 @@ func (e bankPipelineElem) TaskID() string {
 }
 
 func (s *bankStage) Tick() (madeProgress bool) {
-	// Commit-only budget for finalize: each iteration consumes one
-	// slot ONLY when a transaction actually commits out of the
-	// post-pipeline buffer. If no item in postPipelineBuf can finalize
-	// this cycle, the loop terminates early — a stalled head item
-	// shouldn't keep burning per-cycle budget.
+	// [BANK LOCAL/REMOTE SPLIT] Tick BOTH pipelines and run the REMOTE
+	// (peer-serve) finalize+pull FIRST, then LOCAL — mirroring
+	// directoryStage's remote-first arbitration. Each finalize/pull loop
+	// has its own numReqPerCycle commit budget per lane, so the two lanes
+	// run truly in parallel and a stalled local lane can never starve
+	// peer-serve completions.
+
+	// Commit-only budget for finalize: each iteration consumes one slot
+	// ONLY when a transaction actually commits out of the post-pipeline
+	// buffer. If no item in the post buffer can finalize this cycle, the
+	// loop terminates early — a stalled head item shouldn't keep burning
+	// per-cycle budget.
+
+	// --- REMOTE lane first ---
 	for i := 0; i < s.cache.numReqPerCycle; i++ {
-		if !s.finalizeTrans() {
+		if !s.finalizeTrans(true) {
 			break
 		}
 		madeProgress = true
 	}
 
-	madeProgress = s.pipeline.Tick() || madeProgress
+	madeProgress = s.remotePipeline.Tick() || madeProgress
 
-	// Commit-only budget for pull: pullFromBuf already arbitrates
-	// between writeBufferToBankBuffers (upward, priority) and
-	// dirToBankBuffers (downward) internally and returns true only on
-	// commit. If both queues are empty/blocked this cycle, terminate.
 	for i := 0; i < s.cache.numReqPerCycle; i++ {
-		if !s.pullFromBuf() {
+		if !s.pullFromBuf(true) {
+			break
+		}
+		madeProgress = true
+	}
+
+	// --- LOCAL lane ---
+	for i := 0; i < s.cache.numReqPerCycle; i++ {
+		if !s.finalizeTrans(false) {
+			break
+		}
+		madeProgress = true
+	}
+
+	madeProgress = s.localPipeline.Tick() || madeProgress
+
+	// Commit-only budget for pull: pullFromBuf already arbitrates between
+	// writeBufferToBankBuffers (upward, priority) and dirToBankBuffers
+	// (downward) internally and returns true only on commit. If both
+	// queues are empty/blocked this cycle, terminate.
+	for i := 0; i < s.cache.numReqPerCycle; i++ {
+		if !s.pullFromBuf(false) {
 			break
 		}
 		madeProgress = true
@@ -157,16 +231,46 @@ func (s *bankStage) Reset() {
 	s.cache.dirToBankBuffers[s.bankID].Clear()
 	s.cache.dirToBankBuffersLocal[s.bankID].Clear()
 	s.cache.dirToBankBuffersRemote[s.bankID].Clear()
-	// [R5] clear both Req and Rsp halves.
+	// [R5 + BANK LOCAL/REMOTE SPLIT] clear all four Req/Rsp Local/Remote
+	// halves (the unsuffixed Req/Rsp slices are length-only aliases that
+	// receive no pushes, but clear them too for completeness).
 	s.cache.writeBufferToBankBuffersReq[s.bankID].Clear()
 	s.cache.writeBufferToBankBuffersRsp[s.bankID].Clear()
-	s.pipeline.Clear()
-	s.postPipelineBuf.Clear()
-	s.inflightTransCount = 0
+	s.cache.writeBufferToBankBuffersReqLocal[s.bankID].Clear()
+	s.cache.writeBufferToBankBuffersReqRemote[s.bankID].Clear()
+	s.cache.writeBufferToBankBuffersRspLocal[s.bankID].Clear()
+	s.cache.writeBufferToBankBuffersRspRemote[s.bankID].Clear()
+	s.localPipeline.Clear()
+	s.remotePipeline.Clear()
+	s.localPostBuf.Clear()
+	s.remotePostBuf.Clear()
+	s.localInflightTransCount = 0
+	s.remoteInflightTransCount = 0
+	s.localDownwardInflightTransCount = 0
+	s.remoteDownwardInflightTransCount = 0
 }
 
-func (s *bankStage) pullFromBuf() bool {
-	if !s.pipeline.CanAccept() {
+// pullFromBuf pulls one transaction into the lane selected by isRemote.
+// The REMOTE lane gates on remotePipeline.CanAccept() and pulls from the
+// Remote writeBuffer-to-bank halves + dirToBankBuffersRemote; the LOCAL
+// lane uses the Local halves + dirToBankBuffersLocal. Each lane keeps its
+// own inflight/downward counters and applies the ITER19 downward-reservation
+// independently, so peer-serve and own-L1 bank work never share a resource.
+func (s *bankStage) pullFromBuf(isRemote bool) bool {
+	pipeline := s.localPipeline
+	rspBuf := s.cache.writeBufferToBankBuffersRspLocal[s.bankID]
+	reqBuf := s.cache.writeBufferToBankBuffersReqLocal[s.bankID]
+	dirBuf := s.cache.dirToBankBuffersLocal[s.bankID]
+	downwardCount := s.localDownwardInflightTransCount
+	if isRemote {
+		pipeline = s.remotePipeline
+		rspBuf = s.cache.writeBufferToBankBuffersRspRemote[s.bankID]
+		reqBuf = s.cache.writeBufferToBankBuffersReqRemote[s.bankID]
+		dirBuf = s.cache.dirToBankBuffersRemote[s.bankID]
+		downwardCount = s.remoteDownwardInflightTransCount
+	}
+
+	if !pipeline.CanAccept() {
 		return false
 	}
 
@@ -175,55 +279,128 @@ func (s *bankStage) pullFromBuf() bool {
 	// pendingDataReady response-priority precedent — a fetched-data
 	// committing to the bank frees an MSHR slot upstream and is on the
 	// critical path for L1 read-miss completion. Both buffers feed the
-	// same pipeline; only the dequeue order changes.
-	for _, inBuf := range []sim.Buffer{
-		s.cache.writeBufferToBankBuffersRsp[s.bankID],
-		s.cache.writeBufferToBankBuffersReq[s.bankID],
-	} {
+	// same (per-lane) pipeline; only the dequeue order changes.
+	for _, inBuf := range []sim.Buffer{rspBuf, reqBuf} {
 		trans := inBuf.Pop()
 		if trans == nil {
 			continue
 		}
-		s.pipeline.Accept(bankPipelineElem{trans: trans.(*transaction)})
-		s.inflightTransCount++
+		pipeline.Accept(bankPipelineElem{trans: trans.(*transaction)})
+		if isRemote {
+			s.remoteInflightTransCount++
+		} else {
+			s.localInflightTransCount++
+		}
 		return true
-	}
-
-	// Always reserve one lane for up-going transactions
-	if s.downwardInflightTransCount >= s.pipelineWidth-1 {
-		return false
 	}
 
 	// [FIX #2] Remote 먼저, Local 그 다음. dirStage 의 invBuf→remoteBuf→localBuf
 	// priority 가 bank 까지 전파되도록. local 트랜잭션이 bankBuf head 에 쌓여도
-	// remote 가 뒤에서 영원히 밀리는 일이 없게 함 (cross-GPU 데드락 차단).
-	for _, inBuf := range []sim.Buffer{
-		s.cache.dirToBankBuffersRemote[s.bankID],
-		s.cache.dirToBankBuffersLocal[s.bankID],
-	} {
-		trans := inBuf.Pop()
-		if trans == nil {
-			continue
+	// remote 가 뒤에서 영원히 밀리는 일이 없게 함 (cross-GPU 데드락 차단). With the
+	// lane split this priority is now structural: the remote lane has its
+	// own pipeline and is ticked/pulled first in Tick().
+	//
+	// [ITER19 DIR_L2_CYCLE FIX] When the downward (eviction) lane is
+	// exhausted, do NOT return false outright (the old behavior). A
+	// returned-false here lets a head-of-line eviction — which is stuck
+	// at finalizeBankEviction because writeBufferBufferRemote is full —
+	// block the completion-bearing HITs (bankReadHit / bankWriteHit)
+	// queued BEHIND it in the SAME dir-to-bank ingress buffer. Those HITs
+	// are the only producers of the DataReadyRsp/WriteDoneRsp that frees
+	// the originating peer GPU's numRemoteInflightEviction. With both
+	// GPUs symmetric, that is the closing edge of the writeback deadlock.
+	//
+	// Instead, reserve the lane for UP-going work only: when the downward
+	// budget is exhausted we scan past head-of-line evictions and pull
+	// the first non-eviction (upward) transaction so completions always
+	// drain. Reordering only ever moves a HIT ahead of an eviction to a
+	// DIFFERENT line (same-line accesses are serialized upstream by
+	// evictingList + block locks), so coherence is unaffected. No cap
+	// change — same buffers, same capacities. Applied PER LANE against
+	// each lane's own downward count and pipelineWidth.
+	downwardExhausted := downwardCount >= s.pipelineWidth-1
+	var t *transaction
+	if downwardExhausted {
+		// Pull only an upward (non-eviction) transaction, scanning past
+		// blocked evictions at the head.
+		t = pullFirstUpward(dirBuf)
+	} else {
+		if item := dirBuf.Pop(); item != nil {
+			t = item.(*transaction)
 		}
-
-		t := trans.(*transaction)
-		s.pipeline.Accept(bankPipelineElem{trans: t})
-		s.inflightTransCount++
-
-		switch t.action {
-		case bankEvict, bankEvictAndFetch, bankEvictAndWrite, bankEvictAndPrefetch:
-			s.downwardInflightTransCount++
-		}
-
-		return true
+	}
+	if t == nil {
+		return false
 	}
 
+	pipeline.Accept(bankPipelineElem{trans: t})
+	if isRemote {
+		s.remoteInflightTransCount++
+	} else {
+		s.localInflightTransCount++
+	}
+
+	switch t.action {
+	case bankEvict, bankEvictAndFetch, bankEvictAndWrite, bankEvictAndPrefetch:
+		if isRemote {
+			s.remoteDownwardInflightTransCount++
+		} else {
+			s.localDownwardInflightTransCount++
+		}
+	}
+
+	return true
+}
+
+// isDownwardAction reports whether a bank transaction occupies a
+// downward (eviction → writeBuffer) pipeline lane.
+func isDownwardAction(a action) bool {
+	switch a {
+	case bankEvict, bankEvictAndFetch, bankEvictAndWrite, bankEvictAndPrefetch:
+		return true
+	}
 	return false
 }
 
-func (s *bankStage) finalizeTrans() bool {
-	for i := 0; i < s.postPipelineBuf.Size(); i++ {
-		trans := s.postPipelineBuf.Get(i).(bankPipelineElem).trans
+// pullFirstUpward removes and returns the first non-eviction (upward,
+// completion-bearing) transaction from a dir-to-bank ingress buffer,
+// leaving any leading evictions in place. Returns nil if none. Only the
+// scannable *bufferImpl supports the scan; a plain FIFO falls back to a
+// head-only check so behavior degrades safely (never reorders, never
+// panics).
+func pullFirstUpward(inBuf sim.Buffer) *transaction {
+	bi, ok := inBuf.(*bufferImpl)
+	if !ok {
+		if head := inBuf.Peek(); head != nil {
+			if t := head.(*transaction); !isDownwardAction(t.action) {
+				inBuf.Pop()
+				return t
+			}
+		}
+		return nil
+	}
+	for i := 0; i < bi.Size(); i++ {
+		t := bi.Get(i).(*transaction)
+		if !isDownwardAction(t.action) {
+			bi.Remove(i)
+			return t
+		}
+	}
+	return nil
+}
+
+// finalizeTrans drains the post-pipeline buffer for the lane selected by
+// isRemote (remotePostBuf vs localPostBuf). The finalize action handlers
+// (finalizeReadHit / finalizeWriteHit / finalizeBankEviction / …) are
+// unchanged — only which post buffer is iterated changes.
+func (s *bankStage) finalizeTrans(isRemote bool) bool {
+	postBuf := s.localPostBuf
+	if isRemote {
+		postBuf = s.remotePostBuf
+	}
+
+	for i := 0; i < postBuf.Size(); i++ {
+		trans := postBuf.Get(i).(bankPipelineElem).trans
 		if s.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == s.cache.debugAddress0 {
 			fmt.Printf("[%s] [bankStage]\tReceived req - 2: addr %x, action %d\n", s.cache.name, trans.accessReq().GetAddress(), trans.action)
 		}
@@ -232,7 +409,7 @@ func (s *bankStage) finalizeTrans() bool {
 		}
 		if s.cache.debugProcess && trans.responsing {
 			fmt.Printf("[%s]\tTransaction %x is responsing, discard.\n", s.cache.name, trans.accessReq().GetAddress())
-			s.postPipelineBuf.Remove(i)
+			postBuf.Remove(i)
 			continue
 		}
 
@@ -254,7 +431,7 @@ func (s *bankStage) finalizeTrans() bool {
 		}
 
 		if done {
-			s.postPipelineBuf.Remove(i)
+			postBuf.Remove(i)
 
 			return true
 		}
@@ -320,6 +497,11 @@ func (s *bankStage) finalizeReadHit(trans *transaction) bool {
 	if !trans.fromLocal {
 		dataReady.Src = s.cache.remoteTopPort.AsRemote()
 		error = s.cache.remoteTopPort.Send(dataReady)
+		if error == nil {
+			s.cache.peerReadServedCount++ // [DIAG] peer read served (DataReadyRsp emitted)
+		} else {
+			s.cache.peerReadServeFailCount++ // [DIAG] remoteTopPort.Send failed (egress blocked)
+		}
 	} else {
 		error = s.cache.topPort.Send(dataReady)
 	}
@@ -327,7 +509,7 @@ func (s *bankStage) finalizeReadHit(trans *transaction) bool {
 		return false
 	}
 
-	s.inflightTransCount--
+	s.decInflight(trans.fromLocal)
 	block.ReadCount--
 	block.Accessed = true
 
@@ -362,7 +544,16 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		return false
 	}
 
-	if trans.writeToHomeNode && !s.cache.writeBufferBufferCanPush(trans.fromLocal) {
+	// [RESPONSE-DECOUPLE] The WriteDoneRsp ack below must be able to leave even
+	// when the displacement victim cannot enter writeBufferBuffer right now —
+	// otherwise a saturated own-eviction cap blocks the very ack that drains a
+	// peer's eviction cap (the closing edge of the cross-GPU serve deadlock).
+	// We only need SOMEWHERE to place the victim: writeBufferBuffer now, or the
+	// bounded deferral list. If neither has room, retry next cycle (the ack has
+	// not been emitted yet, so "ack emitted ⇒ victim placed" atomicity holds).
+	if trans.writeToHomeNode &&
+		!s.cache.writeBufferBufferCanPush(trans.fromLocal) &&
+		!s.cache.writeBuffer.deferFlushCanPush(trans.fromLocal) {
 		return false
 	}
 
@@ -381,7 +572,7 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 
 	s.removeTransaction(trans)
 
-	s.inflightTransCount--
+	s.decInflight(trans.fromLocal)
 
 	done := mem.WriteDoneRspBuilder{}.
 		WithSrc(s.cache.topPort.AsRemote()).
@@ -393,6 +584,7 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 	if !trans.fromLocal {
 		done.Meta().Src = s.cache.remoteTopPort.AsRemote()
 		s.cache.remoteTopPort.Send(done)
+		s.cache.peerWriteAckSent++ // [ITER20 DIAG A]
 	} else {
 		s.cache.topPort.Send(done)
 	}
@@ -411,7 +603,15 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		trans.evictingDirtyMask = block.DirtyMask
 
 		trans.action = writeBufferFlush
-		s.cache.writeBufferBufferPush(trans, trans.fromLocal)
+		// [RESPONSE-DECOUPLE] The WriteDoneRsp ack already left above. Place the
+		// victim in writeBufferBuffer if a slot is free, else park it in the
+		// bounded deferral list (drained next ticks via drainDeferredFlush).
+		// Pointer only — evictingData/Addr/... are already captured on trans.
+		if s.cache.writeBufferBufferCanPush(trans.fromLocal) {
+			s.cache.writeBufferBufferPush(trans, trans.fromLocal)
+		} else {
+			s.cache.writeBuffer.deferFlushPush(trans)
+		}
 
 		if s.cache.debugProcess && trans.action == bankWritePrefetched {
 			fmt.Printf("[%s]\t[WARNING]\twrong trans action\n", s.cache.name)
@@ -477,7 +677,15 @@ func (s *bankStage) finalizeBankWriteFetched(
 		return false
 	}
 
-	if trans.writeToHomeNode && !s.cache.writeBufferBufferCanPush(trans.fromLocal) {
+	// [RESPONSE-DECOUPLE] The read completion (mshrStageBufferPush below, which
+	// releases the L1 read-miss responder = the DataReadyRsp that drains the
+	// home's inflight) must proceed even when the displacement victim cannot
+	// enter writeBufferBuffer — the same cap-coupling that deadlocks peer-write
+	// serves also strands own reads. Require only that the victim can be PLACED:
+	// writeBufferBuffer now, or the bounded deferral list.
+	if trans.writeToHomeNode &&
+		!s.cache.writeBufferBufferCanPush(trans.fromLocal) &&
+		!s.cache.writeBuffer.deferFlushCanPush(trans.fromLocal) {
 		return false
 	}
 
@@ -493,7 +701,7 @@ func (s *bankStage) finalizeBankWriteFetched(
 	block.IsLocked = false
 	block.IsValid = true
 
-	s.inflightTransCount--
+	s.decInflight(trans.fromLocal)
 
 	if trans.writeToHomeNode {
 		trans.evictingPID = block.PID
@@ -502,7 +710,13 @@ func (s *bankStage) finalizeBankWriteFetched(
 		trans.evictingDirtyMask = block.DirtyMask
 
 		trans.action = writeBufferFlush
-		s.cache.writeBufferBufferPush(trans, trans.fromLocal)
+		// [RESPONSE-DECOUPLE] read completion already emitted (mshrStageBufferPush
+		// above); place the victim now or park it in the bounded deferral list.
+		if s.cache.writeBufferBufferCanPush(trans.fromLocal) {
+			s.cache.writeBufferBufferPush(trans, trans.fromLocal)
+		} else {
+			s.cache.writeBuffer.deferFlushPush(trans)
+		}
 	}
 
 	// Deferred-invalidation: see directoryStage.doInvalidation. The
@@ -594,7 +808,7 @@ func (s *bankStage) finalizeBankWritePrefetched(
 		s.cache.writeBufferBufferPush(trans, trans.fromLocal)
 
 		// [핵심 수정] 하위로 보냈으므로 Downward 카운터 차감
-		s.downwardInflightTransCount--
+		s.decDownward(trans.fromLocal)
 		what = "EvictAndPrefetch"
 
 		if s.cache.debugProcess {
@@ -602,7 +816,7 @@ func (s *bankStage) finalizeBankWritePrefetched(
 		}
 	}
 
-	s.inflightTransCount--
+	s.decInflight(trans.fromLocal)
 
 	if s.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == s.cache.debugAddress0 {
 		fmt.Printf("[%s] [bankStage]\tReceived rsp - 2.3: addr %x, action %d\n", s.cache.name, trans.accessReq().GetAddress(), trans.action)
@@ -706,8 +920,8 @@ func (s *bankStage) finalizeBankEviction(
 	delete(s.cache.evictingList, trans.evictingAddr)
 	s.cache.writeBufferBufferPush(trans, trans.fromLocal)
 
-	s.inflightTransCount--
-	s.downwardInflightTransCount--
+	s.decInflight(trans.fromLocal)
+	s.decDownward(trans.fromLocal)
 
 	return true
 }

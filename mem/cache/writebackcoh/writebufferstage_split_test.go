@@ -2,120 +2,117 @@ package writebackcoh
 
 import "testing"
 
-// Asymmetric soft cap semantics:
-//   - total = numLocal + numRemote, hard-capped at maxInflightEviction
-//   - local additionally hard-capped at 3/4 of maxInflightEviction
-//   - remote has no per-side cap beyond the total
-//   - effect: remote-dominated workloads (like stencil2d cross-GPU
-//     evictions) can use all maxInflightEviction slots when local is
-//     idle, while local cannot starve remote (always >= 1/4 reserve).
+// [ORIGIN-SPLIT] tooManyInflightEvictions now takes (isLocal, fromLocal).
+//
+//   - LOCAL destination (isLocal=true): single ceiling maxInflightEviction,
+//     keyed off numLocalInflightEviction (origin-agnostic; LOCAL drains via
+//     DRAM ACK, independent of the cross-GPU cycle).
+//   - REMOTE destination (isLocal=false): partitioned by ORIGIN into
+//     maxRemoteInflEvictOwn (own=3/4) and maxRemoteInflEvictPeer (peer=1/4),
+//     summing to the legacy remote ceiling. Own saturation can NEVER block a
+//     peer-serve eviction (the confirmed deadlock seed) and vice versa.
 
-func TestTooManyInflightEvictions_RemoteUnboundedWhenLocalIdle(t *testing.T) {
-	wb := &writeBufferStage{maxInflightEviction: 128}
-
-	// Remote can grow up to total cap when local is idle.
-	wb.numLocalInflightEviction = 0
-	wb.numRemoteInflightEviction = 127
-	if wb.tooManyInflightEvictions(false) {
-		t.Fatalf("remote=127 local=0 should not be too many (total<128)")
-	}
-	wb.numRemoteInflightEviction = 128
-	if !wb.tooManyInflightEvictions(false) {
-		t.Fatalf("remote=128 local=0 should be too many (total>=128)")
+// helper: a wb with the production 3/4 own / 1/4 peer partition of `cap`.
+func wbWithRemoteSplit(cap int) *writeBufferStage {
+	return &writeBufferStage{
+		maxInflightEviction:    cap,
+		maxRemoteInflEvictOwn:  cap - cap/4,
+		maxRemoteInflEvictPeer: cap / 4,
 	}
 }
 
-func TestTooManyInflightEvictions_LocalCappedAtThreeQuarters(t *testing.T) {
-	wb := &writeBufferStage{maxInflightEviction: 128}
+func TestTooManyInflightEvictions_LocalDestUsesFullCeiling(t *testing.T) {
+	wb := wbWithRemoteSplit(128)
 
-	// Local hard cap at 96 = 128 - 128/4.
-	wb.numLocalInflightEviction = 95
-	wb.numRemoteInflightEviction = 0
-	if wb.tooManyInflightEvictions(true) {
-		t.Fatalf("local=95 should not be too many")
+	wb.numLocalInflightEviction = 127
+	if wb.tooManyInflightEvictions(true, true) {
+		t.Fatalf("local dest=127 < cap 128 should not be too many")
 	}
-	wb.numLocalInflightEviction = 96
-	if !wb.tooManyInflightEvictions(true) {
-		t.Fatalf("local=96 should be too many (hits 3/4 hard cap)")
+	wb.numLocalInflightEviction = 128
+	if !wb.tooManyInflightEvictions(true, true) {
+		t.Fatalf("local dest=128 == cap should be too many")
 	}
 }
 
-func TestTooManyInflightEvictions_TotalCapEnforced(t *testing.T) {
-	wb := &writeBufferStage{maxInflightEviction: 128}
+// The KEY invariant: a saturated OWN remote sub-budget must NOT block a
+// PEER-serve remote eviction (this is the confirmed cross-GPU seed).
+func TestTooManyInflightEvictions_OwnSaturationDoesNotBlockPeer(t *testing.T) {
+	wb := wbWithRemoteSplit(128) // own=96, peer=32
 
-	// total cap blocks both sides regardless of which one asks.
-	wb.numLocalInflightEviction = 50
-	wb.numRemoteInflightEviction = 78 // total = 128
-	if !wb.tooManyInflightEvictions(true) {
-		t.Fatalf("total=128: local request should be blocked by total cap")
-	}
-	if !wb.tooManyInflightEvictions(false) {
-		t.Fatalf("total=128: remote request should be blocked by total cap")
-	}
+	// Own remote inflight saturated to its full sub-budget.
+	wb.numRemoteInflEvictOwn = 96
+	wb.numRemoteInflEvictPeer = 0
 
-	// Just below total: both can proceed (subject to local's 3/4 cap).
-	wb.numLocalInflightEviction = 50
-	wb.numRemoteInflightEviction = 77 // total = 127
-	if wb.tooManyInflightEvictions(true) {
-		t.Fatalf("total=127, local=50<96: should not be too many")
+	if !wb.tooManyInflightEvictions(false, true) {
+		t.Fatalf("own remote=96 == own sub-budget should be too many for own")
 	}
-	if wb.tooManyInflightEvictions(false) {
-		t.Fatalf("total=127: remote should not be too many")
+	// Peer-serve remote eviction must still be admissible — it has its own
+	// reserved 32 slots untouched by own saturation.
+	if wb.tooManyInflightEvictions(false, false) {
+		t.Fatalf("REGRESSION: peer-serve remote eviction blocked by OWN saturation")
 	}
 }
 
-func TestTooManyInflightEvictions_RemoteReserveProtected(t *testing.T) {
-	wb := &writeBufferStage{maxInflightEviction: 128}
+// Symmetric: a saturated PEER sub-budget must not block OWN.
+func TestTooManyInflightEvictions_PeerSaturationDoesNotBlockOwn(t *testing.T) {
+	wb := wbWithRemoteSplit(128) // own=96, peer=32
 
-	// When local fills to its 96 cap, remote always retains the
-	// remaining 32 slots — it never gets crowded out below 1/4.
-	wb.numLocalInflightEviction = 96
-	wb.numRemoteInflightEviction = 0
-	if wb.tooManyInflightEvictions(false) {
-		t.Fatalf("remote=0 with local=96 should not be too many (32 reserved)")
+	wb.numRemoteInflEvictPeer = 32
+	wb.numRemoteInflEvictOwn = 0
+
+	if !wb.tooManyInflightEvictions(false, false) {
+		t.Fatalf("peer remote=32 == peer sub-budget should be too many for peer")
 	}
-	wb.numRemoteInflightEviction = 31
-	if wb.tooManyInflightEvictions(false) {
-		t.Fatalf("remote=31 (within 32 reserve) should not be too many")
-	}
-	wb.numRemoteInflightEviction = 32
-	if !wb.tooManyInflightEvictions(false) {
-		t.Fatalf("remote=32 + local=96 = 128: should hit total cap")
+	if wb.tooManyInflightEvictions(false, true) {
+		t.Fatalf("REGRESSION: own remote eviction blocked by PEER saturation")
 	}
 }
 
-func TestTooManyInflightEvictions_QuotaArithmetic(t *testing.T) {
+// Each origin sub-budget enforces its own ceiling exactly.
+func TestTooManyInflightEvictions_OriginSubBudgetEdges(t *testing.T) {
 	cases := []struct {
-		cap, wantLocalLimit int
+		cap, wantOwn, wantPeer int
 	}{
-		{128, 96},  // 128 - 32
-		{256, 192}, // 256 - 64
-		{512, 384}, // 512 - 128
-		{100, 75},  // 100 - 25
-		{4, 3},     // 4 - 1
+		{128, 96, 32},
+		{256, 192, 64},
+		{512, 384, 128},
+		{4, 3, 1},
 	}
 	for _, c := range cases {
-		wb := &writeBufferStage{maxInflightEviction: c.cap}
-		// Local just below limit OK.
-		wb.numLocalInflightEviction = c.wantLocalLimit - 1
-		wb.numRemoteInflightEviction = 0
-		if wb.tooManyInflightEvictions(true) {
-			t.Errorf("cap=%d local=%d should be fine", c.cap, c.wantLocalLimit-1)
+		wb := wbWithRemoteSplit(c.cap)
+		if wb.maxRemoteInflEvictOwn != c.wantOwn || wb.maxRemoteInflEvictPeer != c.wantPeer {
+			t.Fatalf("cap=%d partition own=%d peer=%d, want own=%d peer=%d (sum must == cap)",
+				c.cap, wb.maxRemoteInflEvictOwn, wb.maxRemoteInflEvictPeer, c.wantOwn, c.wantPeer)
 		}
-		// Local at limit blocked.
-		wb.numLocalInflightEviction = c.wantLocalLimit
-		if !wb.tooManyInflightEvictions(true) {
-			t.Errorf("cap=%d local=%d should hit local cap", c.cap, c.wantLocalLimit)
+		// own edge
+		wb.numRemoteInflEvictOwn = c.wantOwn - 1
+		if wb.tooManyInflightEvictions(false, true) {
+			t.Errorf("cap=%d own=%d should be fine", c.cap, c.wantOwn-1)
 		}
-		// Remote can use full cap when local idle.
-		wb.numLocalInflightEviction = 0
-		wb.numRemoteInflightEviction = c.cap - 1
-		if wb.tooManyInflightEvictions(false) {
-			t.Errorf("cap=%d remote=%d local=0 should be fine", c.cap, c.cap-1)
+		wb.numRemoteInflEvictOwn = c.wantOwn
+		if !wb.tooManyInflightEvictions(false, true) {
+			t.Errorf("cap=%d own=%d should hit own sub-budget", c.cap, c.wantOwn)
 		}
-		wb.numRemoteInflightEviction = c.cap
-		if !wb.tooManyInflightEvictions(false) {
-			t.Errorf("cap=%d remote=%d should hit total cap", c.cap, c.cap)
+		// peer edge
+		wb.numRemoteInflEvictOwn = 0
+		wb.numRemoteInflEvictPeer = c.wantPeer - 1
+		if wb.tooManyInflightEvictions(false, false) {
+			t.Errorf("cap=%d peer=%d should be fine", c.cap, c.wantPeer-1)
+		}
+		wb.numRemoteInflEvictPeer = c.wantPeer
+		if !wb.tooManyInflightEvictions(false, false) {
+			t.Errorf("cap=%d peer=%d should hit peer sub-budget", c.cap, c.wantPeer)
+		}
+	}
+}
+
+// No net capacity increase: the two REMOTE sub-budgets sum to the legacy
+// single remote ceiling.
+func TestTooManyInflightEvictions_RemoteSubBudgetsSumToCeiling(t *testing.T) {
+	for _, cap := range []int{4, 100, 128, 256, 512} {
+		wb := wbWithRemoteSplit(cap)
+		if got := wb.maxRemoteInflEvictOwn + wb.maxRemoteInflEvictPeer; got != cap {
+			t.Errorf("cap=%d: own+peer=%d, want %d (NO net capacity increase)", cap, got, cap)
 		}
 	}
 }

@@ -25,6 +25,24 @@ type directoryStage struct {
 	localBuf       sim.Buffer
 	remoteBuf      sim.Buffer
 
+	// [ITER20 COMPLETION-VC] Skip-head side queue for the REMOTE dir
+	// pipeline only. processTransaction(isLocal=false) Peeks remoteBuf
+	// strict-FIFO and used to break on any stall. A peer-incoming
+	// eviction (EvictAndInsertNewEntry / write-miss / inv-class) at the
+	// head — stalled on the REQUEST-path resources (remoteDirToBankBuffers,
+	// MSHR, victim lock) — then strict-HoL-blocked every completion-bearing
+	// peer-incoming HIT (read-hit / write-hit-full-perm fast-path, the SOLE
+	// producer of the cross-GPU DataReadyRsp/WriteDoneRsp) queued behind it,
+	// so the completion that frees the peer's numRemoteInflightEviction /
+	// L2 writeBufferBuffer could never be produced -> symmetric cross-GPU
+	// deadlock. We move such a stalled, request-path-coupled head into this
+	// side queue so the HIT behind it can reach remoteBSBData (the
+	// completion's own forward buffer). Cap-neutral: deferral count is
+	// bounded by remoteBuf.Capacity() (an item is only ever moved FROM
+	// remoteBuf INTO here, never duplicated), and we only skip past an
+	// address-DISJOINT head so no same-cacheline operation is reordered.
+	remoteDeferredEvict []*transaction
+
 	returnFalse0 string
 	returnFalse1 string
 	returnFalse  *string
@@ -89,6 +107,9 @@ func (ds *directoryStage) Reset() {
 	ds.localBuf.Clear()
 	ds.remoteBuf.Clear()
 
+	// [ITER20 COMPLETION-VC] drop deferred remote evictions on reset.
+	ds.remoteDeferredEvict = nil
+
 	ds.cache.localDirStageBuffer.Clear()
 	ds.cache.remoteDirStageBuffer.Clear()
 }
@@ -98,8 +119,12 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 	buf := ds.localBuf
 	ds.returnFalse = &ds.returnFalse0
 	if !isLocal {
-		buf = ds.remoteBuf
-		ds.returnFalse = &ds.returnFalse1
+		// [ITER20 COMPLETION-VC] Remote pipeline uses the skip-head variant
+		// so a request-path-coupled eviction at the FIFO head cannot HoL-
+		// block a completion-bearing HIT behind it. Local pipeline keeps the
+		// original strict-FIFO semantics (no cross-GPU completion cycle on
+		// the local plane).
+		return ds.processRemoteTransaction()
 	}
 	*ds.returnFalse = ""
 
@@ -134,6 +159,164 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 	return madeProgress
 }
 
+// regionCacheLineID returns the region-granular cacheline ID used for the
+// evictingList / same-region hazard check (block + sub-entry span).
+func (ds *directoryStage) regionCacheLineID(addr uint64) uint64 {
+	id, _ := getCacheLineID(addr,
+		ds.cache.log2BlockSize+uint64(ds.cache.log2NumSubEntry))
+	return id
+}
+
+// deferredHasRegion reports whether any currently-deferred remote eviction
+// targets the same region as addr. We must NOT skip a buffer item past a
+// deferred item that shares its region, otherwise a later same-region
+// request could be (re)ordered ahead of an earlier eviction of that region
+// and observe stale directory state. Address-disjointness makes the skip
+// provably order-preserving for every individual cacheline.
+func (ds *directoryStage) deferredHasRegion(addr uint64) bool {
+	region := ds.regionCacheLineID(addr)
+	for _, t := range ds.remoteDeferredEvict {
+		if ds.regionCacheLineID(t.accessReq().GetAddress()) == region {
+			return true
+		}
+	}
+	return false
+}
+
+// isCompletionBearingHit is a SIDE-EFFECT-FREE classification of a remote
+// (peer-incoming) transaction. It returns true when doWrite would resolve to
+// the read-hit / write-hit-full-permission fast-path or a read MSHR-hit —
+// i.e. the cases that push to remoteBSBData and ultimately produce the
+// cross-GPU DataReadyRsp/WriteDoneRsp. Such a transaction depends only on
+// remoteBSBData.CanPush() (the completion's own forward buffer); skipping it
+// cannot help, so the caller keeps strict ordering for it. Everything else
+// (write-miss, eviction, inv-class write-hit) is REQUEST-path-coupled (needs
+// remoteDirToBankBuffers / MSHR / victim lock) and is what we defer.
+//
+// Mirrors the read-only lookups doWrite performs (mshr.Query, directory.
+// Lookup, writePermission/readPermission) BEFORE any mutation. No directory
+// state, MSHR, or buffer is modified here.
+func (ds *directoryStage) isCompletionBearingHit(trans *transaction) bool {
+	req := trans.accessReq()
+	cachelineID, _ := getCacheLineID(req.GetAddress(), ds.cache.log2BlockSize)
+
+	if mshrEntry := ds.cache.mshr.Query(req.GetPID(), cachelineID); mshrEntry != nil {
+		// Read MSHR-hit returns true (doWriteMSHRHit always succeeds);
+		// a write on an MSHR hit stalls (no completion produced) -> not a
+		// completion-bearing hit.
+		return trans.write == nil
+	}
+
+	block, index := ds.cache.directory.Lookup(req.GetPID(), req.GetAddress())
+	if block == nil || !block.SubEntry[index].IsValid {
+		return false // miss -> doWriteMiss (request-path coupled)
+	}
+
+	subEntry := block.SubEntry[index]
+	if subEntry.IsLocked || subEntry.ReadCount > 0 {
+		return false // doWriteHit early-returns false; not a clean hit
+	}
+
+	if trans.isReadTrans() && !trans.read.FetchForWriteMiss {
+		return true // read-hit fast-path -> remoteBSBData
+	}
+
+	// Write-hit: only the full-permission branch (action Nothing) is a
+	// completion-bearing fast-path; otherwise it falls through to writeToBank
+	// (request-path / inv emission) -> defer-eligible.
+	if !trans.isReadTrans() && ds.writePermission(trans, subEntry.Sharer) {
+		return true
+	}
+
+	return false
+}
+
+// processRemoteTransaction is the skip-head variant of processTransaction for
+// the remote (peer-incoming) directory pipeline. Each Tick it first retries
+// the oldest deferred evictions, then scans remoteBuf; a request-path-coupled
+// head that stalls is moved into remoteDeferredEvict so a completion-bearing
+// HIT behind it can be reached. See remoteDeferredEvict for the deadlock
+// rationale and the cap-neutrality / order-preservation invariants.
+func (ds *directoryStage) processRemoteTransaction() bool {
+	madeProgress := false
+	buf := ds.remoteBuf
+	ds.returnFalse = &ds.returnFalse1
+	*ds.returnFalse = ""
+
+	// 1. Retry deferred evictions first (oldest first, in order). A deferred
+	//    item is processed exactly like a normal head; on success it leaves
+	//    the side queue, freeing a slot for a future deferral. Stop at the
+	//    first still-stalled deferred item to preserve same-region order
+	//    among deferred items.
+	for len(ds.remoteDeferredEvict) > 0 {
+		trans := ds.remoteDeferredEvict[0]
+		region := ds.regionCacheLineID(trans.accessReq().GetAddress())
+		if _, evicting := ds.cache.evictingList[region]; evicting {
+			ds.cache.stallEvictingList++
+			break
+		}
+		if ds.doWrite(trans, false) {
+			ds.remoteDeferredEvict[0] = nil
+			ds.remoteDeferredEvict = ds.remoteDeferredEvict[1:]
+			madeProgress = true
+		} else {
+			break
+		}
+	}
+
+	// 2. Scan remoteBuf with skip-head over request-path-coupled stalls.
+	for i := 0; i < ds.cache.numReqPerCycle; i++ {
+		*ds.returnFalse += "."
+		item := buf.Peek()
+		if item == nil {
+			break
+		}
+
+		trans := item.(dirPipelineItem).trans
+		addr := trans.accessReq().GetAddress()
+		region := ds.regionCacheLineID(addr)
+
+		if _, evicting := ds.cache.evictingList[region]; evicting {
+			ds.cache.stallEvictingList++
+			break
+		}
+
+		if ds.doWrite(trans, false) {
+			buf.Pop()
+			madeProgress = true
+			continue
+		}
+
+		// Head stalled. Decide whether to skip it.
+		//  - A completion-bearing HIT stalls only on remoteBSBData (its own
+		//    forward buffer); skipping cannot help -> keep strict order, stop.
+		//  - A request-path-coupled item (evict / write-miss / inv-class)
+		//    blocks the request plane; defer it so a HIT behind it can run,
+		//    but ONLY if it is address-disjoint from every deferred item and
+		//    the side queue still has cap-neutral headroom (<= remoteBuf cap).
+		if ds.isCompletionBearingHit(trans) {
+			break
+		}
+		if ds.deferredHasRegion(addr) {
+			break
+		}
+		if len(ds.remoteDeferredEvict) >= buf.Capacity() {
+			break
+		}
+
+		buf.Pop()
+		ds.remoteDeferredEvict = append(ds.remoteDeferredEvict, trans)
+		ds.cache.stallEvictingList++
+		madeProgress = true
+		// continue scanning: the next head may be a completion-bearing HIT.
+	}
+
+	if madeProgress {
+		*ds.returnFalse = ""
+	}
+	return madeProgress
+}
+
 func (ds *directoryStage) doWrite(trans *transaction, isLocal bool) bool {
 	*ds.returnFalse += "[doWrite] "
 	ds.cache.totalDoWriteCalls++
@@ -147,9 +330,28 @@ func (ds *directoryStage) doWrite(trans *transaction, isLocal bool) bool {
 	// Each sub-entry fetch is independent, so each 64B address gets its own entry.
 	cachelineID, _ := getCacheLineID(req.GetAddress(), ds.cache.log2BlockSize)
 	mshrEntry := ds.cache.mshr.Query(req.GetPID(), cachelineID)
+	// [DOWRITE-TRACE] is this the traced cache line?
+	dbgLine := false
+	if ds.cache.debugProcess {
+		tLine, _ := getCacheLineID(ds.cache.debugAddress, ds.cache.log2BlockSize)
+		dbgLine = cachelineID == tLine
+	}
 	if mshrEntry != nil {
 		if trans.write != nil { // write 인 경우, MSHR hit이 발생하면 처리 x
 			*ds.returnFalse += "MSHR hit for write request"
+			// [DOWRITE-TRACE] peer eviction (write) rejected by a line-level
+			// MSHR conflict (an in-flight request — usually local — holds the
+			// MSHR entry for this line). Counted per origin so we can see if
+			// PEER writes are being starved here. Not a capacity stall.
+			if isLocal {
+				ds.cache.stallMSHRHitWriteLocal++
+			} else {
+				ds.cache.stallMSHRHitWriteRemote++
+			}
+			if dbgLine {
+				fmt.Printf("[%s][TRACE] doWrite addr=%x line=%x REJECT(MSHR-hit-write) isLocal=%v fromLocal=%v reqID=%s\n",
+					ds.cache.name, req.GetAddress(), cachelineID, isLocal, trans.fromLocal, trans.accessReq().Meta().ID)
+			}
 			return false
 		}
 
@@ -160,6 +362,15 @@ func (ds *directoryStage) doWrite(trans *transaction, isLocal bool) bool {
 
 		ok := ds.doWriteMSHRHit(trans, mshrEntry)
 		if ok {
+			if isLocal {
+				ds.cache.doWriteMSHRHitLocal++
+			} else {
+				ds.cache.doWriteMSHRHitRemote++
+			}
+			if dbgLine {
+				fmt.Printf("[%s][TRACE] doWrite addr=%x line=%x MSHR-HIT-COALESCE isLocal=%v fromLocal=%v\n",
+					ds.cache.name, req.GetAddress(), cachelineID, isLocal, trans.fromLocal)
+			}
 			tracing.AddTaskStep(
 				tracing.MsgIDAtReceiver(trans.accessReq(), ds.cache),
 				ds.cache,
@@ -179,6 +390,11 @@ func (ds *directoryStage) doWrite(trans *transaction, isLocal bool) bool {
 	if block != nil && block.SubEntry[index].IsValid {
 		ok := ds.doWriteHit(trans, block, index, isLocal)
 		if ok {
+			if isLocal {
+				ds.cache.doWriteHitLocal++
+			} else {
+				ds.cache.doWriteHitRemote++
+			}
 			what := "read-hit"
 			if trans.write != nil {
 				what = "write-hit"
@@ -191,11 +407,20 @@ func (ds *directoryStage) doWrite(trans *transaction, isLocal bool) bool {
 			)
 		}
 
+		if dbgLine {
+			fmt.Printf("[%s][TRACE] doWrite addr=%x line=%x HIT ok=%v isLocal=%v fromLocal=%v write=%v\n",
+				ds.cache.name, req.GetAddress(), cachelineID, ok, isLocal, trans.fromLocal, trans.write != nil)
+		}
 		return ok
 	}
 
 	ok := ds.doWriteMiss(trans, isLocal)
 	if ok {
+		if isLocal {
+			ds.cache.doWriteMissLocal++
+		} else {
+			ds.cache.doWriteMissRemote++
+		}
 		what := "read-miss"
 		if trans.write != nil {
 			what = "write-miss"
@@ -206,6 +431,11 @@ func (ds *directoryStage) doWrite(trans *transaction, isLocal bool) bool {
 			ds.cache,
 			what,
 		)
+	}
+
+	if dbgLine {
+		fmt.Printf("[%s][TRACE] doWrite addr=%x line=%x MISS ok=%v isLocal=%v fromLocal=%v write=%v\n",
+			ds.cache.name, req.GetAddress(), cachelineID, ok, isLocal, trans.fromLocal, trans.write != nil)
 	}
 
 	return ok

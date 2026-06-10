@@ -206,26 +206,29 @@ func (bs *bottomSender) processBypassReq() bool {
 }
 
 // [수정] 양쪽 큐를 모두 확인하여 데드락 방지
+// [BSB-CLASS-SPLIT] Drain all FOUR class lanes each Tick so an inv-class
+// trans stalled on its cap only stalls ITS OWN lane; the other three keep
+// draining. Order Remote-Inv, Remote-Data, Local-Inv, Local-Data mirrors
+// the superdirectory/REC drain (remote-first cross-GPU progress, inv-first
+// egress priority).
 func (bs *bottomSender) processInputReq() bool {
 	progress := false
 
-	// 1. Remote 버퍼 우선 확인 (원격 응답/요청을 먼저 빼주어 네트워크 데드락 완화)
-	item := bs.cache.remoteBottomSenderBuffer.Peek()
-	if item != nil {
-		if bs.processItem(item, false) {
-			bs.cache.remoteBottomSenderBuffer.Pop()
+	drainOne := func(buf sim.Buffer, isLocal bool) {
+		item := buf.Peek()
+		if item == nil {
+			return
+		}
+		if bs.processItem(item, isLocal) {
+			buf.Pop()
 			progress = true
 		}
 	}
 
-	// 2. Local 버퍼 확인
-	item = bs.cache.localBottomSenderBuffer.Peek()
-	if item != nil {
-		if bs.processItem(item, true) {
-			bs.cache.localBottomSenderBuffer.Pop()
-			progress = true
-		}
-	}
+	drainOne(bs.cache.remoteBottomSenderBufferInv, false)
+	drainOne(bs.cache.remoteBottomSenderBufferData, false)
+	drainOne(bs.cache.localBottomSenderBufferInv, true)
+	drainOne(bs.cache.localBottomSenderBufferData, true)
 
 	return progress
 }
@@ -791,9 +794,14 @@ func (bs *bottomSender) processInvRspFromBottom(rsp *mem.InvRsp, port sim.Port) 
 	}
 
 	req := inflightInv.req
+	// [ITER19 INV-RSP ROUTE FIX] Rewrite InvRsp Dst RDMAInvInside ->
+	// RDMAInvRspInside so it routes on the ForInvRsp connection (where this
+	// dir egresses via RDMAInvRspOutPort) to RDMA's processFromInvRspInside.
+	rspDst := sim.RemotePort(strings.Replace(
+		string(req.Meta().Src), ".RDMAInvInside", ".RDMAInvRspInside", 1))
 	rspToOutside := mem.InvRspBuilder{}.
 		WithSrc(bs.cache.topPort.AsRemote()).
-		WithDst(req.Meta().Src).
+		WithDst(rspDst).
 		WithRspTo(req.ReqFrom).
 		Build()
 
@@ -1164,8 +1172,11 @@ func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
 }
 
 func (bs *bottomSender) Reset() {
-	bs.cache.localBottomSenderBuffer.Clear()
-	bs.cache.remoteBottomSenderBuffer.Clear()
+	// [BSB-CLASS-SPLIT] clear all four class lanes.
+	bs.cache.localBottomSenderBufferData.Clear()
+	bs.cache.localBottomSenderBufferInv.Clear()
+	bs.cache.remoteBottomSenderBufferData.Clear()
+	bs.cache.remoteBottomSenderBufferInv.Clear()
 	bs.cache.localBypassBuffer.Clear()
 
 	bs.localInflightRequest = nil

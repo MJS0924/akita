@@ -48,6 +48,22 @@ type directoryStage struct {
 	remoteBuf   sim.Buffer
 	invBuf      sim.Buffer
 
+	// [L2-DECOUPLE / DIR_L2_CYCLE] deferredEvictBuf holds a peer-incoming
+	// remote transaction whose head was stuck (typically an eviction blocked
+	// on a full writeBufferBufferRemote / dirToBankBuffersRemote), moved aside
+	// so a completion-bearing write/read queued BEHIND it can be serviced.
+	// That completion (DataReadyRsp/WriteDoneRsp) egresses UP on remoteTopPort
+	// — a port NOT on the saturated dir->L2 request lane — so it frees the
+	// originating peer's numRemoteInflightEviction and breaks the symmetric
+	// cross-GPU writeback deadlock. deferredEvictLines preserves program order:
+	// while a line sits in the deferred lane, a same-line access is blocked in
+	// processOne, so nothing is reordered past it (independent of evictingList,
+	// whose invariant is left untouched). Cap-neutral: a slot is only ever
+	// MOVED here out of remoteBuf, and acceptNewTransaction gates remote admits
+	// on the combined occupancy.
+	deferredEvictBuf   sim.Buffer
+	deferredEvictLines map[uint64]int
+
 	activeBuf sim.Buffer // 현재 처리 중인 버퍼를 가리키는 내부 포인터
 
 	lastReturnValue bool
@@ -91,6 +107,60 @@ func (ds *directoryStage) Tick() (madeProgress bool) {
 	return madeProgress
 }
 
+// transLine returns the cache-line id a directory-stage transaction targets,
+// mirroring the addr resolution in processOne.
+func (ds *directoryStage) transLine(trans *transaction) uint64 {
+	addr := uint64(0)
+	if trans.invalidation != nil {
+		addr = trans.invalidation.Address
+	} else if trans.accessReq() != nil {
+		addr = trans.accessReq().GetAddress()
+	} else {
+		addr = trans.fetchAddress
+	}
+	line, _ := getCacheLineID(addr, ds.cache.log2BlockSize)
+	return line
+}
+
+// processDeferredRemote retries the head of the deferred lane. On commit it
+// releases that line's program-order hold (handed off to the real evictingList
+// in the same step if the deferred item was an eviction). Returns (committed,
+// cost).
+func (ds *directoryStage) processDeferredRemote() (bool, int) {
+	item := ds.deferredEvictBuf.Peek()
+	if item == nil {
+		return false, 0
+	}
+	line := ds.transLine(item.(dirPipelineItem).trans)
+	ds.activeBuf = ds.deferredEvictBuf
+	ok, cost := ds.processOne()
+	if ok {
+		if ds.deferredEvictLines[line] > 0 {
+			ds.deferredEvictLines[line]--
+			if ds.deferredEvictLines[line] == 0 {
+				delete(ds.deferredEvictLines, line)
+			}
+		}
+	}
+	return ok, cost
+}
+
+// deferRemoteHead parks the stuck remoteBuf head in the deferred lane so a
+// transaction queued behind it can be serviced this cycle. Cap-bounded by the
+// deferred lane size; records the line for program-order safety. Returns true
+// if it moved an item.
+func (ds *directoryStage) deferRemoteHead() bool {
+	item := ds.remoteBuf.Peek()
+	if item == nil || !ds.deferredEvictBuf.CanPush() {
+		return false
+	}
+	line := ds.transLine(item.(dirPipelineItem).trans)
+	ds.remoteBuf.Pop()
+	ds.deferredEvictBuf.Push(item)
+	ds.deferredEvictLines[line]++
+	return true
+}
+
 // invCostInSlots is how many numReqPerCycle slots a single
 // invalidation commit consumes in the directory stage. Reads and
 // writes consume 1 slot. Invalidations consume more to model the
@@ -125,12 +195,26 @@ func (ds *directoryStage) processTransaction() bool {
 			madeProgress = true
 			continue
 		}
-		// Try remote.
+		// Try remote — deferred lane first (program order), then remoteBuf.
 		ds.activeString = &ds.returnFalse0
+		if dok, dcost := ds.processDeferredRemote(); dok {
+			used += dcost
+			madeProgress = true
+			continue
+		}
 		ds.activeBuf = ds.remoteBuf
 		ok, cost = ds.processOne()
 		if ok {
 			used += cost
+			madeProgress = true
+			continue
+		}
+		// [L2-DECOUPLE] remoteBuf head is stuck (e.g. an eviction blocked on a
+		// full writeBufferBufferRemote). Park it in the deferred lane so a
+		// completion-bearing transaction queued behind it can be serviced —
+		// its response egresses UP on remoteTopPort, the edge that frees the
+		// peer's eviction and breaks the symmetric cross-GPU writeback cycle.
+		if ds.deferRemoteHead() {
 			madeProgress = true
 			continue
 		}
@@ -187,6 +271,16 @@ func (ds *directoryStage) processOne() (bool, int) {
 	}
 
 	if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
+		return false, 0
+	}
+
+	// [L2-DECOUPLE] Program-order guard: if a transaction for this line is
+	// currently parked in the deferred lane, a later same-line access must
+	// NOT be committed ahead of it. The deferred item itself is exempt (it is
+	// processed via activeBuf == deferredEvictBuf). Mirrors evictingList's
+	// same-line serialization without mutating evictingList.
+	if ds.activeBuf != ds.deferredEvictBuf &&
+		ds.deferredEvictLines[cacheLineID] > 0 {
 		return false, 0
 	}
 
@@ -358,6 +452,10 @@ func (ds *directoryStage) Reset() {
 	ds.localBuf.Clear()
 	ds.remoteBuf.Clear()
 	ds.invBuf.Clear()
+	ds.deferredEvictBuf.Clear()
+	for k := range ds.deferredEvictLines {
+		delete(ds.deferredEvictLines, k)
+	}
 	ds.cache.dirStageBuffer.Clear()
 	ds.cache.remoteDirStageBuffer.Clear() // Comp 구조체에 remoteDirStageBuffer 추가 필요
 	ds.cache.invStageBuffer.Clear()
@@ -416,6 +514,49 @@ func (ds *directoryStage) bankBufFor(trans *transaction, bank int) sim.Buffer {
 		return ds.cache.dirToBankBuffersLocal[bank]
 	}
 	return ds.cache.dirToBankBuffersRemote[bank]
+}
+
+// [ITER19 DIR_L2_CYCLE FIX] Reserve one slot of the REMOTE bank-ingress
+// buffer (dirToBankBuffersRemote) for completion-bearing peer-incoming
+// transactions (read/write HITs whose finalizeReadHit/finalizeWriteHit
+// emit the DataReadyRsp/WriteDoneRsp that frees the *originating* GPU's
+// numRemoteInflightEviction). Peer-incoming EVICTIONS (evict /
+// evictAndPrefetch) block downstream at finalizeBankEviction on a full
+// writeBufferBufferRemote; once dirToBankBuffersRemote fills with such
+// eviction transactions it head-of-line-blocks peer-incoming HITs from
+// EVER entering the bank pipeline — and those HITs are the only
+// producers of the cross-GPU completion. With both GPUs symmetric this
+// is the closing edge of the writeback deadlock (stencil_rec).
+//
+// By admitting an eviction-class push only when ≥2 slots are free (one
+// left as a guaranteed lane), a peer-incoming HIT can ALWAYS enter the
+// bank, reach finalize*, and Send its completion (which needs no
+// writeBuffer slot because a peer-incoming write to a locally-homed line
+// has writeToHomeNode=false). That completion frees the peer's inflight
+// eviction, the symmetric stall unwinds, and writeBufferBufferRemote
+// drains so deferred evictions resume.
+//
+// NO cap increase: the reservation is carved from the EXISTING
+// dirToBankBuffersRemote capacity (numReqPerCycle). Scope is strictly
+// fromLocal=false EVICTIONS; local traffic and all HIT/fetch pushes use
+// the unchanged CanPush(). Coherence decisions are untouched — only the
+// admit-ordering between an eviction REQUEST and a completion RESPONSE
+// on the shared remote bank-ingress buffer changes.
+func (ds *directoryStage) bankBufCanPushEvict(trans *transaction, bank int) bool {
+	buf := ds.bankBufFor(trans, bank)
+	if trans.fromLocal {
+		// Local evictions drain via DRAM ACK on an independent path;
+		// they are not part of the cross-GPU completion cycle. Preserve
+		// legacy behavior exactly.
+		return buf.CanPush()
+	}
+	// Remote (peer-incoming) eviction: leave one completion slot free.
+	// When Capacity()==1 (degenerate) fall back to CanPush() so we never
+	// hard-block all eviction progress.
+	if buf.Capacity() <= 1 {
+		return buf.CanPush()
+	}
+	return buf.Size()+1 < buf.Capacity()
 }
 
 // [FIX #3] writeBuffer 가 임계 이상 차 있을 때 fromLocal=true 트랜잭션의
@@ -490,8 +631,11 @@ func (ds *directoryStage) evictAndPrefetch(trans *transaction, victim *internal.
 		ds.cache.directory.WayAssociativity(), len(ds.cache.dirToBankBuffers))
 	bankBuf := ds.bankBufFor(trans, bankNum)
 
-	if !bankBuf.CanPush() {
-		*ds.activeString = *ds.activeString + "Cannot push to bankBuf "
+	// [ITER19 DIR_L2_CYCLE FIX] Eviction-class push honors the reserved
+	// completion lane on the remote bank-ingress buffer (see
+	// bankBufCanPushEvict). Local evictions keep legacy CanPush().
+	if !ds.bankBufCanPushEvict(trans, bankNum) {
+		*ds.activeString = *ds.activeString + "Cannot push to bankBuf (evict+prefetch, completion-lane reserved) "
 		// fmt.Printf("[%s]\t%s\n", ds.cache.name, ds.returnFalse)
 		return false
 	}
@@ -1183,8 +1327,11 @@ func (ds *directoryStage) evict(
 		ds.cache.directory.WayAssociativity(), len(ds.cache.dirToBankBuffers))
 	bankBuf := ds.bankBufFor(trans, bankNum)
 
-	if !bankBuf.CanPush() {
-		*ds.activeString = *ds.activeString + "Cannot push to bankBuf "
+	// [ITER19 DIR_L2_CYCLE FIX] Eviction-class push: honor the reserved
+	// completion lane on the remote bank-ingress buffer (see
+	// bankBufCanPushEvict). Local evictions keep legacy CanPush().
+	if !ds.bankBufCanPushEvict(trans, bankNum) {
+		*ds.activeString = *ds.activeString + "Cannot push to bankBuf (evict, completion-lane reserved) "
 		trans.returnFalse = *ds.activeString
 
 		return false
@@ -1441,19 +1588,33 @@ func (ds *directoryStage) isMSHRAvailable(trans *transaction) bool {
 		return false
 	}
 
-	if trans.fromLocal {
-		entries := ds.cache.mshr.AllEntries()
-		count := 0
-		for _, entry := range entries {
-			if entry.Requests[0].(*transaction).fromLocal {
-				count++
-			}
+	// [ORIGIN-SPLIT] Gate each ORIGIN against its own MSHR sub-quota so the
+	// IsFull residual is never shared. maxLocalMshr + maxRemoteMshr partition
+	// numMSHREntry (no net increase). Without the symmetric maxRemoteMshr
+	// reservation, peer-serve (fromLocal=false) misses could consume the
+	// entire residual (own starves) and own filling to maxLocalMshr left only
+	// the gap for peer-serve (peer starves) — the cross-GPU MSHR-starvation
+	// edge of the serve deadlock.
+	localCount := 0
+	for _, entry := range ds.cache.mshr.AllEntries() {
+		if entry.Requests[0].(*transaction).fromLocal {
+			localCount++
 		}
+	}
 
-		if count >= ds.cache.maxLocalMshr {
+	if trans.fromLocal {
+		if localCount >= ds.cache.maxLocalMshr {
 			ds.cache.stallMSHRLocalCap++
 			return false
 		}
+		return true
+	}
+
+	// fromLocal=false (peer-serve): gate against the remote sub-quota.
+	remoteCount := len(ds.cache.mshr.AllEntries()) - localCount
+	if ds.cache.maxRemoteMshr > 0 && remoteCount >= ds.cache.maxRemoteMshr {
+		ds.cache.stallMSHRRemoteCap++
+		return false
 	}
 
 	return true

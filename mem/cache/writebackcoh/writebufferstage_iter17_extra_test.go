@@ -100,7 +100,7 @@ func TestIter17_F2_PeerFullAtExactCapacityBoundary(t *testing.T) {
 		writeBufferCapacity:     32,
 		writeBufferPeerCapacity: 16,
 	}
-	wb.pendingRemoteEvictions = make([]*transaction, 14)
+	wb.pendingRemoteEvictionsPeer = make([]*transaction, 14)
 	wb.numRemoteInflightEviction = 2
 	// PEER bucket = 14+2 = 16 = peerCap → FULL
 	if !wb.writeBufferFull(false) {
@@ -135,7 +135,7 @@ func TestIter17_F2_LocalAdmitIndependentOfRemoteSaturation_Stress(t *testing.T) 
 		{512, 0},  // 2x peer cap (synthetic worst case)
 	}
 	for _, c := range cases {
-		wb.pendingRemoteEvictions = make([]*transaction, c.pendRem)
+		wb.pendingRemoteEvictionsPeer = make([]*transaction, c.pendRem)
 		wb.numRemoteInflightEviction = c.infRem
 		// LOCAL fully empty.
 		wb.pendingLocalEvictions = nil
@@ -164,7 +164,7 @@ func TestIter17_F2_PeerAdmitIndependentOfLocalSaturation_Stress(t *testing.T) {
 	for _, c := range cases {
 		wb.pendingLocalEvictions = make([]*transaction, c.pendLoc)
 		wb.numLocalInflightEviction = c.infLoc
-		wb.pendingRemoteEvictions = nil
+		wb.pendingRemoteEvictionsPeer = nil
 		wb.numRemoteInflightEviction = 0
 		if wb.writeBufferFull(false) {
 			t.Errorf("REGRESSION: peer admit blocked by LOCAL saturation (pendLoc=%d infLoc=%d)",
@@ -204,7 +204,7 @@ func TestIter17_F1F2_PeerAdmitCombined(t *testing.T) {
 
 	// Hit only peer bucket (numPeerIncoming reset).
 	wb.numPeerIncomingPending = 0
-	wb.pendingRemoteEvictions = make([]*transaction, 32)
+	wb.pendingRemoteEvictionsPeer = make([]*transaction, 32)
 	if !wb.writeBufferFull(false) {
 		t.Fatalf("F1F2: peer bucket should be FULL at cap=32")
 	}
@@ -220,7 +220,7 @@ func TestIter17_F1F2_PeerAdmitCombined(t *testing.T) {
 func TestIter17_LegacyFullPredicate_SumsAllSides(t *testing.T) {
 	wb := &writeBufferStage{writeBufferCapacity: 100}
 	wb.pendingLocalEvictions = make([]*transaction, 40)
-	wb.pendingRemoteEvictions = make([]*transaction, 40)
+	wb.pendingRemoteEvictionsPeer = make([]*transaction, 40)
 	wb.inflightEviction = make([]*transaction, 20)
 	if !wb.writeBufferFullLegacy() {
 		t.Fatalf("legacy predicate should treat sum=100=cap as FULL")

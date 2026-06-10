@@ -37,9 +37,9 @@ func TestIter17_F5b_PeerInflightCapEnforced(t *testing.T) {
 	}
 	for _, c := range cases {
 		bs.numPeerInflightRequest = c.numPeer
-		got := bs.tooManyInflightRequest(false) // peer side
+		got := bs.tooManyInflightRequest(false, false) // peer side
 		if got != c.wantFull {
-			t.Errorf("F5b: numPeerInflight=%d cap=%d: tooManyInflightRequest(false)=%v, want %v",
+			t.Errorf("F5b: numPeerInflight=%d cap=%d: tooManyInflightRequest(false, false)=%v, want %v",
 				c.numPeer, bs.maxPeerInflightRequest, got, c.wantFull)
 		}
 	}
@@ -53,7 +53,7 @@ func TestIter17_F5b_PeerCapDisabledFallsBackToIter15(t *testing.T) {
 		maxPeerInflightRequest: 0,        // disabled
 		numPeerInflightRequest: 10000000, // any value
 	}
-	if bs.tooManyInflightRequest(false) {
+	if bs.tooManyInflightRequest(false, false) {
 		t.Fatalf("F5b: peer cap disabled, must always admit")
 	}
 }
@@ -68,14 +68,14 @@ func TestIter17_F5_LocalSideUnaffectedByPeerCap(t *testing.T) {
 	}
 
 	// local idle → tooMany(true) = false (peer state must not leak)
-	if bs.tooManyInflightRequest(true) {
+	if bs.tooManyInflightRequest(true, false) {
 		t.Fatalf("F5: peer-cap state must not affect LOCAL admit (local=0)")
 	}
 
 	// Local actually at its own cap.
 	bs.localInflightRequest = make([]*transaction, 128)
 	bs.remoteInflightRequest = nil
-	if !bs.tooManyInflightRequest(true) {
+	if !bs.tooManyInflightRequest(true, false) {
 		t.Fatalf("F5: LOCAL admit blocked when LOCAL inflight at total cap")
 	}
 }
@@ -144,11 +144,11 @@ func TestIter17_F5b_PeerCapEdge(t *testing.T) {
 		maxPeerInflightRequest: 256,
 	}
 	bs.numPeerInflightRequest = 255
-	if bs.tooManyInflightRequest(false) {
+	if bs.tooManyInflightRequest(false, false) {
 		t.Fatalf("F5b: 255 < 256 should NOT block")
 	}
 	bs.numPeerInflightRequest = 256
-	if !bs.tooManyInflightRequest(false) {
+	if !bs.tooManyInflightRequest(false, false) {
 		t.Fatalf("F5b: 256 = 256 should block")
 	}
 }
@@ -162,7 +162,7 @@ func TestIter17_F5b_PeerBurstSimulation(t *testing.T) {
 	}
 	admitted := 0
 	for i := 0; i < 1000; i++ {
-		if !bs.tooManyInflightRequest(false) {
+		if !bs.tooManyInflightRequest(false, false) {
 			bs.numPeerInflightRequest++
 			admitted++
 		}

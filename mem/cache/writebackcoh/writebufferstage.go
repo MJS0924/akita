@@ -28,6 +28,18 @@ type writeBufferStage struct {
 	maxInflightFetch         int
 	maxInflightEviction      int
 
+	// [ORIGIN-SPLIT] Per-ORIGIN sub-budgets of the REMOTE-destination
+	// inflight-eviction ceiling. own + peer sum to the existing remote
+	// ceiling (maxInflightEviction); no net capacity increase. Set in
+	// builder.go (own≈3/4, peer≈1/4, mirroring the maxInflightRequest
+	// soft-cap convention). tooManyInflightEvictions gates a remote-bound
+	// eviction against the sub-budget matching its origin so peer-serve
+	// always retains its reserved slots. The LOCAL-destination side keeps
+	// the single maxInflightEviction ceiling (it drains via DRAM ACK,
+	// independent of the cross-GPU cycle).
+	maxRemoteInflEvictOwn  int
+	maxRemoteInflEvictPeer int
+
 	// [ITER17 F1] Cap on peer-bypass admit lane (the iter13 #1 path
 	// that admits fromLocal=false unconditionally except for bankBuf.
 	// Without this cap, observed: pendingLocalEvictions = 1432 (1.4×
@@ -45,10 +57,43 @@ type writeBufferStage struct {
 	// one is sent (bottomPort.CanSend is shared), so total throughput
 	// is unchanged but a stalled head no longer starves the other
 	// category.
-	pendingLocalEvictions  []*transaction
-	pendingRemoteEvictions []*transaction
-	inflightFetch          []*transaction
-	inflightEviction       []*transaction
+	//
+	// [ORIGIN-SPLIT] The pendingRemoteEvictions queue (remote DESTINATION)
+	// is further partitioned by ORIGIN (trans.fromLocal): own-L1-originated
+	// remote evictions vs peer-serve-originated displacement flushes. A pile
+	// of OWN remote evictions must not head-of-line-block the PEER-serve
+	// flush whose drain emits the ACK that frees the peer's remote-inflict
+	// cap (the closing edge of the cross-GPU serve deadlock). tryWriteOne
+	// drains the Peer queue FIRST. pendingLocalEvictions (local DESTINATION)
+	// stays single — the deadlock cycle is entirely on the remote-bound side.
+	pendingLocalEvictions       []*transaction
+	pendingRemoteEvictionsOwn   []*transaction
+	pendingRemoteEvictionsPeer  []*transaction
+	inflightFetch               []*transaction
+	inflightEviction            []*transaction
+
+	// [RESPONSE-DECOUPLE] Bounded reordering buffer for displacement-flush
+	// transactions whose response (WriteDoneRsp/DataReadyRsp) has already been
+	// emitted but whose victim flush could not yet enter writeBufferBuffer
+	// (its admit lane was momentarily full). The victim's data/identity is
+	// already snapshotted on the *transaction (evictingData/evictingAddr/...),
+	// so this holds only the pointer — NO data copy, NO eviction-capacity
+	// increase. Drained every Tick (drainDeferredFlush) the instant a
+	// writeBufferBuffer slot frees; the victim then traverses the UNCHANGED
+	// tooManyOutgoingRemote / numRemoteInflightEviction caps. This lets the
+	// response leave ahead of the displacement so a saturated own-eviction cap
+	// can no longer block the response that drains a peer's cap (the closing
+	// edge of the cross-GPU serve deadlock).
+	// [ORIGIN-SPLIT] deferredFlush partitioned by ORIGIN (trans.fromLocal)
+	// each with cap = maxDeferredFlush/2 (no net increase). A shared, full
+	// deferredFlush re-closes the very cross-GPU writeback cycle the
+	// response-decouple buffer exists to break: own-L1 displacement flushes
+	// (fromLocal=true) could exhaust the deferral list and strand the
+	// peer-serve WriteDoneRsp/DataReadyRsp ack. drainDeferredFlush drains
+	// the Peer list FIRST.
+	deferredFlushOwn  []*transaction
+	deferredFlushPeer []*transaction
+	maxDeferredFlush  int
 
 	// Local/remote split mirrors the fetch quota in superdirectory's
 	// bottomSender (75% local / 25% remote). Without this split,
@@ -57,8 +102,26 @@ type writeBufferStage struct {
 	// the cross-GPU path can fill the cap and HoL-block local evictions
 	// (and vice versa), producing cross-GPU circular wait deadlocks
 	// observed under stencil2d SD.
+	//
+	// numRemoteInflightEviction (remote DESTINATION) is kept as the exact
+	// sum of the two ORIGIN sub-counters below so writeBufferFull's PEER
+	// bucket accounting is unchanged. The ORIGIN split is what the inflight
+	// admit gate (tooManyInflightEvictions) now keys on.
 	numLocalInflightEviction  int
 	numRemoteInflightEviction int
+
+	// [ORIGIN-SPLIT] Remote-DESTINATION inflight evictions partitioned by
+	// ORIGIN (trans.fromLocal). The single 128-slot remote cap used to be
+	// consumed by BOTH own cross-GPU evictions (fromLocal=true) AND
+	// peer-serve displacement flushes (fromLocal=false); when own work
+	// saturated it the peer-serve flush could never drain → no
+	// WriteDoneRsp/ack → mutual cross-GPU deadlock (the confirmed seed).
+	// Each origin now gates against its own sub-budget
+	// (maxRemoteInflEvictOwn / maxRemoteInflEvictPeer) carved from the
+	// existing remote ceiling, so the peer-serve flush always has reserved
+	// slots and own work can never starve it.
+	numRemoteInflEvictOwn  int
+	numRemoteInflEvictPeer int
 
 	// [OUTGOING-REMOTE CAP FIX] Cap on the SUM of pending + inflight
 	// remote-bound evictions. Closes the cross-GPU symmetric
@@ -79,8 +142,16 @@ type writeBufferStage struct {
 	// sender's upstream (dirStage → topparser → L1) instead of the
 	// receiver's wB cap. maxOutgoingRemotePending <= 0 disables the
 	// cap (legacy behavior).
-	numPendingRemoteEvictions int
-	maxOutgoingRemotePending  int
+	//
+	// [ORIGIN-SPLIT] numPendingRemoteEvictions partitioned by ORIGIN. The
+	// peer-bypass admit lane never consulted tooManyOutgoingRemote, so
+	// peer-serve work used to FILL this counter while only OWN remote
+	// evictions were gated by it — own work both filled and was starved by
+	// a sum peer-serve also filled. The outgoing-remote admit gate now
+	// applies ONLY to OWN-origin pending; peer-serve stays ungated there.
+	numPendingRemoteEvictionsOwn  int
+	numPendingRemoteEvictionsPeer int
+	maxOutgoingRemotePending      int
 
 	// Typed sub-queues for bottomPort response handling. Without these,
 	// processDataReadyRsp may fail (writeBufferToBankBuffers cap full →
@@ -121,6 +192,18 @@ type writeBufferStage struct {
 	// pop from this exact buffer so the right slot is freed regardless
 	// of whether the head came from the local or remote queue.
 	currentEvictionSrcBuf sim.Buffer
+
+	// [ITER20 DIAG] WriteDoneRsp acks whose RespondTo matched no
+	// inflightEviction.evictionWriteReq.ID — a silent numRemoteInflight
+	// leak (ack consumed at bottomPort, but no decrement). Non-zero ==
+	// the win80 quiesced-with-128-inflight deadlock root.
+	writeDoneNoMatchCount  uint64
+	writeDoneNoMatchSample string
+	// [ITER20 DIAG E] every WriteDoneRsp that arrives at bottomPort
+	// (matched or not). If 0 at the win80 deadlock while
+	// numRemoteInflightEviction is pinned, the ack never reached the
+	// sender L2 — the leak is on the return path (peer/RDMA/network).
+	writeDoneReceivedCount uint64
 }
 
 
@@ -149,6 +232,12 @@ func (wb *writeBufferStage) Tick() bool {
 
 	madeProgress = wb.write() || madeProgress
 
+	// [RESPONSE-DECOUPLE] Re-inject already-acked displacement flushes back
+	// into the normal writeBufferBuffer admit path as soon as a slot frees.
+	// Runs before processNewTransaction so deferred victims (whose responses
+	// already left) get the freed slot ahead of brand-new work.
+	madeProgress = wb.drainDeferredFlush() || madeProgress
+
 	madeProgress = wb.processNewTransaction() || madeProgress
 	// [FIX: head-of-line] writeBufferFetchBuffer(fetch 전용)를 writeBufferBuffer(eviction 전용)와
 	// 독립적으로 처리. fetch 블로킹이 eviction 진행을 막지 않도록 분리.
@@ -157,27 +246,80 @@ func (wb *writeBufferStage) Tick() bool {
 	return madeProgress
 }
 
+// [RESPONSE-DECOUPLE] deferFlushCanPush reports whether the bounded
+// reordering buffer for the given ORIGIN can accept one more already-acked
+// displacement flush. [ORIGIN-SPLIT] Each origin has its own half-cap so an
+// own-L1 displacement-flush flood cannot exhaust the deferral list and strand
+// the peer-serve ack (and vice versa).
+func (wb *writeBufferStage) deferFlushCanPush(fromLocal bool) bool {
+	half := wb.maxDeferredFlush / 2
+	if fromLocal {
+		return len(wb.deferredFlushOwn) < half
+	}
+	return len(wb.deferredFlushPeer) < half
+}
+
+// deferFlushPush parks a displacement-flush transaction whose response has
+// already been emitted but whose victim could not yet enter writeBufferBuffer.
+// Holds the pointer only — the victim data already lives on the transaction.
+// [ORIGIN-SPLIT] Routes by trans.fromLocal to the matching half-list.
+func (wb *writeBufferStage) deferFlushPush(trans *transaction) {
+	if trans.fromLocal {
+		wb.deferredFlushOwn = append(wb.deferredFlushOwn, trans)
+	} else {
+		wb.deferredFlushPeer = append(wb.deferredFlushPeer, trans)
+	}
+}
+
+// drainDeferredFlush re-injects the head deferred flush into the normal
+// writeBufferBuffer admit path the instant a slot frees. The victim then
+// traverses the UNCHANGED tooManyOutgoingRemote / numRemoteInflictEviction
+// caps via processWriteBufferFlush → tryWriteOne — no cap is bypassed; only
+// the response left ahead of the displacement. [ORIGIN-SPLIT] Drains the PEER
+// half FIRST so a pile of own deferred flushes cannot strand the peer-serve
+// ack-bearing displacement.
+func (wb *writeBufferStage) drainDeferredFlush() bool {
+	if wb.drainOneDeferredFlush(&wb.deferredFlushPeer) {
+		return true
+	}
+	return wb.drainOneDeferredFlush(&wb.deferredFlushOwn)
+}
+
+func (wb *writeBufferStage) drainOneDeferredFlush(list *[]*transaction) bool {
+	if len(*list) == 0 {
+		return false
+	}
+	head := (*list)[0]
+	if !wb.cache.writeBufferBufferCanPush(head.fromLocal) {
+		return false
+	}
+	wb.cache.writeBufferBufferPush(head, head.fromLocal)
+	*list = (*list)[1:]
+	return true
+}
+
 func (wb *writeBufferStage) drainBottomTyped() bool {
-	// Drain bottomPort head unconditionally into typed sub-queues. Caps
-	// are intentionally NOT applied here — capping the typed queue
-	// would re-introduce the same HoL behavior the queues are meant to
-	// eliminate (a stuck DataReadyRsp at port head behind which
-	// WriteDoneRsp cannot be observed). The typed queues are normally
-	// near-empty (drained the same cycle by processPending* helpers);
-	// they only grow during the rare downstream-stall window the fix
-	// is designed to break. No inflight cap is being raised — these
-	// are pure ingress sub-queues with no model semantics.
-	msg := wb.cache.bottomPort.PeekIncoming()
+	// [L2 LOCAL/REMOTE SPLIT] Drain remoteBottomPort FIRST (cross-GPU critical
+	// path = the ACK return for own remote evictions / remote fetches), then
+	// bottomPort — each independently, mirroring the dir's remote-first
+	// processReturnRsp. Each port has its own head so a stalled local response
+	// can never HoL-block a remote response and vice versa.
+	r := wb.drainOneBottomPort(wb.cache.remoteBottomPort)
+	l := wb.drainOneBottomPort(wb.cache.bottomPort)
+	return r || l
+}
+
+// drainOneBottomPort drains one head from the given bottom-side port into the
+// typed sub-queues (classified by fromLocal). Caps are intentionally NOT
+// applied here (see original rationale: capping would re-introduce HoL).
+func (wb *writeBufferStage) drainOneBottomPort(port sim.Port) bool {
+	msg := port.PeekIncoming()
 	if msg == nil {
 		return false
 	}
 
 	switch m := msg.(type) {
 	case *mem.DataReadyRsp:
-		// [R6] Classify by inflightFetch lookup; if it matches a
-		// known fromLocal trans, route to Local lane, else Remote.
-		// Prefetch responses (no matching inflightFetch) default to
-		// Local — they don't sit on the cross-GPU critical path.
 		trans := wb.findInflightFetchByFetchReadReqID(m.RespondTo)
 		if trans != nil && !trans.fromLocal {
 			wb.pendingDataReadyRemote = append(wb.pendingDataReadyRemote, m)
@@ -185,8 +327,7 @@ func (wb *writeBufferStage) drainBottomTyped() bool {
 			wb.pendingDataReadyLocal = append(wb.pendingDataReadyLocal, m)
 		}
 	case *mem.WriteDoneRsp:
-		// [R6] Classify by inflightEviction lookup using
-		// e.evictionWriteReq.ID. Route by trans.fromLocal.
+		wb.writeDoneReceivedCount++
 		var fromLocal = true
 		for _, e := range wb.inflightEviction {
 			if e.evictionWriteReq != nil && e.evictionWriteReq.ID == m.RespondTo {
@@ -200,23 +341,23 @@ func (wb *writeBufferStage) drainBottomTyped() bool {
 			wb.pendingWriteDoneRemote = append(wb.pendingWriteDoneRemote, m)
 		}
 	default:
-		panic("unknown msg type on bottomPort")
+		panic("unknown msg type on bottom port")
 	}
 
-	wb.cache.bottomPort.RetrieveIncoming()
+	port.RetrieveIncoming()
 	return true
 }
 
 func (wb *writeBufferStage) processPendingDataReady() bool {
-	// [R6] Drain Remote half first (peer-incoming priority) — mirrors
-	// dirToBankBuffersRemote and writeBufferBufferRemote precedent.
+	// [R6] Try Remote first; if blocked, fall through to try Local
+	// independently — do NOT block Local when Remote fails (HoL-in-reverse).
 	if len(wb.pendingDataReadyRemote) > 0 {
 		head := wb.pendingDataReadyRemote[0]
 		if wb.tryProcessDataReadyRsp(head) {
 			wb.pendingDataReadyRemote = wb.pendingDataReadyRemote[1:]
 			return true
 		}
-		return false
+		// Remote blocked — fall through and try Local below
 	}
 	if len(wb.pendingDataReadyLocal) == 0 {
 		return false
@@ -343,13 +484,20 @@ func (wb *writeBufferStage) findDataLocally(trans *transaction) bool {
 	}
 
 	// [ITER10] check both local and remote pending eviction queues.
+	// [ORIGIN-SPLIT] remote pending is now two origin half-queues; scan both.
 	for _, e := range wb.pendingLocalEvictions {
 		if e.evictingAddr == trans.fetchAddress {
 			trans.fetchedData = e.evictingData
 			return true
 		}
 	}
-	for _, e := range wb.pendingRemoteEvictions {
+	for _, e := range wb.pendingRemoteEvictionsOwn {
+		if e.evictingAddr == trans.fetchAddress {
+			trans.fetchedData = e.evictingData
+			return true
+		}
+	}
+	for _, e := range wb.pendingRemoteEvictionsPeer {
 		if e.evictingAddr == trans.fetchAddress {
 			trans.fetchedData = e.evictingData
 			return true
@@ -366,7 +514,7 @@ func (wb *writeBufferStage) sendFetchedDataToBank(
 	bankNum := bankID(trans.block,
 		wb.cache.directory.WayAssociativity(),
 		len(wb.cache.dirToBankBuffers))
-	bankBuf := wb.cache.writeBufferToBankBuffersRsp[bankNum] // [R5] bankWriteFetched
+	bankBuf := wb.cache.writeBufferToBankBufferRsp(bankNum, trans.fromLocal) // [R5 + BANK SPLIT] bankWriteFetched
 
 	if !bankBuf.CanPush() {
 		trans.fetchedData = nil
@@ -408,7 +556,12 @@ func (wb *writeBufferStage) fetchFromBottom(
 		return false
 	}
 
-	if !wb.cache.bottomPort.CanSend() {
+	// [L2 LOCAL/REMOTE SPLIT] remote-homed fetches egress on remoteBottomPort.
+	egress := wb.cache.bottomPort
+	if !wb.cache.toLocal(trans.fetchAddress) {
+		egress = wb.cache.remoteBottomPort
+	}
+	if !egress.CanSend() {
 		return false
 	}
 
@@ -417,7 +570,7 @@ func (wb *writeBufferStage) fetchFromBottom(
 	// 	fmt.Printf("[%s]\tFetch %x from %s\n", wb.cache.Name(), trans.fetchAddress, lowModulePort)
 	// }
 	read := mem.ReadReqBuilder{}.
-		WithSrc(wb.cache.bottomPort.AsRemote()).
+		WithSrc(egress.AsRemote()).
 		WithDst(lowModulePort).
 		WithPID(trans.fetchPID).
 		WithAddress(trans.fetchAddress).
@@ -428,7 +581,7 @@ func (wb *writeBufferStage) fetchFromBottom(
 		read.VAddr = trans.accessReq().GetVAddr()
 	}
 
-	wb.cache.bottomPort.Send(read)
+	egress.Send(read)
 
 	trans.fetchReadReq = read
 	wb.inflightFetch = append(wb.inflightFetch, trans)
@@ -497,7 +650,7 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 			wb.cache.directory.WayAssociativity(),
 			len(wb.cache.dirToBankBuffers),
 		)
-		bankBuf := wb.cache.writeBufferToBankBuffersReq[bankNum] // [R5] bankWriteHit
+		bankBuf := wb.cache.writeBufferToBankBufferReq(bankNum, trans.fromLocal) // [R5 + BANK SPLIT] bankWriteHit (peer-incoming bypass, fromLocal=false)
 		if !bankBuf.CanPush() {
 			wb.lastAdmitFailReason = fmt.Sprintf("bankBuf.CanPush()=false bankNum=%d fromLocal=false (peer-incoming bypass lane, still bank-backpressured)",
 				bankNum)
@@ -509,8 +662,9 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 		if isLocal {
 			wb.pendingLocalEvictions = append(wb.pendingLocalEvictions, trans)
 		} else {
-			wb.pendingRemoteEvictions = append(wb.pendingRemoteEvictions, trans)
-			wb.numPendingRemoteEvictions++
+			// [ORIGIN-SPLIT] peer-bypass admit = fromLocal=false = PEER origin.
+			wb.pendingRemoteEvictionsPeer = append(wb.pendingRemoteEvictionsPeer, trans)
+			wb.numPendingRemoteEvictionsPeer++
 		}
 		wb.numPeerIncomingPending++
 		wb.currentEvictionSrcBuf.Pop()
@@ -520,7 +674,7 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 	if wb.writeBufferFull(trans.fromLocal) {
 		// [ITER12] precise reason
 		wb.lastAdmitFailReason = fmt.Sprintf("writeBufferFull(side=%v): pendingLoc=%d pendingRem=%d numLocalInfl=%d numRemoteInfl=%d locCap=%d peerCap=%d",
-			trans.fromLocal, len(wb.pendingLocalEvictions), len(wb.pendingRemoteEvictions),
+			trans.fromLocal, len(wb.pendingLocalEvictions), wb.pendingRemoteEvictionsLen(),
 			wb.numLocalInflightEviction, wb.numRemoteInflightEviction, wb.writeBufferCapacity, wb.writeBufferPeerCapacity)
 		return false
 	}
@@ -528,10 +682,12 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 	// [OUTGOING-REMOTE CAP FIX] Refuse new remote-bound evictions when
 	// the per-cache outgoing-remote quota is saturated. Keeps receiver
 	// L2's wB headroom available for incoming-triggered evictions.
+	// [ORIGIN-SPLIT] This own-eviction path is fromLocal=true (peer-bypass
+	// returned above), so the outgoing-remote gate applies to OWN pending.
 	isLocal := wb.cache.toLocal(trans.evictingAddr)
 	if wb.tooManyOutgoingRemote(isLocal) {
-		wb.lastAdmitFailReason = fmt.Sprintf("tooManyOutgoingRemote: numPendingRemote=%d numRemoteInflight=%d maxOutgoingRemotePending=%d isLocal=%v fromLocal=%v",
-			wb.numPendingRemoteEvictions, wb.numRemoteInflightEviction,
+		wb.lastAdmitFailReason = fmt.Sprintf("tooManyOutgoingRemote: numPendingRemoteOwn=%d numRemoteInflight=%d maxOutgoingRemotePending=%d isLocal=%v fromLocal=%v",
+			wb.numPendingRemoteEvictionsOwn, wb.numRemoteInflightEviction,
 			wb.maxOutgoingRemotePending, isLocal, trans.fromLocal)
 		return false
 	}
@@ -541,7 +697,7 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 		wb.cache.directory.WayAssociativity(),
 		len(wb.cache.dirToBankBuffers),
 	)
-	bankBuf := wb.cache.writeBufferToBankBuffersReq[bankNum] // [R5] bankWriteHit
+	bankBuf := wb.cache.writeBufferToBankBufferReq(bankNum, trans.fromLocal) // [R5 + BANK SPLIT] bankWriteHit
 
 	if !bankBuf.CanPush() {
 		wb.lastAdmitFailReason = fmt.Sprintf("bankBuf.CanPush()=false bankNum=%d fromLocal=%v",
@@ -555,8 +711,9 @@ func (wb *writeBufferStage) processWriteBufferEvictAndWrite(
 	if isLocal {
 		wb.pendingLocalEvictions = append(wb.pendingLocalEvictions, trans)
 	} else {
-		wb.pendingRemoteEvictions = append(wb.pendingRemoteEvictions, trans)
-		wb.numPendingRemoteEvictions++
+		// [ORIGIN-SPLIT] own (fromLocal=true) remote eviction.
+		wb.pendingRemoteEvictionsOwn = append(wb.pendingRemoteEvictionsOwn, trans)
+		wb.numPendingRemoteEvictionsOwn++
 	}
 	wb.currentEvictionSrcBuf.Pop()
 
@@ -588,7 +745,7 @@ func (wb *writeBufferStage) processWriteBufferEvictAndPrefetch(
 		wb.cache.directory.WayAssociativity(),
 		len(wb.cache.dirToBankBuffers),
 	)
-	bankBuf := wb.cache.writeBufferToBankBuffersReq[bankNum] // [R5] bankWritePrefetched
+	bankBuf := wb.cache.writeBufferToBankBufferReq(bankNum, trans.fromLocal) // [R5 + BANK SPLIT] bankWritePrefetched
 
 	if !bankBuf.CanPush() {
 		return false
@@ -598,10 +755,15 @@ func (wb *writeBufferStage) processWriteBufferEvictAndPrefetch(
 	bankBuf.Push(trans)
 
 	// [ITER10] route to local/remote pending queue based on dst.
+	// [ORIGIN-SPLIT] remote pending further keyed by origin (dead code path).
 	if wb.cache.toLocal(trans.evictingAddr) {
 		wb.pendingLocalEvictions = append(wb.pendingLocalEvictions, trans)
+	} else if trans.fromLocal {
+		wb.pendingRemoteEvictionsOwn = append(wb.pendingRemoteEvictionsOwn, trans)
+		wb.numPendingRemoteEvictionsOwn++
 	} else {
-		wb.pendingRemoteEvictions = append(wb.pendingRemoteEvictions, trans)
+		wb.pendingRemoteEvictionsPeer = append(wb.pendingRemoteEvictionsPeer, trans)
+		wb.numPendingRemoteEvictionsPeer++
 	}
 
 	wb.currentEvictionSrcBuf.Pop()
@@ -648,13 +810,18 @@ func (wb *writeBufferStage) processWriteBufferFlush(
 	// MUST be admitted so the ACK path stays open.
 	if trans.fromLocal {
 		if wb.writeBufferFull(true) {
+			wb.lastAdmitFailReason = fmt.Sprintf("flush:writeBufferFull(true) pendingLoc=%d numLocalInfl=%d cap=%d evictAddr=%x",
+				len(wb.pendingLocalEvictions), wb.numLocalInflightEviction, wb.writeBufferCapacity, trans.evictingAddr)
 			return false
 		}
 		// [OUTGOING-REMOTE CAP FIX] Same admit-side guard as
 		// processWriteBufferEvictAndWrite — guards against sender L2
 		// over-filling its pending+inflight remote eviction count.
+		// [ORIGIN-SPLIT] fromLocal=true here, so the gate reads OWN pending.
 		isLocalDst := wb.cache.toLocal(trans.evictingAddr)
 		if wb.tooManyOutgoingRemote(isLocalDst) {
+			wb.lastAdmitFailReason = fmt.Sprintf("flush:tooManyOutgoingRemote numPendingRemoteOwn=%d numRemoteInfl=%d max=%d evictAddr=%x",
+				wb.numPendingRemoteEvictionsOwn, wb.numRemoteInflightEviction, wb.maxOutgoingRemotePending, trans.evictingAddr)
 			return false
 		}
 	} else {
@@ -671,12 +838,18 @@ func (wb *writeBufferStage) processWriteBufferFlush(
 
 	// [ITER10] route to local/remote pending queue (works for both
 	// peer-bypass and sender paths).
+	// [ORIGIN-SPLIT] remote-destination pending further keyed by origin so
+	// own flushes and peer-serve flushes occupy independent queues; the
+	// peer-bypass path falls into the Peer queue here too.
 	isLocal := wb.cache.toLocal(trans.evictingAddr)
 	if isLocal {
 		wb.pendingLocalEvictions = append(wb.pendingLocalEvictions, trans)
+	} else if trans.fromLocal {
+		wb.pendingRemoteEvictionsOwn = append(wb.pendingRemoteEvictionsOwn, trans)
+		wb.numPendingRemoteEvictionsOwn++
 	} else {
-		wb.pendingRemoteEvictions = append(wb.pendingRemoteEvictions, trans)
-		wb.numPendingRemoteEvictions++
+		wb.pendingRemoteEvictionsPeer = append(wb.pendingRemoteEvictionsPeer, trans)
+		wb.numPendingRemoteEvictionsPeer++
 	}
 	// [ITER17 F1] Track peer-bypass admits so the cap above can fire.
 	if !trans.fromLocal {
@@ -700,30 +873,58 @@ func (wb *writeBufferStage) processWriteBufferFlush(
 // [ITER10] tryWriteOne attempts to send the head of a single category
 // queue (local or remote). Returns true if the head was sent and popped.
 // Caller is responsible for choosing which queue to drain.
+//
+// [ORIGIN-SPLIT] The local-destination side is a single queue. The
+// remote-destination side is split into Peer/Own origin queues drained
+// Peer-FIRST in write() so a pile of own remote evictions cannot
+// head-of-line-block the peer-serve flush whose drain emits the freeing ACK.
 func (wb *writeBufferStage) tryWriteOne(isLocal bool) bool {
-	var queue *[]*transaction
 	if isLocal {
-		queue = &wb.pendingLocalEvictions
-	} else {
-		queue = &wb.pendingRemoteEvictions
+		return wb.tryWriteOneFrom(&wb.pendingLocalEvictions, true)
 	}
+	// Remote-destination: drain Peer origin first, then Own.
+	if wb.tryWriteOneFrom(&wb.pendingRemoteEvictionsPeer, false) {
+		return true
+	}
+	return wb.tryWriteOneFrom(&wb.pendingRemoteEvictionsOwn, false)
+}
+
+// tryWriteOneFrom drains the head of one specific pending-eviction queue.
+// isLocalDest selects the egress port (DRAM vs RDMA) AND the destination
+// inflict/outgoing accounting. The ORIGIN accounting (own vs peer remote
+// inflict counters, peer-bypass admit release) keys on trans.fromLocal.
+func (wb *writeBufferStage) tryWriteOneFrom(
+	queue *[]*transaction,
+	isLocal bool,
+) bool {
 	if len(*queue) == 0 {
 		return false
 	}
 
 	trans := (*queue)[0]
 
-	if wb.tooManyInflightEvictions(isLocal) {
+	// [ORIGIN-SPLIT] tooManyInflightEvictions gates a remote-bound eviction
+	// against the sub-budget matching its ORIGIN (trans.fromLocal); local
+	// keeps the single ceiling.
+	if wb.tooManyInflightEvictions(isLocal, trans.fromLocal) {
 		return false
 	}
 
-	if !wb.cache.bottomPort.CanSend() {
+	// [L2 LOCAL/REMOTE SPLIT] remote (RDMA-bound) evictions egress on
+	// remoteBottomPort, local (DRAM-bound) on bottomPort — each its own
+	// CanSend budget so a saturated local-DRAM egress never starves the
+	// remote-RDMA egress (the serve/ACK critical path) and vice versa.
+	egress := wb.cache.bottomPort
+	if !isLocal {
+		egress = wb.cache.remoteBottomPort
+	}
+	if !egress.CanSend() {
 		return false
 	}
 
 	lowModulePort := wb.cache.addressToPortMapper.Find(trans.evictingAddr)
 	write := mem.WriteReqBuilder{}.
-		WithSrc(wb.cache.bottomPort.AsRemote()).
+		WithSrc(egress.AsRemote()).
 		WithDst(lowModulePort).
 		WithPID(trans.evictingPID).
 		WithAddress(trans.evictingAddr).
@@ -735,7 +936,7 @@ func (wb *writeBufferStage) tryWriteOne(isLocal bool) bool {
 		write.VAddr = trans.accessReq().GetVAddr()
 	}
 
-	wb.cache.bottomPort.Send(write)
+	egress.Send(write)
 
 	trans.evictionWriteReq = write
 	trans.evictionToLocal = isLocal
@@ -753,13 +954,18 @@ func (wb *writeBufferStage) tryWriteOne(isLocal bool) bool {
 		wb.numLocalInflightEviction++
 	} else {
 		wb.numRemoteInflightEviction++
-		// [OUTGOING-REMOTE CAP FIX] Trans transitioned out of
-		// pendingEvictions into inflight — pending portion of the
-		// outgoing-remote count drops, but the total
-		// (pending+inflight) is unchanged, so the admit guard sees
-		// no headroom change until processWriteDoneRsp.
-		if wb.numPendingRemoteEvictions > 0 {
-			wb.numPendingRemoteEvictions--
+		// [ORIGIN-SPLIT] bump the per-origin remote-inflict sub-counter and
+		// decrement the matching per-origin pending counter.
+		if trans.fromLocal {
+			wb.numRemoteInflEvictOwn++
+			if wb.numPendingRemoteEvictionsOwn > 0 {
+				wb.numPendingRemoteEvictionsOwn--
+			}
+		} else {
+			wb.numRemoteInflEvictPeer++
+			if wb.numPendingRemoteEvictionsPeer > 0 {
+				wb.numPendingRemoteEvictionsPeer--
+			}
 		}
 	}
 
@@ -845,7 +1051,7 @@ func (wb *writeBufferStage) processDataReadyRsp(
 		wb.cache.directory.WayAssociativity(),
 		len(wb.cache.dirToBankBuffers),
 	)
-	bankBuf := wb.cache.writeBufferToBankBuffersRsp[bankIndex] // [R5] bankWriteFetched
+	bankBuf := wb.cache.writeBufferToBankBufferRsp(bankIndex, trans.fromLocal) // [R5 + BANK SPLIT] bankWriteFetched
 
 	if !bankBuf.CanPush() {
 		return false
@@ -969,7 +1175,7 @@ func (wb *writeBufferStage) processPrefetch(
 			wb.cache.directory.WayAssociativity(),
 			len(wb.cache.dirToBankBuffers),
 		)
-		bankBuf := wb.cache.writeBufferToBankBuffersRsp[bankIndex] // [R5] bankWriteFetched derived
+		bankBuf := wb.cache.writeBufferToBankBufferRsp(bankIndex, trans.fromLocal) // [R5 + BANK SPLIT] bankWriteFetched derived
 
 		if !bankBuf.CanPush() {
 			return false
@@ -1062,6 +1268,13 @@ func (wb *writeBufferStage) processWriteDoneRsp(
 				wb.numLocalInflightEviction--
 			} else {
 				wb.numRemoteInflightEviction--
+				// [ORIGIN-SPLIT] decrement the per-origin remote-inflict
+				// sub-counter matching this eviction's ORIGIN (e.fromLocal).
+				if e.fromLocal {
+					wb.numRemoteInflEvictOwn--
+				} else {
+					wb.numRemoteInflEvictPeer--
+				}
 			}
 			wb.inflightEviction = append(
 				wb.inflightEviction[:i],
@@ -1082,7 +1295,21 @@ func (wb *writeBufferStage) processWriteDoneRsp(
 		}
 	}
 
+	// [ITER20 DIAG] No inflightEviction matched this ack's RespondTo:
+	// the eviction stays counted forever (numRemoteInflightEviction leak).
+	wb.writeDoneNoMatchCount++
+	if wb.writeDoneNoMatchSample == "" {
+		wb.writeDoneNoMatchSample = writeDone.RespondTo
+	}
 	return true
+}
+
+// pendingRemoteEvictionsLen reports the combined depth of the two ORIGIN
+// remote-pending half-queues (own + peer). Used by writeBufferFull's PEER
+// bucket and diagnostics so the destination-side accounting is unchanged by
+// the origin split.
+func (wb *writeBufferStage) pendingRemoteEvictionsLen() int {
+	return len(wb.pendingRemoteEvictionsOwn) + len(wb.pendingRemoteEvictionsPeer)
 }
 
 // [ITER17 F2] writeBufferFull now checks the appropriate side bucket
@@ -1096,9 +1323,8 @@ func (wb *writeBufferStage) writeBufferFull(fromLocal bool) bool {
 		used := len(wb.pendingLocalEvictions) + wb.numLocalInflightEviction
 		return used >= wb.writeBufferCapacity
 	}
-	// PEER bucket = pendingRemoteEvictions + numRemoteInflightEviction +
-	// peer-bypass items still queued (numPeerIncomingPending)
-	used := len(wb.pendingRemoteEvictions) + wb.numRemoteInflightEviction
+	// PEER bucket = pendingRemoteEvictions(own+peer) + numRemoteInflightEviction
+	used := wb.pendingRemoteEvictionsLen() + wb.numRemoteInflightEviction
 	cap := wb.writeBufferPeerCapacity
 	if cap <= 0 {
 		cap = wb.writeBufferCapacity // fall back to legacy if peer cap unset
@@ -1110,20 +1336,25 @@ func (wb *writeBufferStage) writeBufferFull(fromLocal bool) bool {
 // (e.g. flusher) that does not know the side. Reports the total entry
 // count vs the LOCAL cap (mirrors pre-iter17 semantics for those callers).
 func (wb *writeBufferStage) writeBufferFullLegacy() bool {
-	numEntry := len(wb.pendingLocalEvictions) + len(wb.pendingRemoteEvictions) + len(wb.inflightEviction)
+	numEntry := len(wb.pendingLocalEvictions) + wb.pendingRemoteEvictionsLen() + len(wb.inflightEviction)
 	return numEntry >= wb.writeBufferCapacity
 }
 
 // tooManyOutgoingRemote returns true when this L2 already holds the
-// configured number of remote-bound evictions across the pending+inflight
-// stages. New remote-bound evictions are refused at admit until the
+// configured number of OWN remote-bound evictions across the pending+inflight
+// stages. New OWN remote-bound evictions are refused at admit until the
 // inflight portion drains via processWriteDoneRsp. Always false when
 // the eviction targets local DRAM (isLocal=true) or the cap is disabled.
+//
+// [ORIGIN-SPLIT] This cap is applied ONLY to OWN-origin pending+inflight
+// (numPendingRemoteEvictionsOwn + numRemoteInflEvictOwn). The peer-bypass
+// admit lane never consulted this gate, so peer-serve work must not be
+// counted here — otherwise peer-serve fills a counter that only gates own.
 func (wb *writeBufferStage) tooManyOutgoingRemote(isLocal bool) bool {
 	if isLocal || wb.maxOutgoingRemotePending <= 0 {
 		return false
 	}
-	return wb.numPendingRemoteEvictions+wb.numRemoteInflightEviction >=
+	return wb.numPendingRemoteEvictionsOwn+wb.numRemoteInflEvictOwn >=
 		wb.maxOutgoingRemotePending
 }
 
@@ -1131,29 +1362,29 @@ func (wb *writeBufferStage) tooManyInflightFetches() bool {
 	return len(wb.inflightFetch) >= wb.maxInflightFetch
 }
 
-func (wb *writeBufferStage) tooManyInflightEvictions(isLocal bool) bool {
-	// [ITER16 SPLIT INFLIGHT CAP]
-	// Discovered at iter15 stencil2d sim 21.38 ms deadlock via the akita
-	// monitoring tool: GPU[3].L2[14] had numLocalInflightEviction=0,
-	// numRemoteInflightEviction=128 (CAP), pendingLocalEvictions=11615
-	// (11× the writeBufferCapacity). The old SHARED total cap means
-	// REMOTE-bound inflight monopolizing the 128 slots blocked ALL new
-	// admits — including LOCAL-bound ones whose drain path is
-	// INDEPENDENT (LOCAL drains via DRAM ACK; REMOTE drains via peer
-	// L2 ACK). LOCAL pending grew unbounded behind a queue it could
-	// not progress through.
-	//
-	// Fix: each side caps INDEPENDENTLY at maxInflightEviction. Total
-	// system load is bounded by 2× maxInflightEviction (was 128, now
-	// 256) — modest growth, NOT a relaxation in the user's sense
-	// because the structural cycle (remote ⟂ local block at the
-	// inflight queue) is what's being broken. Mirrors the iter15 REC
-	// .bottomSender.tooManyInflightRequest split (REC layer) and the
-	// iter10/iter13 pendingLocal/pendingRemote split (pending stage).
+// tooManyInflightEvictions gates an eviction admit-to-inflight by DESTINATION
+// (isLocal) and, on the remote side, by ORIGIN (fromLocal).
+//
+// [ITER16 SPLIT INFLIGHT CAP] each DESTINATION side caps INDEPENDENTLY: LOCAL
+// drains via DRAM ACK, REMOTE via peer L2 ACK; a remote-inflict pile must not
+// block local admits whose drain path is independent.
+//
+// [ORIGIN-SPLIT] On the REMOTE-destination side the single 128-slot ceiling
+// was the confirmed deadlock seed: own cross-GPU evictions (fromLocal=true)
+// and peer-serve displacement flushes (fromLocal=false) shared it, so own work
+// could saturate it and the peer-serve flush could never drain → no
+// WriteDoneRsp/ack → mutual cross-GPU deadlock. The remote side now gates each
+// origin against its own sub-budget (maxRemoteInflEvictOwn /
+// maxRemoteInflEvictPeer), which sum to the existing remote ceiling — peer-
+// serve always retains its reserved slots and own can never starve it.
+func (wb *writeBufferStage) tooManyInflightEvictions(isLocal, fromLocal bool) bool {
 	if isLocal {
 		return wb.numLocalInflightEviction >= wb.maxInflightEviction
 	}
-	return wb.numRemoteInflightEviction >= wb.maxInflightEviction
+	if fromLocal {
+		return wb.numRemoteInflEvictOwn >= wb.maxRemoteInflEvictOwn
+	}
+	return wb.numRemoteInflEvictPeer >= wb.maxRemoteInflEvictPeer
 }
 
 // _unused_tooManyInflightEvictions_old is the pre-iter16 shared-cap
@@ -1176,17 +1407,27 @@ func (wb *writeBufferStage) Reset() {
 	wb.cache.writeBufferFetchBuffer.Clear()
 	wb.currentEvictionSrcBuf = nil
 	// [ITER10] reset both split pending queues.
+	// [ORIGIN-SPLIT] reset both remote-pending origin halves.
 	wb.pendingLocalEvictions = nil
-	wb.pendingRemoteEvictions = nil
+	wb.pendingRemoteEvictionsOwn = nil
+	wb.pendingRemoteEvictionsPeer = nil
 	wb.inflightFetch = nil
 	wb.inflightEviction = nil
+	// [RESPONSE-DECOUPLE] [ORIGIN-SPLIT] reset both deferred-flush origin halves.
+	wb.deferredFlushOwn = nil
+	wb.deferredFlushPeer = nil
 	wb.numLocalInflightEviction = 0
 	wb.numRemoteInflightEviction = 0
+	// [ORIGIN-SPLIT] reset the per-origin remote-inflict sub-counters.
+	wb.numRemoteInflEvictOwn = 0
+	wb.numRemoteInflEvictPeer = 0
 	// [R6] reset all 4 halves.
 	wb.pendingDataReadyLocal = nil
 	wb.pendingDataReadyRemote = nil
 	wb.pendingWriteDoneLocal = nil
 	wb.pendingWriteDoneRemote = nil
-	wb.numPendingRemoteEvictions = 0
+	// [ORIGIN-SPLIT] reset both pending-remote origin counters.
+	wb.numPendingRemoteEvictionsOwn = 0
+	wb.numPendingRemoteEvictionsPeer = 0
 	wb.numPeerIncomingPending = 0 // [ITER17 F1]
 }

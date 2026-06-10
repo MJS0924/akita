@@ -679,13 +679,37 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 	)
 
 	// [수정] BottomSenderBuffer를 Local과 Remote로 분리
-	cache.localBottomSenderBuffer = sim.NewBuffer(
-		cache.Name()+".LocalBottomSenderBuffer",
-		cache.numReqPerCycle,
+	// [BSB-CLASS-SPLIT] Further split each side into Data + Inv class lanes
+	// to break the request-class head-of-line deadlock (see superdirectory.go
+	// comment). The two lanes PARTITION the original numReqPerCycle-deep
+	// capacity — bsbInvCap = numReqPerCycle/4 (floored at 1), bsbDataCap =
+	// numReqPerCycle - bsbInvCap (floored at 1) — so the per-side admission
+	// budget is NOT increased (16 -> 12 data + 4 inv). Inv-class trans are
+	// independently bounded by maxInflightInvalidation, so the 4-deep inv
+	// lane is ample.
+	bsbInvCap := cache.numReqPerCycle / 4
+	if bsbInvCap < 1 {
+		bsbInvCap = 1
+	}
+	bsbDataCap := cache.numReqPerCycle - bsbInvCap
+	if bsbDataCap < 1 {
+		bsbDataCap = 1
+	}
+	cache.localBottomSenderBufferData = sim.NewBuffer(
+		cache.Name()+".LocalBottomSenderBufferData",
+		bsbDataCap,
 	)
-	cache.remoteBottomSenderBuffer = sim.NewBuffer(
-		cache.Name()+".RemoteBottomSenderBuffer",
-		cache.numReqPerCycle,
+	cache.localBottomSenderBufferInv = sim.NewBuffer(
+		cache.Name()+".LocalBottomSenderBufferInv",
+		bsbInvCap,
+	)
+	cache.remoteBottomSenderBufferData = sim.NewBuffer(
+		cache.Name()+".RemoteBottomSenderBufferData",
+		bsbDataCap,
+	)
+	cache.remoteBottomSenderBufferInv = sim.NewBuffer(
+		cache.Name()+".RemoteBottomSenderBufferInv",
+		bsbInvCap,
 	)
 
 	cache.invReqBuffer = sim.NewBuffer(
