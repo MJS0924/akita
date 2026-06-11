@@ -120,9 +120,9 @@ func (f *flusher) processFlush() bool {
 	}
 
 	trans := &transaction{
-		flush:   f.processingFlush,
-		victim:  block,
-		action:  bankEvict,
+		flush:  f.processingFlush,
+		victim: block,
+		action: bankEvict,
 		// [FLUSH-CYCLE FIX] This is the cache's OWN flush of a local-DRAM-home
 		// dirty block; it is hard-pushed to dirToBankBuffersLocal (the LOCAL
 		// bank lane) above. fromLocal must match the lane: without it the zero

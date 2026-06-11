@@ -44,7 +44,7 @@ type Comp struct {
 	name     string
 	deviceID int
 
-	topPort          sim.Port
+	topPort sim.Port
 	// D4: dedicated L1-facing InvRsp ingress. L1 sends InvRsp back to
 	// the directory using `WithDst(req.Src)` where req.Src was set to
 	// this port's AsRemote() (see bottomSender sendInvalidationRequest /
@@ -67,7 +67,7 @@ type Comp struct {
 	// drained → cross-GPU cyclic backpressure (A2 fir deadlock at
 	// win=495 when useRsbHintAlloc=true triggers coarse-alloc InvReq
 	// broadcast bursts).
-	RDMAInvRspPort   sim.Port
+	RDMAInvRspPort sim.Port
 	// S1: dedicated egress port for outbound InvRsp (peer-bound). The
 	// old design drained outbound InvRsp via RDMAInvPort (shared with
 	// outbound InvReq); under a broadcast InvReq burst, the InvRsp
@@ -75,11 +75,11 @@ type Comp struct {
 	// Splitting the queue + draining via this port lets InvRsp egress
 	// proceed independently of InvReq backpressure.
 	RDMAInvRspOutPort sim.Port
-	ToRDMA           sim.RemotePort
-	ToRDMAInv        sim.RemotePort
+	ToRDMA            sim.RemotePort
+	ToRDMAInv         sim.RemotePort
 	// D1: remote-side endpoint name for the new InvRsp channel; set by
 	// the r9nano builder when plugging RDMAToCohDirForInvRsp.
-	ToRDMAInvRsp     sim.RemotePort
+	ToRDMAInvRsp sim.RemotePort
 
 	// [수정 코드] 자원을 Local과 Remote로 완전 분리
 	localDirStageBuffer  sim.Buffer
@@ -161,27 +161,29 @@ type Comp struct {
 	evictEntryUtilSum float64
 	evictEntryCount   uint64
 
-	allocationCount    uint64
-	remoteAcceptCount  uint64 // diagnostic: how many times acceptNewTransaction(false) fires
-	doWriteMissCount   uint64 // diagnostic: how many times doWriteMiss is reached
-	doWriteMissRemote  uint64 // diagnostic: doWriteMiss with fromLocal=false
+	allocationCount   uint64
+	remoteAcceptCount uint64 // diagnostic: how many times acceptNewTransaction(false) fires
+	doWriteMissCount  uint64 // diagnostic: how many times doWriteMiss is reached
+	doWriteMissRemote uint64 // diagnostic: doWriteMiss with fromLocal=false
 
 	// Stall cause counters (Method E — mirrors REC/optdirectory for
 	// one-to-one comparison). Each increments when the named back-pressure
 	// forces the transaction to retry next cycle.
-	stallMSHRFull       uint64 // writeToBank: mshr.IsFull()
-	stallSubEntryLocked uint64 // doWriteHit: sub-entry IsLocked or ReadCount > 0
-	stallBankFull       uint64 // writeToBank: bankBuf.CanPush() == false
-	stallEvictingList   uint64 // processTransaction: addr in evictingList
-	stallVictimLocked   uint64 // doWriteMiss: victim entry locked
-	stallBottomBufFull  uint64 // fast-path push to bottomSenderBuffer rejected
-	stallMshrBufFull    uint64 // bankstage push to mshrStageBuffer rejected
-	stallInflightFetch  uint64 // bottomSender: tooManyInflightRequest
-	stallInflightInv    uint64 // bottomSender: tooManyInflightInvalidation
-	stallBottomPortBusy uint64 // bottomSender: bottomPort/RDMAPort can't send
-	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
+	stallMSHRFull             uint64 // writeToBank: mshr.IsFull()
+	stallSubEntryLocked       uint64 // doWriteHit: sub-entry IsLocked or ReadCount > 0
+	stallBankFull             uint64 // writeToBank: bankBuf.CanPush() == false
+	stallEvictingList         uint64 // processTransaction: addr in evictingList
+	stallVictimLocked         uint64 // doWriteMiss: victim entry locked
+	stallBottomBufFull        uint64 // fast-path push to bottomSenderBuffer rejected
+	stallMshrBufFull          uint64 // bankstage push to mshrStageBuffer rejected
+	stallInflightFetch        uint64 // bottomSender: tooManyInflightRequest
+	stallInflightInv          uint64 // bottomSender: tooManyInflightInvalidation
+	stallBottomPortBusy       uint64 // bottomSender: bottomPort/RDMAPort can't send
+	stallTopPortBusy          uint64 // doInvalidation / response: topPort/RDMAInv can't send
+	stallInvEmitPeer          uint64 // [INV-FIDELITY C4] peer-lane InvReq head deferred by emit budget
+	invEmittedPeer            uint64 // [INV-FIDELITY C4] InvReqs emitted on the dir→peer-dir lane
 	stallWriteToBankPreflight uint64 // writeToBank: MSHR cross-granularity conflict caught before mutation
-	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
+	totalDoWriteCalls         uint64 // every entry into doWrite (success+retry)
 
 	// E-RACE-DEFER: deferred redirect queue. Fix B-2's coarser-bank
 	// reprobe MUST route to the existing coarser entry for SO invariant.
@@ -199,7 +201,7 @@ type Comp struct {
 	// the head-of-line block — other trans in remoteBuf can now make
 	// progress, draining the saturated pipeline so the deferred trans
 	// eventually get their target slot.
-	deferredRedirects []deferredRedirectEntry
+	deferredRedirects     []deferredRedirectEntry
 	deferredRedirectCount uint64 // diagnostic: how many trans were ever deferred
 
 	// H3e fix counter: number of demote triggers that hit a DemoteLocked
@@ -368,27 +370,29 @@ func (c *Comp) EventCounts() map[string]uint64 {
 // in the post-fix codebase.
 func (c *Comp) ActionCounts() map[string]uint64 {
 	return map[string]uint64{
-		"allocation_count":     c.allocationCount,
-		"remote_accept_count":  c.remoteAcceptCount,
-		"do_write_miss":        c.doWriteMissCount,
-		"do_write_miss_remote": c.doWriteMissRemote,
-		"stall_mshr_full":          c.stallMSHRFull,
-		"stall_subentry_locked":    c.stallSubEntryLocked,
-		"stall_bank_full":          c.stallBankFull,
-		"stall_evicting_list":      c.stallEvictingList,
-		"stall_victim_locked":      c.stallVictimLocked,
-		"stall_bottom_buf_full":    c.stallBottomBufFull,
-		"stall_mshr_buf_full":      c.stallMshrBufFull,
-		"stall_inflight_fetch":     c.stallInflightFetch,
-		"stall_inflight_inv":       c.stallInflightInv,
-		"stall_bottom_port_busy":   c.stallBottomPortBusy,
-		"stall_top_port_busy":      c.stallTopPortBusy,
-		"stall_write_to_bank_preflight": c.stallWriteToBankPreflight,
-		"total_dowrite_calls":      c.totalDoWriteCalls,
-		"demote_lock_hits":         c.demoteLockHits,
-		"op5a_shortcut_with_remote_sharer":     c.op5aShortcutWithRemoteSharer,
-		"op5b_writer_cleared_at_finest_bank":   c.op5bWriterClearedAtFinestBank,
-		"promote_at_evict_count":               c.promoteAtEvictCount,
+		"allocation_count":                   c.allocationCount,
+		"remote_accept_count":                c.remoteAcceptCount,
+		"do_write_miss":                      c.doWriteMissCount,
+		"do_write_miss_remote":               c.doWriteMissRemote,
+		"stall_mshr_full":                    c.stallMSHRFull,
+		"stall_subentry_locked":              c.stallSubEntryLocked,
+		"stall_bank_full":                    c.stallBankFull,
+		"stall_evicting_list":                c.stallEvictingList,
+		"stall_victim_locked":                c.stallVictimLocked,
+		"stall_bottom_buf_full":              c.stallBottomBufFull,
+		"stall_mshr_buf_full":                c.stallMshrBufFull,
+		"stall_inflight_fetch":               c.stallInflightFetch,
+		"stall_inflight_inv":                 c.stallInflightInv,
+		"stall_bottom_port_busy":             c.stallBottomPortBusy,
+		"stall_top_port_busy":                c.stallTopPortBusy,
+		"stall_inv_emit_peer":                c.stallInvEmitPeer,
+		"inv_emitted_peer":                   c.invEmittedPeer,
+		"stall_write_to_bank_preflight":      c.stallWriteToBankPreflight,
+		"total_dowrite_calls":                c.totalDoWriteCalls,
+		"demote_lock_hits":                   c.demoteLockHits,
+		"op5a_shortcut_with_remote_sharer":   c.op5aShortcutWithRemoteSharer,
+		"op5b_writer_cleared_at_finest_bank": c.op5bWriterClearedAtFinestBank,
+		"promote_at_evict_count":             c.promoteAtEvictCount,
 	}
 }
 
@@ -427,10 +431,14 @@ func (c *Comp) AvgEvictUtilization() float64 {
 //
 // [COVERAGE FORMULA VERIFICATION]
 // totalCacheLines = Σ (per valid entry: validSubEntries × cachelinesPerSub)
-//                 = Σ (per valid entry: validSubEntries × regionSize / cacheLineSize)
+//
+//	= Σ (per valid entry: validSubEntries × regionSize / cacheLineSize)
+//
 // where regionSize = 1<<regionLen[bankID], cacheLineSize = 1<<log2BlockSize.
 // This MATCHES the user-specified formula
-//   coverage = Σ (subentries × regionSize/cacheLineSize)
+//
+//	coverage = Σ (subentries × regionSize/cacheLineSize)
+//
 // when "subentries" means VALID sub-entries (the only sub-entries that
 // actually track address space) and the sum is over all valid entries
 // across all banks. See also MaxCoverageCacheLines below for the

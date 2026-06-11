@@ -33,8 +33,8 @@ type bottomSender struct {
 	// (responses arriving from peer GPU via the RDMA → REC.bottomPort
 	// path). Non-zero suggests responses are dropping somewhere
 	// upstream of REC's bookkeeping.
-	lostWriteDoneRspCount uint64
-	lostDataReadyRspCount uint64
+	lostWriteDoneRspCount    uint64
+	lostDataReadyRspCount    uint64
 	lostWriteDoneRspSampleID string
 	lostDataReadyRspSampleID string
 	// [ITER20 DIAG C] eviction-acks (WriteDoneRsp routed to sendToRemoteTopQue)
@@ -55,7 +55,10 @@ type bottomSender struct {
 	maxInvEmitPerCycle          int
 	invEmittedToRDMAThisCycle   int
 	invEmittedToBottomThisCycle int
-	lastEmitCycleTime           sim.VTimeInSec
+	// [INV-FIDELITY C4] Third budget lane: dir→peer-dir InvReq fan-out via
+	// RDMAInvPort (sendToRDMAInvQue), previously drained unbudgeted.
+	invEmittedToPeerThisCycle int
+	lastEmitCycleTime         sim.VTimeInSec
 
 	localInflightRequest       []*transaction
 	localInflightBypassRequest []*transaction
@@ -80,8 +83,8 @@ type bottomSender struct {
 	// the L2's peerReadServedCount is high but peerRspRecvCount stays low,
 	// the L2's DataReadyRsp never reaches the dir. If recv is high but
 	// cleared is low, the responses arrive but don't match the 256 stuck.
-	peerRspRecvCount       uint64
-	peerRspClearedRemote   uint64
+	peerRspRecvCount     uint64
+	peerRspClearedRemote uint64
 
 	// [ORIGIN-SPLIT] inflightInvToOutside partitioned by ORIGIN
 	// (trans.fromLocal). Previously a single slice + single
@@ -131,19 +134,19 @@ type bottomSender struct {
 	//
 	// New typed queues drain INDEPENDENTLY each Tick; a stalled port no
 	// longer prevents progress on the other ports.
-	sendToTopRspQue       []sim.Msg // local L1 RSPs → topPort
-	sendToRDMADataRspQue  []sim.Msg // peer data RSPs → RDMAPort
+	sendToTopRspQue      []sim.Msg // local L1 RSPs → topPort
+	sendToRDMADataRspQue []sim.Msg // peer data RSPs → RDMAPort
 	// [R3] Split iter17's sendToRDMAInvQue into request vs response
 	// lanes. Mixing them at the egress queue forced InvReq backpressure
 	// (peer's RDMAInvPort.incomingBuf full) to HoL-block our outbound
 	// InvRsp — which is exactly the traffic the peer needs to drain its
 	// own inflightInvToBottom and free that very buffer. Split + drained
 	// independently breaks that mutual-block cycle.
-	sendToRDMAInvQue      []sim.Msg // outbound InvReq → RDMAInvPort
-	sendToRDMAInvRspQue   []sim.Msg // outbound InvRsp → RDMAInvPort
-	sendToRemoteTopQue    []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
-	sendToDirQue          []*transaction
-	bypassRspQue          []sim.Msg
+	sendToRDMAInvQue    []sim.Msg // outbound InvReq → RDMAInvPort
+	sendToRDMAInvRspQue []sim.Msg // outbound InvRsp → RDMAInvPort
+	sendToRemoteTopQue  []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
+	sendToDirQue        []*transaction
+	bypassRspQue        []sim.Msg
 
 	returnFalse0 string
 	returnFalse1 string
@@ -155,6 +158,7 @@ func (bs *bottomSender) refreshEmitBudget() {
 	if now > bs.lastEmitCycleTime {
 		bs.invEmittedToRDMAThisCycle = 0
 		bs.invEmittedToBottomThisCycle = 0
+		bs.invEmittedToPeerThisCycle = 0
 		bs.lastEmitCycleTime = now
 	}
 }
@@ -162,6 +166,44 @@ func (bs *bottomSender) refreshEmitBudget() {
 func (bs *bottomSender) canEmitInvToRDMA() bool {
 	return bs.maxInvEmitPerCycle <= 0 ||
 		bs.invEmittedToRDMAThisCycle < bs.maxInvEmitPerCycle
+}
+
+func (bs *bottomSender) canEmitInvToPeer() bool {
+	return bs.maxInvEmitPerCycle <= 0 ||
+		bs.invEmittedToPeerThisCycle < bs.maxInvEmitPerCycle
+}
+
+// drainRDMAInvQueuePeerBudget drains one message from sendToRDMAInvQue with
+// the per-cycle inv-emit budget applied to InvReq heads only. Responses
+// routed into this queue (Dst contains "RDMAInv") flow unbudgeted — the
+// iter19 invariant that rsp lanes are never throttled. A budget-deferred
+// head retries next cycle; bounded pacing adds no wait-for edge.
+// [INV-FIDELITY C4]
+func (bs *bottomSender) drainRDMAInvQueuePeerBudget() bool {
+	if len(bs.sendToRDMAInvQue) == 0 {
+		return false
+	}
+	head := bs.sendToRDMAInvQue[0]
+	_, headIsInv := head.(*mem.InvReq)
+	if headIsInv && !bs.canEmitInvToPeer() {
+		bs.cache.stallInvEmitPeer++
+		return false
+	}
+	if !bs.cache.RDMAInvPort.CanSend() {
+		bs.cache.stallTopPortBusy++
+		return false
+	}
+	head.Meta().Src = bs.cache.RDMAInvPort.AsRemote()
+	if err := bs.cache.RDMAInvPort.Send(head); err != nil {
+		return false
+	}
+	bs.sendToRDMAInvQue[0] = nil
+	bs.sendToRDMAInvQue = bs.sendToRDMAInvQue[1:]
+	if headIsInv {
+		bs.invEmittedToPeerThisCycle++
+		bs.cache.invEmittedPeer++
+	}
+	return true
 }
 
 func (bs *bottomSender) canEmitInvToBottom() bool {
@@ -1306,7 +1348,8 @@ func (bs *bottomSender) sendToTop() bool {
 	if bs.drainOneTypedQueue(&bs.sendToRDMADataRspQue, bs.cache.RDMADataRspPort) {
 		progress = true
 	}
-	if bs.drainOneTypedQueue(&bs.sendToRDMAInvQue, bs.cache.RDMAInvPort) {
+	// [INV-FIDELITY C4] peer-lane InvReq drain honors maxInvEmitPerCycle.
+	if bs.drainRDMAInvQueuePeerBudget() {
 		progress = true
 	}
 	// [ITER19 INV-RSP ROUTE FIX] Drain the InvRsp lane on the dedicated

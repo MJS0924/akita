@@ -39,22 +39,22 @@ type Comp struct {
 	// and remote-RDMA traffic (own-DRAM-evict could starve the remote-RDMA-evict
 	// / serve flush). With its own port + CanSend, remote drains independently.
 	remoteBottomPort sim.Port
-	controlPort   sim.Port
+	controlPort      sim.Port
 
-	cohDirStageBuffer        sim.Buffer
-	dirStageBuffer           sim.Buffer
-	remoteDirStageBuffer     sim.Buffer
+	cohDirStageBuffer    sim.Buffer
+	dirStageBuffer       sim.Buffer
+	remoteDirStageBuffer sim.Buffer
 	// Phase F — separate priority ingress queue for InvReq. topparser
 	// routes incoming InvReq messages here; dirStage drains this buffer
 	// before processing the regular FIFO so that read/write requests
 	// stalled on bankBuf or MSHR cannot block invalidations behind them.
-	invStageBuffer           sim.Buffer
-	dirToBankBuffers         []sim.Buffer
+	invStageBuffer   sim.Buffer
+	dirToBankBuffers []sim.Buffer
 	// [FIX #2: priority preserved past dirStage] dirStage 가 fromLocal 기준으로
 	// 분기 push. bankStage.pullFromBuf 가 Remote 를 먼저 drain → cross-GPU 데드락
 	// 회피. dirToBankBuffers 는 length(numBanks) 계산 용도로만 유지.
-	dirToBankBuffersLocal    []sim.Buffer
-	dirToBankBuffersRemote   []sim.Buffer
+	dirToBankBuffersLocal  []sim.Buffer
+	dirToBankBuffersRemote []sim.Buffer
 	// [R5] writeBufferToBankBuffers split into REQ / RSP queues per bank.
 	// Req lane = bankWriteHit / bankWritePrefetched (write admit path).
 	// Rsp lane = bankWriteFetched (fetch-response path).
@@ -89,11 +89,11 @@ type Comp struct {
 	// (fromLocal=true) traffic; the *Remote variant absorbs the peer
 	// (fromLocal=false) traffic. Each is cap=numReqPerCycle. Pop sites
 	// drain Remote first (mirroring dirToBankBuffersRemote precedent).
-	mshrStageBuffer          sim.Buffer
-	mshrStageBufferRemote    sim.Buffer
-	writeBufferBuffer        sim.Buffer // eviction 전용 (writeBufferFlush, writeBufferEvictAndFetch, writeBufferEvictAndWrite) — LOCAL only
-	writeBufferBufferRemote  sim.Buffer // peer-incoming eviction 전용
-	writeBufferFetchBuffer   sim.Buffer // 순수 fetch 전용 (dirStage.fetch() → writeBufferFetch)
+	mshrStageBuffer         sim.Buffer
+	mshrStageBufferRemote   sim.Buffer
+	writeBufferBuffer       sim.Buffer // eviction 전용 (writeBufferFlush, writeBufferEvictAndFetch, writeBufferEvictAndWrite) — LOCAL only
+	writeBufferBufferRemote sim.Buffer // peer-incoming eviction 전용
+	writeBufferFetchBuffer  sim.Buffer // 순수 fetch 전용 (dirStage.fetch() → writeBufferFetch)
 
 	topParser   *topParser
 	writeBuffer *writeBufferStage
@@ -114,7 +114,7 @@ type Comp struct {
 	// only the gap (peer starves). maxLocalMshr + maxRemoteMshr partition
 	// numMSHREntry (sum = numMSHREntry, NO net increase): own gets a 3/4
 	// quota, peer-serve a guaranteed 1/4 reserve, so neither can monopolize.
-	maxRemoteMshr       int
+	maxRemoteMshr int
 	// MSHR 분포 추적 카운터 (deadlock 분석용).
 	mshrLocalAdded    uint64 // fromLocal=true 로 추가된 MSHR entry 총 횟수
 	mshrRemoteAdded   uint64 // fromLocal=false 로 추가된 MSHR entry 총 횟수
@@ -130,11 +130,11 @@ type Comp struct {
 	// numPeerInflightRequest stays pinned, responses are produced but not
 	// clearing the dir (routing/match). If served is ~0, the L2 never reaches
 	// the serve point (stuck upstream).
-	peerReadServedCount     uint64
-	peerReadServeFailCount  uint64
-	stallMSHRTotalFull uint64 // IsFull로 reject된 횟수 (모두에게 적용)
-	stallMSHRLocalCap  uint64 // local cap으로 reject된 횟수
-	stallMSHRRemoteCap uint64 // [ORIGIN-SPLIT] remote(peer-serve) cap으로 reject된 횟수
+	peerReadServedCount    uint64
+	peerReadServeFailCount uint64
+	stallMSHRTotalFull     uint64 // IsFull로 reject된 횟수 (모두에게 적용)
+	stallMSHRLocalCap      uint64 // local cap으로 reject된 횟수
+	stallMSHRRemoteCap     uint64 // [ORIGIN-SPLIT] remote(peer-serve) cap으로 reject된 횟수
 	// Deferred-invalidation counters. Armed: doInvalidation acked an
 	// InvReq on a still-locked block and set PendingInvalidation.
 	// Applied: bankStage.applyPendingInvalidation consumed the flag and
@@ -144,10 +144,10 @@ type Comp struct {
 	// healthy run, non-zero indicates the deadlock pattern returned).
 	deferredInvArmed   uint64
 	deferredInvApplied uint64
-	log2BlockSize       uint64
-	log2PageSize        uint64
-	log2UnitSize        uint64
-	numReqPerCycle      int
+	log2BlockSize      uint64
+	log2PageSize       uint64
+	log2UnitSize       uint64
+	numReqPerCycle     int
 
 	state                     cacheState
 	inFlightTransactions      []*transaction
@@ -243,7 +243,19 @@ func (m *middleware) runPipeline() bool {
 		madeProgress = bs.Tick() || madeProgress
 	}
 
-	madeProgress = m.runStage(m.dirStage) || madeProgress
+	// [INV-FIDELITY C1] dirStage is ticked exactly ONCE per cycle, like the
+	// bank stages. It is internally budgeted per Tick (pipelines advance one
+	// stage, acceptNewTransaction admits up to numReqPerCycle, and
+	// processTransaction commits up to numReqPerCycle slots), so the previous
+	// runStage(m.dirStage) — numReqPerCycle subticks per cycle — silently
+	// quartered the dirLatency pipeline traversal time (16 stages in ~4
+	// cycles) and inflated the commit bandwidth to numReqPerCycle² slots per
+	// cycle, which made invCostInSlots structurally non-binding and diluted
+	// the per-invalidation tag-access latency 4×. With a single Tick the
+	// r9nano calibration holds as documented: L2 hit = dirLatency(16) +
+	// bankLatency(184) = 200 cycles, and the commit budget is a true
+	// numReqPerCycle slots/cycle shared by reads, writes, and invalidations.
+	madeProgress = m.dirStage.Tick() || madeProgress
 	madeProgress = m.runStage(m.topParser) || madeProgress
 
 	return madeProgress
@@ -353,6 +365,53 @@ func (c *Comp) writeBufferBufferPush(item interface{}, fromLocal bool) {
 	} else {
 		c.writeBufferBufferRemote.Push(item)
 	}
+}
+
+// enqueueInvDirtyFlush builds a synthetic local-origin writeBufferFlush
+// transaction carrying the dirty line an invalidation is about to destroy,
+// and admits it to the LOCAL writeBuffer path (writeBufferBuffer, falling
+// back to the bounded deferred-flush list). Returns false only when both
+// targets are full (callers that gate on capacity never see this). The
+// flush follows the normal pendingLocalEvictions → bottomPort → local-DRAM
+// eviction path and terminates at processWriteDoneRsp — the same lifecycle
+// as a displacement flush, so the kill pays the real writeBuffer slot, NoC,
+// and DRAM-write cost a hardware victim writeback pays. Dirty lines are
+// locally-homed by construction (RDMA-mapped writes are write-through to
+// the home node and clear IsDirty), so this path never touches the
+// cross-GPU eviction caps. [INV-FIDELITY C3]
+func (c *Comp) enqueueInvDirtyFlush(block *internal.Block) bool {
+	data, err := c.storage.Read(block.CacheAddress, 1<<c.log2BlockSize)
+	if err != nil {
+		panic(err)
+	}
+
+	var dirtyMask []bool
+	if block.DirtyMask != nil {
+		dirtyMask = make([]bool, len(block.DirtyMask))
+		copy(dirtyMask, block.DirtyMask)
+	}
+
+	flushTrans := &transaction{
+		id:                sim.GetIDGenerator().Generate(),
+		action:            writeBufferFlush,
+		fromLocal:         true,
+		evictingPID:       block.PID,
+		evictingAddr:      block.Tag,
+		evictingData:      data,
+		evictingDirtyMask: dirtyMask,
+	}
+
+	if c.writeBufferBufferCanPush(true) {
+		c.writeBufferBufferPush(flushTrans, true)
+	} else if c.writeBuffer.deferFlushCanPush(true) {
+		c.writeBuffer.deferFlushPush(flushTrans)
+	} else {
+		// Unreachable when callers gate on capacity; never drop silently.
+		c.incEvent("InvDirtyWritebackDropped")
+		return false
+	}
+
+	return true
 }
 func (c *Comp) mshrStageBufferCanPush(fromLocal bool) bool {
 	if fromLocal {

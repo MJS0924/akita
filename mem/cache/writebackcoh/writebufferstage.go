@@ -23,10 +23,10 @@ type writeBufferStage struct {
 	// Now each side has its own ceiling; one side's saturation does not
 	// block admit / drain of the other. Defaults: local=1024 (= legacy),
 	// peer=256 (~conservative since peer is rate-limited by sender caps).
-	writeBufferCapacity      int // = writeBufferLocalCapacity (kept name for back-compat)
-	writeBufferPeerCapacity  int
-	maxInflightFetch         int
-	maxInflightEviction      int
+	writeBufferCapacity     int // = writeBufferLocalCapacity (kept name for back-compat)
+	writeBufferPeerCapacity int
+	maxInflightFetch        int
+	maxInflightEviction     int
 
 	// [ORIGIN-SPLIT] Per-ORIGIN sub-budgets of the REMOTE-destination
 	// inflight-eviction ceiling. own + peer sum to the existing remote
@@ -66,11 +66,11 @@ type writeBufferStage struct {
 	// cap (the closing edge of the cross-GPU serve deadlock). tryWriteOne
 	// drains the Peer queue FIRST. pendingLocalEvictions (local DESTINATION)
 	// stays single — the deadlock cycle is entirely on the remote-bound side.
-	pendingLocalEvictions       []*transaction
-	pendingRemoteEvictionsOwn   []*transaction
-	pendingRemoteEvictionsPeer  []*transaction
-	inflightFetch               []*transaction
-	inflightEviction            []*transaction
+	pendingLocalEvictions      []*transaction
+	pendingRemoteEvictionsOwn  []*transaction
+	pendingRemoteEvictionsPeer []*transaction
+	inflightFetch              []*transaction
+	inflightEviction           []*transaction
 
 	// [RESPONSE-DECOUPLE] Bounded reordering buffer for displacement-flush
 	// transactions whose response (WriteDoneRsp/DataReadyRsp) has already been
@@ -205,7 +205,6 @@ type writeBufferStage struct {
 	// sender L2 — the leak is on the return path (peer/RDMA/network).
 	writeDoneReceivedCount uint64
 }
-
 
 func (wb *writeBufferStage) Tick() bool {
 	madeProgress := false
@@ -1196,7 +1195,6 @@ func (wb *writeBufferStage) processPrefetch(
 
 		bankBuf.Push(&trans)
 
-
 		if trans.fetchReadReq != nil {
 			tracing.TraceReqFinalize(trans.fetchReadReq, wb.cache)
 		}
@@ -1280,7 +1278,7 @@ func (wb *writeBufferStage) processWriteDoneRsp(
 				wb.inflightEviction[:i],
 				wb.inflightEviction[i+1:]...,
 			)
-				tracing.TraceReqFinalize(e.evictionWriteReq, wb.cache)
+			tracing.TraceReqFinalize(e.evictionWriteReq, wb.cache)
 
 			// log.Printf("%.10f, %s, wb write to bottom，
 			//  %s, %04X, %04X, (%d, %d), %v\n",

@@ -26,23 +26,16 @@ type directoryStage struct {
 	// Pipeline 및 Buffer를 Local과 Remote로 완전 분리
 	localPipeline  pipelining.Pipeline
 	remotePipeline pipelining.Pipeline
-	// Optional snoop-latency pipelines for InvReq. When the builder's
-	// snoopLatency knob is 0 these are nil and invalidations share the
-	// regular local/remote pipelines (historical behavior). When > 0
-	// each is a (dirLatency + snoopLatency)-stage pipeline whose post
-	// buffer is the same localBuf/remoteBuf — so the downstream commit
-	// loop is oblivious to whether an item arrived via the regular or
-	// the snoop path. The pipelining package keeps madeProgress=true
-	// while items are in flight, which guarantees the cache stays
-	// awake until any deferred inv reaches the commit point (no extra
-	// queue or shared resource is introduced, hence no new HoL path).
-	localSnoopPipeline  pipelining.Pipeline
-	remoteSnoopPipeline pipelining.Pipeline
 	// Phase F: dedicated InvReq pipeline + post-buffer. ingress is
 	// cache.invStageBuffer (separate from dirStageBuffer/remoteDirStageBuffer
 	// to avoid HoL blocking by stalled read/write at the queue head).
 	// processTransaction drains invBuf BEFORE the regular local/remote
-	// bufs every Tick.
+	// bufs every Tick. ALL InvReqs flow through this pipeline (topParser
+	// routes every inv into invStageBuffer), so the -inv-extra-latency
+	// knob (builder snoopLatency) acts solely by deepening this pipeline
+	// to dirLatency+snoopLatency stages — modeling the extra state-bit
+	// write and snoop-response generation a real L2 pays per probe on
+	// top of the shared tag lookup.
 	invPipeline pipelining.Pipeline
 	localBuf    sim.Buffer
 	remoteBuf   sim.Buffer
@@ -83,17 +76,6 @@ func (ds *directoryStage) Tick() (madeProgress bool) {
 
 	madeProgress = ds.localPipeline.Tick() || madeProgress
 	madeProgress = ds.remotePipeline.Tick() || madeProgress
-
-	// Tick the optional snoop pipelines every cycle. Empty stages are
-	// no-ops that return false, so this only contributes madeProgress
-	// while a deferred inv is in flight — exactly the behavior needed
-	// to keep the cache awake without spurious wakeups.
-	if ds.localSnoopPipeline != nil {
-		madeProgress = ds.localSnoopPipeline.Tick() || madeProgress
-	}
-	if ds.remoteSnoopPipeline != nil {
-		madeProgress = ds.remoteSnoopPipeline.Tick() || madeProgress
-	}
 
 	// Phase F: dedicated InvReq pipeline. Same dirLatency stages so
 	// inv pays tag-lookup time. Items emerge into invBuf which is
@@ -187,13 +169,25 @@ func (ds *directoryStage) processTransaction() bool {
 		// Phase F: drain invBuf first (preempts read/write so that
 		// stalled R/W head in localBuf/remoteBuf cannot block inv
 		// processing → cache coherence response always proceeds).
-		ds.activeString = &ds.returnFalse0
-		ds.activeBuf = ds.invBuf
-		ok, cost := ds.processOne()
-		if ok {
-			used += cost
-			madeProgress = true
-			continue
+		// [INV-FIDELITY C1b] An inv commit costs invCostInSlots; only
+		// attempt it when the remaining budget covers the full cost so a
+		// late-cycle inv cannot overdraw the budget (used==0 keeps inv
+		// from being permanently shut out — invBuf is tried first every
+		// iteration, so a waiting inv always commits at the start of the
+		// next cycle).
+		var (
+			ok   bool
+			cost int
+		)
+		if used == 0 || used+invCostInSlots <= totalBudget {
+			ds.activeString = &ds.returnFalse0
+			ds.activeBuf = ds.invBuf
+			ok, cost = ds.processOne()
+			if ok {
+				used += cost
+				madeProgress = true
+				continue
+			}
 		}
 		// Try remote — deferred lane first (program order), then remoteBuf.
 		ds.activeString = &ds.returnFalse0
@@ -228,6 +222,17 @@ func (ds *directoryStage) processTransaction() bool {
 			continue
 		}
 		break
+	}
+
+	// [INV-FIDELITY C1c] The cycle ended because the commit budget bound
+	// while committable work was still queued — the directory's tag/state
+	// ports are the bottleneck this cycle. Under inv storms this counter
+	// quantifies how many cycles of demand commit bandwidth invalidations
+	// (and other traffic) actually consumed.
+	if used >= totalBudget &&
+		(ds.invBuf.Size() > 0 || ds.remoteBuf.Size() > 0 ||
+			ds.localBuf.Size() > 0 || ds.deferredEvictBuf.Size() > 0) {
+		ds.cache.incEvent("DirCommitBudgetSaturated")
 	}
 
 	return madeProgress
@@ -370,10 +375,22 @@ func (ds *directoryStage) processSpecificBuffer(targetBuf sim.Buffer) bool {
 func (ds *directoryStage) acceptNewTransaction() bool {
 	madeProgress := false
 
+	// [INV-FIDELITY C2] Shared tag-port token pool. A real L2 slice has a
+	// fixed number of tag-array ports shared by demand accesses AND
+	// incoming probes; an invalidation's tag lookup displaces a demand
+	// lookup. The three admission queues below therefore share ONE pool of
+	// numReqPerCycle pipeline-entry tokens per cycle (priority: inv >
+	// remote > local, matching the existing arbitration). The typed queues
+	// and separate pipelines are kept — they are load-bearing anti-HoL
+	// deadlock breakers — only the per-cycle entry bandwidth is unified.
+	// Tokens refill unconditionally every cycle, so exhaustion is a
+	// bounded 1-cycle delay and cannot close a blocking cycle.
+	tokens := ds.cache.numReqPerCycle
+
 	// [Phase F] 0순위: InvReq 전용 ingress (invStageBuffer) → invPipeline.
 	// 분리된 큐를 두어 head-of-line blocking 제거. 정규 큐의 read/write가
 	// stall되어도 inv는 자기 큐에서 정상 진행.
-	for i := 0; i < ds.cache.numReqPerCycle; i++ {
+	for tokens > 0 {
 		item := ds.cache.invStageBuffer.Peek()
 		if item == nil {
 			break
@@ -384,14 +401,15 @@ func (ds *directoryStage) acceptNewTransaction() bool {
 		trans := item.(*transaction)
 		ds.invPipeline.Accept(dirPipelineItem{trans})
 		ds.cache.invStageBuffer.Pop()
+		ds.cache.incEvent("InvTagProbe")
+		tokens--
 		madeProgress = true
 	}
 
 	// [이식 완료] 1순위: 외부(Remote) 요청 최우선 파이프라인 진입.
-	// InvReq는 snoopLatency>0인 경우 remoteSnoopPipeline으로 우회.
-	// Snoop pipeline이 가득 차면 break — 이 경우 같은 head를 다음
+	// 파이프라인이 가득 차면 break — 이 경우 같은 head를 다음
 	// 사이클에 다시 시도하므로 deadlock-free (기존 break 패턴과 동일).
-	for i := 0; i < ds.cache.numReqPerCycle; i++ {
+	for tokens > 0 {
 		item := ds.cache.remoteDirStageBuffer.Peek()
 		if item == nil {
 			break
@@ -399,22 +417,18 @@ func (ds *directoryStage) acceptNewTransaction() bool {
 
 		trans := item.(*transaction)
 
-		targetPipeline := ds.remotePipeline
-		if trans.invalidation != nil && ds.remoteSnoopPipeline != nil {
-			targetPipeline = ds.remoteSnoopPipeline
-		}
-
-		if !targetPipeline.CanAccept() {
+		if !ds.remotePipeline.CanAccept() {
 			break
 		}
 
-		targetPipeline.Accept(dirPipelineItem{trans})
+		ds.remotePipeline.Accept(dirPipelineItem{trans})
 		ds.cache.remoteDirStageBuffer.Pop()
+		tokens--
 		madeProgress = true
 	}
 
 	// [이식 완료] 2순위: 내부(Local) 요청 파이프라인 진입.
-	for i := 0; i < ds.cache.numReqPerCycle; i++ {
+	for tokens > 0 {
 		item := ds.cache.dirStageBuffer.Peek()
 		if item == nil {
 			break
@@ -422,18 +436,24 @@ func (ds *directoryStage) acceptNewTransaction() bool {
 
 		trans := item.(*transaction)
 
-		targetPipeline := ds.localPipeline
-		if trans.invalidation != nil && ds.localSnoopPipeline != nil {
-			targetPipeline = ds.localSnoopPipeline
-		}
-
-		if !targetPipeline.CanAccept() {
+		if !ds.localPipeline.CanAccept() {
 			break
 		}
 
-		targetPipeline.Accept(dirPipelineItem{trans})
+		ds.localPipeline.Accept(dirPipelineItem{trans})
 		ds.cache.dirStageBuffer.Pop()
+		tokens--
 		madeProgress = true
+	}
+
+	// [INV-FIDELITY C2] Admission contention happened: the pool ran dry
+	// while at least one queue still had a head that the target pipeline
+	// could have accepted.
+	if tokens == 0 &&
+		((ds.cache.invStageBuffer.Size() > 0 && ds.invPipeline.CanAccept()) ||
+			(ds.cache.remoteDirStageBuffer.Size() > 0 && ds.remotePipeline.CanAccept()) ||
+			(ds.cache.dirStageBuffer.Size() > 0 && ds.localPipeline.CanAccept())) {
+		ds.cache.incEvent("TagPortTokensExhausted")
 	}
 
 	return madeProgress
@@ -442,12 +462,6 @@ func (ds *directoryStage) acceptNewTransaction() bool {
 func (ds *directoryStage) Reset() {
 	ds.localPipeline.Clear()
 	ds.remotePipeline.Clear()
-	if ds.localSnoopPipeline != nil {
-		ds.localSnoopPipeline.Clear()
-	}
-	if ds.remoteSnoopPipeline != nil {
-		ds.remoteSnoopPipeline.Clear()
-	}
 	ds.invPipeline.Clear()
 	ds.localBuf.Clear()
 	ds.remoteBuf.Clear()
@@ -763,6 +777,26 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 		deferred = true
 	}
 
+	// [INV-FIDELITY C3] A probe killing a dirty (M-state) line must produce
+	// a victim writeback — real L2s have no mode that discards modified
+	// data. Dirty lines are locally-homed by construction (writes to
+	// RDMA-mapped addresses are write-through to the home node and clear
+	// IsDirty), so the flush drains through the LOCAL writeBuffer bucket to
+	// local DRAM only: the retry edge below is invBuf-head ← local
+	// writeBuffer ← bottomPort ← local DRAM — acyclic, no cross-GPU or
+	// CohDir dependency. Deferred (IsLocked/MSHR) cases are handled at bank
+	// finalize by applyPendingInvalidation.
+	needDirtyFlush := !deferred && mshrEntry == nil && block != nil &&
+		block.IsValid && block.IsDirty
+	if needDirtyFlush &&
+		!ds.cache.writeBufferBufferCanPush(true) &&
+		!ds.cache.writeBuffer.deferFlushCanPush(true) {
+		ds.cache.incEvent("InvDirtyWritebackStall")
+		*ds.activeString += "dirty-inv writeback: writeBuffer full"
+		trans.returnFalse = *ds.activeString
+		return false
+	}
+
 	// InvRsp는 InvReq가 도착한 port의 짝으로 돌려보내야 함. InvReq는
 	// 항상 remote path (directory의 remoteBottomPort → L2의 remoteTopPort)로
 	// 들어오므로 invBuf에서 처리되는 inv는 반드시 remoteTopPort로 응답.
@@ -799,6 +833,13 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 			ds.cache.deferredInvArmed++
 			ds.cache.incEvent("DeferredInvArmed")
 		} else if mshrEntry == nil {
+			// [INV-FIDELITY C3] Writeback-on-dirty-probe: capture the
+			// modified line into a synthetic local flush before the
+			// zero-out destroys it. Capacity was guaranteed by the
+			// needDirtyFlush gate above, so the push cannot fail.
+			if needDirtyFlush && ds.cache.enqueueInvDirtyFlush(block) {
+				ds.cache.incEvent("InvDirtyWriteback")
+			}
 			newBlk := &internal.Block{
 				WayID:        block.WayID,
 				SetID:        block.SetID,
@@ -992,8 +1033,9 @@ func (ds *directoryStage) handleReadMiss(trans *transaction) bool {
 // steps so the metric can be aggregated like read-miss/remote-read-miss.
 //
 // Names emitted:
-//   read-miss-<reason>
-//   remote-read-miss-<reason>   (only when trans.toLocal == false)
+//
+//	read-miss-<reason>
+//	remote-read-miss-<reason>   (only when trans.toLocal == false)
 func (ds *directoryStage) emitMissReason(trans *transaction, cacheLineID uint64) {
 	reason := ds.cache.classifyAndRecordReadMiss(trans.read.PID, cacheLineID)
 	ds.cache.incEvent("read-miss-" + reason)

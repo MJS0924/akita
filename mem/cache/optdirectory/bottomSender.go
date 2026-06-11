@@ -23,7 +23,13 @@ type bottomSender struct {
 	maxInvEmitPerCycle          int
 	invEmittedToRDMAThisCycle   int
 	invEmittedToBottomThisCycle int
-	lastEmitCycleTime           sim.VTimeInSec
+	// [INV-FIDELITY C4] Third budget lane: dir→peer-dir InvReq fan-out via
+	// RDMAInvPort (sendToRDMAInvQue). This is the origin of every
+	// cross-GPU invalidation and previously drained UNBUDGETED at up to
+	// numReqPerCycle InvReq/cycle while the r9nano config documents "at
+	// most maxInvEmitPerCycle InvReqs per output channel per cycle".
+	invEmittedToPeerThisCycle int
+	lastEmitCycleTime         sim.VTimeInSec
 
 	// localInflightBypassRequest []*transaction
 	// [수정] Inflight 트랜잭션을 Local과 Remote로 분리
@@ -55,15 +61,15 @@ type bottomSender struct {
 	// invalidations preempt regular requests at the egress.
 	invRemoteSendToBottomQue []sim.Msg
 	// [ITER18 F4/D7] split sendToTopQue by egress port (mirrors REC).
-	sendToTopRspQue       []sim.Msg
-	sendToRDMADataRspQue  []sim.Msg
-	sendToRDMAInvQue      []sim.Msg // outbound InvReq → RDMAInvPort
+	sendToTopRspQue      []sim.Msg
+	sendToRDMADataRspQue []sim.Msg
+	sendToRDMAInvQue     []sim.Msg // outbound InvReq → RDMAInvPort
 	// S1 (ported from SD): outbound InvRsp split off from sendToRDMAInvQue.
 	// Drained via the new RDMAInvRspOutPort; complies with RDMA's
 	// contract (processFromInvInside panics on InvRsp).
-	sendToRDMAInvRspQue   []sim.Msg // outbound InvRsp → RDMAInvRspOutPort
-	sendToRemoteTopQue    []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
-	bypassRspQue          []sim.Msg
+	sendToRDMAInvRspQue []sim.Msg // outbound InvRsp → RDMAInvRspOutPort
+	sendToRemoteTopQue  []sim.Msg // remote(RDMAPort)로 나가야 하는 응답 전용 (Src에 RDMA 없는 쓰기 eviction 등)
+	bypassRspQue        []sim.Msg
 
 	returnFalse0 string
 	returnFalse1 string
@@ -75,6 +81,7 @@ func (bs *bottomSender) refreshEmitBudget() {
 	if now > bs.lastEmitCycleTime {
 		bs.invEmittedToRDMAThisCycle = 0
 		bs.invEmittedToBottomThisCycle = 0
+		bs.invEmittedToPeerThisCycle = 0
 		bs.lastEmitCycleTime = now
 	}
 }
@@ -82,6 +89,46 @@ func (bs *bottomSender) refreshEmitBudget() {
 func (bs *bottomSender) canEmitInvToRDMA() bool {
 	return bs.maxInvEmitPerCycle <= 0 ||
 		bs.invEmittedToRDMAThisCycle < bs.maxInvEmitPerCycle
+}
+
+func (bs *bottomSender) canEmitInvToPeer() bool {
+	return bs.maxInvEmitPerCycle <= 0 ||
+		bs.invEmittedToPeerThisCycle < bs.maxInvEmitPerCycle
+}
+
+// drainRDMAInvQueuePeerBudget drains one message from sendToRDMAInvQue with
+// the per-cycle inv-emit budget applied to InvReq heads. The type check is
+// mandatory: DataReadyRsp/WriteDoneRsp whose Dst contains "RDMAInv" are also
+// routed into this queue and must flow unbudgeted — throttling response
+// lanes is the iter19 anti-deadlock invariant (rsp paths must terminate in
+// counter decrements unconditionally). A budget-deferred head is retried
+// next cycle; bounded pacing of a producer-side slice adds no wait-for
+// edge. [INV-FIDELITY C4]
+func (bs *bottomSender) drainRDMAInvQueuePeerBudget() bool {
+	if len(bs.sendToRDMAInvQue) == 0 {
+		return false
+	}
+	head := bs.sendToRDMAInvQue[0]
+	_, headIsInv := head.(*mem.InvReq)
+	if headIsInv && !bs.canEmitInvToPeer() {
+		bs.cache.stallInvEmitPeer++
+		return false
+	}
+	if !bs.cache.RDMAInvPort.CanSend() {
+		bs.cache.stallTopPortBusy++
+		return false
+	}
+	head.Meta().Src = bs.cache.RDMAInvPort.AsRemote()
+	if err := bs.cache.RDMAInvPort.Send(head); err != nil {
+		return false
+	}
+	bs.sendToRDMAInvQue[0] = nil
+	bs.sendToRDMAInvQue = bs.sendToRDMAInvQue[1:]
+	if headIsInv {
+		bs.invEmittedToPeerThisCycle++
+		bs.cache.invEmittedPeer++
+	}
+	return true
 }
 
 func (bs *bottomSender) canEmitInvToBottom() bool {
@@ -1025,7 +1072,8 @@ func (bs *bottomSender) sendToTop() bool {
 	if bs.drainOneTypedQueue(&bs.sendToRDMADataRspQue, bs.cache.RDMAPort) {
 		progress = true
 	}
-	if bs.drainOneTypedQueue(&bs.sendToRDMAInvQue, bs.cache.RDMAInvPort) {
+	// [INV-FIDELITY C4] peer-lane InvReq drain honors maxInvEmitPerCycle.
+	if bs.drainRDMAInvQueuePeerBudget() {
 		progress = true
 	}
 	// S1 (ported from SD): drain outbound InvRsp via the dedicated egress

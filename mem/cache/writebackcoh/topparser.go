@@ -74,15 +74,20 @@ func (p *topParser) Tick() bool {
 		madeProgress = true
 	}
 
-	// 2) Dispatch one typed pending item to its downstream buffer.
-	//    Priority: InvReq > Access. Inv dispatch goes to invStageBuffer
-	//    (already prioritized by dirStage). Access goes to
-	//    remoteDirStageBuffer.
+	// 2) Dispatch one typed pending item per class to its downstream
+	//    buffer. Priority WITHIN each class stays InvReq > Access (part of
+	//    the documented CD_0 anti-HoL design), but a successful dispatch no
+	//    longer early-returns: the old `return true` let a burst of remote
+	//    invs consume every subtick and starve local L1 admission entirely
+	//    — an emergent parser-scheduling artifact, not a modeled resource.
+	//    [INV-FIDELITY C8a] Probe-vs-demand contention is now modeled
+	//    explicitly at the dir-stage admission token pool and commit
+	//    budget, so the parser just moves one item per class per Tick.
 	if p.dispatchRemoteInv() {
-		return true
+		madeProgress = true
 	}
 	if p.dispatchRemoteAccess() {
-		return true
+		madeProgress = true
 	}
 
 	// 3) Local L1 path (topPort). Symmetric typed-queue split so that
@@ -92,7 +97,7 @@ func (p *topParser) Tick() bool {
 		madeProgress = true
 	}
 	if p.dispatchLocalInv() {
-		return true
+		madeProgress = true
 	}
 	if p.dispatchLocalAccess() {
 		madeProgress = true

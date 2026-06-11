@@ -557,6 +557,19 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		return false
 	}
 
+	// [INV-FIDELITY C3] A deferred invalidation is armed on this block and
+	// this local (non-write-through) write is about to leave it dirty; the
+	// kill at applyPendingInvalidation below must produce a local
+	// writeback, so require flush capacity up front (same shape as the
+	// writeToHomeNode gate above; retried next cycle, drains via local
+	// DRAM only). writeToHomeNode writes leave the block clean and are
+	// covered by their own gate.
+	if trans.block.PendingInvalidation && !trans.writeToHomeNode &&
+		!s.cache.writeBufferBufferCanPush(true) &&
+		!s.cache.writeBuffer.deferFlushCanPush(true) {
+		return false
+	}
+
 	write := trans.write
 	addr := write.Address
 	_, offset := getCacheLineID(addr, s.cache.log2BlockSize)
@@ -845,6 +858,17 @@ func (s *bankStage) finalizeBankWritePrefetched(
 func (s *bankStage) applyPendingInvalidation(block *internal.Block) {
 	if !block.PendingInvalidation {
 		return
+	}
+	// [INV-FIDELITY C3] Deferred kill of a dirty line: the modified data
+	// must be written back to local DRAM before the zero-out, exactly like
+	// the immediate path in doInvalidation. finalizeWriteHit gates on
+	// flush capacity up front; the write-through (writeToHomeNode) and
+	// fetch/prefetch finalize paths leave the block clean, so in practice
+	// the fallback drop counter stays 0.
+	if block.IsValid && block.IsDirty {
+		if s.cache.enqueueInvDirtyFlush(block) {
+			s.cache.incEvent("InvDirtyWritebackDeferred")
+		}
 	}
 	s.cache.eraseCacheLineFromRWMask(block.PID, block.VAddr)
 	newBlk := &internal.Block{

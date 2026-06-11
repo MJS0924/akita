@@ -14,9 +14,9 @@ type missTrackerKey struct {
 
 // Eviction reason tags (used to classify a future re-fetch).
 const (
-	evictReasonLRU       = "lru"
-	evictReasonInvWrite  = "inv-write"  // peer write on a shared line
-	evictReasonInvEvict  = "inv-evict"  // remote directory eviction
+	evictReasonLRU      = "lru"
+	evictReasonInvWrite = "inv-write" // peer write on a shared line
+	evictReasonInvEvict = "inv-evict" // remote directory eviction
 )
 
 // classifyAndRecordReadMiss returns the canonical miss-reason tag for a
@@ -24,13 +24,14 @@ const (
 // remain accurate.
 //
 // Reasons:
-//   "cold"       — first time this L2 has ever seen the line.
-//   "capacity"   — line was previously cached then LRU-evicted. (We don't
-//                  separate true capacity vs conflict misses; doing so would
-//                  require a parallel fully-associative shadow LRU.)
-//   "coh-write"  — line was invalidated by a peer write (write-init).
-//   "coh-evict"  — line was invalidated by a remote directory eviction.
-//   "other"      — unexpected: should be 0 in a healthy run.
+//
+//	"cold"       — first time this L2 has ever seen the line.
+//	"capacity"   — line was previously cached then LRU-evicted. (We don't
+//	               separate true capacity vs conflict misses; doing so would
+//	               require a parallel fully-associative shadow LRU.)
+//	"coh-write"  — line was invalidated by a peer write (write-init).
+//	"coh-evict"  — line was invalidated by a remote directory eviction.
+//	"other"      — unexpected: should be 0 in a healthy run.
 func (c *Comp) classifyAndRecordReadMiss(pid vm.PID, addr uint64) string {
 	key := missTrackerKey{PID: pid, Addr: addr}
 

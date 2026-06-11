@@ -41,23 +41,23 @@ type Comp struct {
 	// (RDMADataReqInside / RDMADataRspInside).  RDMAPort is retained
 	// only as a legacy field; new traffic flows through the split
 	// ports.
-	RDMADataReqPort  sim.Port
-	RDMADataRspPort  sim.Port
+	RDMADataReqPort sim.Port
+	RDMADataRspPort sim.Port
 	// RDMAInvPort is conceptually the InvReq ingress (carried under
 	// the historical iter7 field name); RDMAInvRspPort is the InvRsp
 	// ingress added in iter7.
-	RDMAInvPort      sim.Port
-	RDMAInvRspPort   sim.Port
+	RDMAInvPort    sim.Port
+	RDMAInvRspPort sim.Port
 	// [ITER19] Dedicated InvRsp EGRESS port on the ForInvRsp connection
 	// (mirrors SD/HMG RDMAInvRspOutPort). Keeps outbound InvRsp off the
 	// InvReq connection (RDMAInvPort/ForInv) and off the InvRsp ingress
 	// (RDMAInvRspPort, polled by topparser), so req/rsp stay fully split.
 	RDMAInvRspOutPort sim.Port
-	ToRDMA           sim.RemotePort
-	ToRDMADataReq    sim.RemotePort // [R2] paired with R1 RDMADataReqInside
-	ToRDMADataRsp    sim.RemotePort // [R2] paired with R1 RDMADataRspInside
-	ToRDMAInv        sim.RemotePort
-	ToRDMAInvRsp     sim.RemotePort
+	ToRDMA            sim.RemotePort
+	ToRDMADataReq     sim.RemotePort // [R2] paired with R1 RDMADataReqInside
+	ToRDMADataRsp     sim.RemotePort // [R2] paired with R1 RDMADataRspInside
+	ToRDMAInv         sim.RemotePort
+	ToRDMAInvRsp      sim.RemotePort
 
 	// [수정 코드] 자원을 Local과 Remote로 완전 분리
 	localDirStageBuffer  sim.Buffer
@@ -132,11 +132,11 @@ type Comp struct {
 	evictEntryCount   uint64
 
 	// Diagnostic counters for silent eviction analysis
-	allocCount             uint64 // FindVictim returned alloc=true (need to allocate new slot)
-	needEvictionCount      uint64 // alloc=true && needEviction=true (real eviction with sharers)
-	silentResetCount       uint64 // alloc=true && needEviction=false (Reset clears entry without inv)
-	defensiveCleanupCount  uint64 // "혹시 몰라서" loop in InvalidateAndUpdateEntry fired
-	invSentCount           uint64 // sendInvalidationRequest sent at least one inv message
+	allocCount              uint64 // FindVictim returned alloc=true (need to allocate new slot)
+	needEvictionCount       uint64 // alloc=true && needEviction=true (real eviction with sharers)
+	silentResetCount        uint64 // alloc=true && needEviction=false (Reset clears entry without inv)
+	defensiveCleanupCount   uint64 // "혹시 몰라서" loop in InvalidateAndUpdateEntry fired
+	invSentCount            uint64 // sendInvalidationRequest sent at least one inv message
 	invSkippedSelfOnlyCount uint64 // sendInvalidationRequest had no targets (only-self sharer)
 
 	// Per-action dispatch counts (counted when transaction successfully advances)
@@ -167,6 +167,8 @@ type Comp struct {
 	stallInflightInv    uint64 // bottomSender: tooManyInflightInvalidation
 	stallBottomPortBusy uint64 // bottomSender: bottomPort/RDMAPort can't send
 	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
+	stallInvEmitPeer    uint64 // [INV-FIDELITY C4] peer-lane InvReq head deferred by emit budget
+	invEmittedPeer      uint64 // [INV-FIDELITY C4] InvReqs emitted on the dir→peer-dir lane
 	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
 
 	// [DOWRITE-TRACE] origin-split doWrite outcome counters. The shared
@@ -193,20 +195,20 @@ type Comp struct {
 	waitBottomSum_bypass sim.VTimeInSec
 	waitCount_bypass     uint64
 
-	waitDirSum_fast      sim.VTimeInSec
-	waitBottomSum_fast   sim.VTimeInSec
-	waitCount_fast       uint64
+	waitDirSum_fast    sim.VTimeInSec
+	waitBottomSum_fast sim.VTimeInSec
+	waitCount_fast     uint64
 
-	waitDirSum_bank      sim.VTimeInSec
-	waitBottomSum_bank   sim.VTimeInSec
-	waitCount_bank       uint64
+	waitDirSum_bank    sim.VTimeInSec
+	waitBottomSum_bank sim.VTimeInSec
+	waitCount_bank     uint64
 
 	// OP5 deviation regression slots (PHASE C-2). Increment sites are
 	// intentionally absent in the post-fix code: a non-zero value means
 	// either (a) a future change reintroduced the buggy branch and wired
 	// the counter back, or (b) someone added a new code path that
 	// re-exhibits the deviation. Either case is a regression.
-	op5aShortcutWithRemoteSharer uint64 // local write hit took the no-inv shortcut despite a remote sharer (paper §4.2 OP5a)
+	op5aShortcutWithRemoteSharer    uint64 // local write hit took the no-inv shortcut despite a remote sharer (paper §4.2 OP5a)
 	op5bRemoteWriteHitClearedWriter uint64 // remote write hit on valid offset cleared the writer's sharer bit (paper §4.2 OP5b)
 }
 
@@ -277,39 +279,41 @@ func (c *Comp) DiagCounts() (alloc, needEvict, silentReset, defCleanup, invSent,
 // in the post-fix codebase.
 func (c *Comp) ActionCounts() map[string]uint64 {
 	return map[string]uint64{
-		"act_Nothing":              c.actNothing,
-		"act_InsertNewEntry":       c.actInsertNew,
-		"act_UpdateEntry":          c.actUpdate,
-		"act_EvictAndInsertNew":    c.actEvictInsert,
-		"act_InvalidateEntry":      c.actInvalidateEnt,
-		"act_InvalidateAndUpdate":  c.actInvUpdate,
-		"act_BypassingDirectory":   c.actBypass,
-		"bottom_send_count":        c.bottomSendCount,
-		"mshr_forward_count":       c.mshrFwdCount,
-		"stall_mshr_full":          c.stallMSHRFull,
-		"stall_subentry_locked":    c.stallSubEntryLocked,
-		"stall_bank_full":          c.stallBankFull,
-		"stall_evicting_list":      c.stallEvictingList,
-		"stall_victim_locked":      c.stallVictimLocked,
-		"stall_bottom_buf_full":    c.stallBottomBufFull,
-		"stall_mshr_buf_full":      c.stallMshrBufFull,
-		"stall_inflight_fetch":     c.stallInflightFetch,
-		"stall_inflight_inv":       c.stallInflightInv,
-		"stall_bottom_port_busy":   c.stallBottomPortBusy,
-		"stall_top_port_busy":      c.stallTopPortBusy,
-		"total_dowrite_calls":      c.totalDoWriteCalls,
+		"act_Nothing":             c.actNothing,
+		"act_InsertNewEntry":      c.actInsertNew,
+		"act_UpdateEntry":         c.actUpdate,
+		"act_EvictAndInsertNew":   c.actEvictInsert,
+		"act_InvalidateEntry":     c.actInvalidateEnt,
+		"act_InvalidateAndUpdate": c.actInvUpdate,
+		"act_BypassingDirectory":  c.actBypass,
+		"bottom_send_count":       c.bottomSendCount,
+		"mshr_forward_count":      c.mshrFwdCount,
+		"stall_mshr_full":         c.stallMSHRFull,
+		"stall_subentry_locked":   c.stallSubEntryLocked,
+		"stall_bank_full":         c.stallBankFull,
+		"stall_evicting_list":     c.stallEvictingList,
+		"stall_victim_locked":     c.stallVictimLocked,
+		"stall_bottom_buf_full":   c.stallBottomBufFull,
+		"stall_mshr_buf_full":     c.stallMshrBufFull,
+		"stall_inflight_fetch":    c.stallInflightFetch,
+		"stall_inflight_inv":      c.stallInflightInv,
+		"stall_bottom_port_busy":  c.stallBottomPortBusy,
+		"stall_top_port_busy":     c.stallTopPortBusy,
+		"stall_inv_emit_peer":     c.stallInvEmitPeer,
+		"inv_emitted_peer":        c.invEmittedPeer,
+		"total_dowrite_calls":     c.totalDoWriteCalls,
 		// Queueing-delay sums emitted in nanoseconds (for analysis;
 		// divide by *_count to get average per-trans dwell time).
-		"wait_dir_ns_bypass":       uint64(c.waitDirSum_bypass * 1e9),
-		"wait_bottom_ns_bypass":    uint64(c.waitBottomSum_bypass * 1e9),
-		"wait_count_bypass":        c.waitCount_bypass,
-		"wait_dir_ns_fast":         uint64(c.waitDirSum_fast * 1e9),
-		"wait_bottom_ns_fast":      uint64(c.waitBottomSum_fast * 1e9),
-		"wait_count_fast":          c.waitCount_fast,
-		"wait_dir_ns_bank":         uint64(c.waitDirSum_bank * 1e9),
-		"wait_bottom_ns_bank":      uint64(c.waitBottomSum_bank * 1e9),
-		"wait_count_bank":          c.waitCount_bank,
-		"op5a_shortcut_with_remote_sharer":   c.op5aShortcutWithRemoteSharer,
+		"wait_dir_ns_bypass":                   uint64(c.waitDirSum_bypass * 1e9),
+		"wait_bottom_ns_bypass":                uint64(c.waitBottomSum_bypass * 1e9),
+		"wait_count_bypass":                    c.waitCount_bypass,
+		"wait_dir_ns_fast":                     uint64(c.waitDirSum_fast * 1e9),
+		"wait_bottom_ns_fast":                  uint64(c.waitBottomSum_fast * 1e9),
+		"wait_count_fast":                      c.waitCount_fast,
+		"wait_dir_ns_bank":                     uint64(c.waitDirSum_bank * 1e9),
+		"wait_bottom_ns_bank":                  uint64(c.waitBottomSum_bank * 1e9),
+		"wait_count_bank":                      c.waitCount_bank,
+		"op5a_shortcut_with_remote_sharer":     c.op5aShortcutWithRemoteSharer,
 		"op5b_remote_write_hit_cleared_writer": c.op5bRemoteWriteHitClearedWriter,
 	}
 }

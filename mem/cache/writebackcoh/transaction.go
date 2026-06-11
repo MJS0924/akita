@@ -29,14 +29,13 @@ const (
 	writeBufferEvictAndPrefetch
 	writeBufferFlush
 
+	// invalidation completes inside the directory stage (tag-only op; no
+	// data-array access). Its cost model: shared tag-port admission token
+	// + invPipeline latency (dirLatency+snoopLatency) + invCostInSlots of
+	// the per-cycle commit budget. Deliberately NOT routed through the
+	// bank pipeline — the shared dirToBank buffer dependency deadlocks
+	// under SuperDirectory promotion/demotion InvReq storms.
 	invalidation
-
-	// bankInvalidate routes an InvReq through the bank stage so that
-	// invalidations consume bank-pipeline slots and tag-lookup
-	// bandwidth, rather than completing entirely inside the directory
-	// stage. The bank just verifies the line and sends InvRsp; no data
-	// movement.
-	bankInvalidate
 )
 
 type transaction struct {

@@ -135,8 +135,8 @@ func TestCrossGPUWriteBufferDeadlock(t *testing.T) {
 		}
 		return reqs
 	}
-	reqsA := mkReqs(half)    // A targets B's range (remote)
-	reqsB := mkReqs(0)       // B targets A's range (remote)
+	reqsA := mkReqs(half) // A targets B's range (remote)
+	reqsB := mkReqs(0)    // B targets A's range (remote)
 
 	idxA, idxB, recvA, recvB := 0, 0, 0, 0
 

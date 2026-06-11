@@ -32,7 +32,7 @@ type Comp struct {
 	name     string
 	deviceID int
 
-	topPort          sim.Port
+	topPort sim.Port
 	// D4 (ported from SD): dedicated L1-facing InvRsp ingress so L1's
 	// InvRsp is not head-blocked by a full localBypassBuffer behind a
 	// queued ReadReq at topPort. Mirror of D1 on the L1-facing side.
@@ -48,9 +48,9 @@ type Comp struct {
 	// and complies with RDMA's contract: processFromInvInside panics
 	// on InvRsp; only RDMAInvRspInside accepts InvRsp.
 	RDMAInvRspOutPort sim.Port
-	ToRDMA           sim.RemotePort
-	ToRDMAInv        sim.RemotePort
-	ToRDMAInvRsp     sim.RemotePort
+	ToRDMA            sim.RemotePort
+	ToRDMAInv         sim.RemotePort
+	ToRDMAInvRsp      sim.RemotePort
 
 	// [수정 코드] 자원을 Local과 Remote로 완전 분리
 	localDirStageBuffer  sim.Buffer
@@ -156,10 +156,10 @@ type Comp struct {
 	actBypass        uint64
 	bottomSendCount  uint64
 	// remoteBottomPort/bottomPort 별도 사용량 추적 (deadlock 분석용).
-	localSendCount        uint64 // sendRequestToBottom/sendMultipleRequest with isLocal=true
-	remoteSendCount       uint64 // sendRequestToBottom/sendMultipleRequest with isLocal=false
-	bypassSendCount       uint64 // processBypassReq sends (always local)
-	mshrFwdCount     uint64
+	localSendCount  uint64 // sendRequestToBottom/sendMultipleRequest with isLocal=true
+	remoteSendCount uint64 // sendRequestToBottom/sendMultipleRequest with isLocal=false
+	bypassSendCount uint64 // processBypassReq sends (always local)
+	mshrFwdCount    uint64
 
 	// MSHR local/remote soft cap (mirrors writebackcoh L2 정책):
 	// remote 요청은 전체 numMSHREntry 사용 가능; local 요청은 항상 16개 슬롯을 예약.
@@ -178,6 +178,8 @@ type Comp struct {
 	stallInflightInv    uint64 // bottomSender: tooManyInflightInvalidation
 	stallBottomPortBusy uint64 // bottomSender: bottomPort/RDMAPort can't send
 	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
+	stallInvEmitPeer    uint64 // [INV-FIDELITY C4] peer-lane InvReq head deferred by emit budget
+	invEmittedPeer      uint64 // [INV-FIDELITY C4] InvReqs emitted on the dir→peer-dir lane
 	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
 
 	// Queueing-delay accumulators (Method E2). See REC Comp for naming.
@@ -206,36 +208,38 @@ type Comp struct {
 // in the post-fix codebase.
 func (c *Comp) ActionCounts() map[string]uint64 {
 	return map[string]uint64{
-		"act_Nothing":              c.actNothing,
-		"act_InsertNewEntry":       c.actInsertNew,
-		"act_UpdateEntry":          c.actUpdate,
-		"act_EvictAndInsertNew":    c.actEvictInsert,
-		"act_InvalidateEntry":      c.actInvalidateEnt,
-		"act_InvalidateAndUpdate":  c.actInvUpdate,
-		"act_BypassingDirectory":   c.actBypass,
-		"bottom_send_count":        c.bottomSendCount,
-		"mshr_forward_count":       c.mshrFwdCount,
-		"stall_mshr_full":          c.stallMSHRFull,
-		"stall_block_locked":       c.stallBlockLocked,
-		"stall_bank_full":          c.stallBankFull,
-		"stall_evicting_list":      c.stallEvictingList,
-		"stall_victim_locked":      c.stallVictimLocked,
-		"stall_bottom_buf_full":    c.stallBottomBufFull,
-		"stall_mshr_buf_full":      c.stallMshrBufFull,
-		"stall_inflight_fetch":     c.stallInflightFetch,
-		"stall_inflight_inv":       c.stallInflightInv,
-		"stall_bottom_port_busy":   c.stallBottomPortBusy,
-		"stall_top_port_busy":      c.stallTopPortBusy,
-		"total_dowrite_calls":      c.totalDoWriteCalls,
-		"wait_dir_ns_bypass":       uint64(c.waitDirSum_bypass * 1e9),
-		"wait_bottom_ns_bypass":    uint64(c.waitBottomSum_bypass * 1e9),
-		"wait_count_bypass":        c.waitCount_bypass,
-		"wait_dir_ns_fast":         uint64(c.waitDirSum_fast * 1e9),
-		"wait_bottom_ns_fast":      uint64(c.waitBottomSum_fast * 1e9),
-		"wait_count_fast":          c.waitCount_fast,
-		"wait_dir_ns_bank":         uint64(c.waitDirSum_bank * 1e9),
-		"wait_bottom_ns_bank":      uint64(c.waitBottomSum_bank * 1e9),
-		"wait_count_bank":          c.waitCount_bank,
+		"act_Nothing":                          c.actNothing,
+		"act_InsertNewEntry":                   c.actInsertNew,
+		"act_UpdateEntry":                      c.actUpdate,
+		"act_EvictAndInsertNew":                c.actEvictInsert,
+		"act_InvalidateEntry":                  c.actInvalidateEnt,
+		"act_InvalidateAndUpdate":              c.actInvUpdate,
+		"act_BypassingDirectory":               c.actBypass,
+		"bottom_send_count":                    c.bottomSendCount,
+		"mshr_forward_count":                   c.mshrFwdCount,
+		"stall_mshr_full":                      c.stallMSHRFull,
+		"stall_block_locked":                   c.stallBlockLocked,
+		"stall_bank_full":                      c.stallBankFull,
+		"stall_evicting_list":                  c.stallEvictingList,
+		"stall_victim_locked":                  c.stallVictimLocked,
+		"stall_bottom_buf_full":                c.stallBottomBufFull,
+		"stall_mshr_buf_full":                  c.stallMshrBufFull,
+		"stall_inflight_fetch":                 c.stallInflightFetch,
+		"stall_inflight_inv":                   c.stallInflightInv,
+		"stall_bottom_port_busy":               c.stallBottomPortBusy,
+		"stall_top_port_busy":                  c.stallTopPortBusy,
+		"stall_inv_emit_peer":                  c.stallInvEmitPeer,
+		"inv_emitted_peer":                     c.invEmittedPeer,
+		"total_dowrite_calls":                  c.totalDoWriteCalls,
+		"wait_dir_ns_bypass":                   uint64(c.waitDirSum_bypass * 1e9),
+		"wait_bottom_ns_bypass":                uint64(c.waitBottomSum_bypass * 1e9),
+		"wait_count_bypass":                    c.waitCount_bypass,
+		"wait_dir_ns_fast":                     uint64(c.waitDirSum_fast * 1e9),
+		"wait_bottom_ns_fast":                  uint64(c.waitBottomSum_fast * 1e9),
+		"wait_count_fast":                      c.waitCount_fast,
+		"wait_dir_ns_bank":                     uint64(c.waitDirSum_bank * 1e9),
+		"wait_bottom_ns_bank":                  uint64(c.waitBottomSum_bank * 1e9),
+		"wait_count_bank":                      c.waitCount_bank,
 		"op5a_shortcut_with_remote_sharer":     c.op5aShortcutWithRemoteSharer,
 		"op5b_remote_write_hit_cleared_writer": c.op5bRemoteWriteHitClearedWriter,
 	}

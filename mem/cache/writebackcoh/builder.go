@@ -200,26 +200,20 @@ func (b Builder) WithBankLatency(n int) Builder {
 
 // WithSnoopLatency sets the number of *additional* cycles an invalidation
 // request spends in the directory stage on top of the regular dirLatency.
-// This models the per-snoop tag-array lookup, state-bit write, and snoop
-// response generation cost a real L2 pays regardless of whether the
-// targeted line is present (i.e., wasted invalidations cost the same as
-// productive ones).
+// This models the per-snoop state-bit write and snoop-response generation
+// cost a real L2 pays regardless of whether the targeted line is present
+// (i.e., wasted invalidations cost the same as productive ones).
 //
-// Default: 0 — invalidations share the regular local/remote pipelines and
-// behavior is byte-identical to the historical implementation.
-//
-// When n > 0, two dedicated snoop pipelines (local + remote) of
-// (dirLatency + n) stages each are created. acceptNewTransaction routes
-// InvReq items into them; the existing local/remote post-pipeline buffers
-// are reused as the merge point, so processTransaction is unchanged.
-// Pipeline width matches numReqPerCycle, so the per-cycle inv processing
+// All InvReqs traverse the dedicated invPipeline (topParser routes every
+// inv into invStageBuffer), whose depth is dirLatency + n stages — the
+// snoop latency adds *on top of* the shared tag-access time. Pipeline
+// width matches numReqPerCycle, so the per-cycle inv processing
 // throughput cap is unchanged — only the latency floor is added.
 //
-// Deadlock safety: the pipelining package keeps madeProgress=true while a
-// stage's cycleLeft countdown is in flight, which keeps the cache ticking
-// until any deferred inv reaches the post-buffer. There is no extra
-// queue or shared resource introduced beyond the pipelines themselves,
-// so no new HoL blocking path is created.
+// Deadlock safety: pure bounded pipeline latency; the pipelining package
+// keeps madeProgress=true while a stage's cycleLeft countdown is in
+// flight, which keeps the cache ticking until any deferred inv reaches
+// the commit point. No new queue, shared resource, or HoL path.
 func (b Builder) WithSnoopLatency(n int) Builder {
 	b.snoopLatency = n
 	return b
@@ -436,31 +430,7 @@ func (b *Builder) buildDirectoryStage(cache *Comp) {
 		WithPostPipelineBuffer(remoteBuf).
 		Build(cache.Name() + ".Dir.RemotePipeline")
 
-	// 3. (Optional) Snoop pipelines for InvReq with extended latency.
-	// Built only when snoopLatency > 0; otherwise nil and invalidations
-	// flow through localPipeline/remotePipeline as before. Pipelines feed
-	// the same localBuf/remoteBuf so the downstream commit loop is
-	// unchanged. Their total stage count is dirLatency+snoopLatency so
-	// the snoop latency adds *on top of* the regular tag-access time.
-	var localSnoopPipeline, remoteSnoopPipeline pipelining.Pipeline
-	if b.snoopLatency > 0 {
-		localSnoopPipeline = pipelining.
-			MakeBuilder().
-			WithCyclePerStage(1).
-			WithNumStage(b.dirLatency + b.snoopLatency).
-			WithPipelineWidth(b.numReqPerCycle).
-			WithPostPipelineBuffer(localBuf).
-			Build(cache.Name() + ".Dir.LocalSnoopPipeline")
-		remoteSnoopPipeline = pipelining.
-			MakeBuilder().
-			WithCyclePerStage(1).
-			WithNumStage(b.dirLatency + b.snoopLatency).
-			WithPipelineWidth(b.numReqPerCycle).
-			WithPostPipelineBuffer(remoteBuf).
-			Build(cache.Name() + ".Dir.RemoteSnoopPipeline")
-	}
-
-	// 4. Phase F dedicated InvReq pipeline. ingress: invStageBuffer → invPipeline
+	// 3. Phase F dedicated InvReq pipeline. ingress: invStageBuffer → invPipeline
 	// (dirLatency stages baseline so tag lookup time is honored), post-pipeline:
 	// invBuf. processTransaction drains invBuf BEFORE local/remote bufs so
 	// invs preempt stalled read/write at the commit stage. The +snoopLatency
@@ -480,15 +450,13 @@ func (b *Builder) buildDirectoryStage(cache *Comp) {
 
 	// 5. directoryStage 구조체 초기화 및 할당
 	cache.dirStage = &directoryStage{
-		cache:               cache,
-		localPipeline:       localPipeline,
-		remotePipeline:      remotePipeline,
-		localSnoopPipeline:  localSnoopPipeline,
-		remoteSnoopPipeline: remoteSnoopPipeline,
-		invPipeline:         invPipeline,
-		localBuf:            localBuf,
-		remoteBuf:           remoteBuf,
-		invBuf:              invBuf,
+		cache:          cache,
+		localPipeline:  localPipeline,
+		remotePipeline: remotePipeline,
+		invPipeline:    invPipeline,
+		localBuf:       localBuf,
+		remoteBuf:      remoteBuf,
+		invBuf:         invBuf,
 		// [L2-DECOUPLE] dedicated deferral lane for stuck remote heads; sized
 		// like the sibling dir-stage buffer (numReqPerCycle), not an
 		// enlargement of any existing buffer. Combined occupancy is bounded by
