@@ -13,15 +13,15 @@ import (
 
 // A Builder can build writeback caches
 type Builder struct {
-	engine              sim.Engine
-	freq                sim.Freq
-	deviceID            int
-	addressToPortMapper mem.AddressToPortMapper
-	wayAssociativity    int
-	log2BlockSize       uint64
-	log2PageSize        uint64
-	log2UnitSize        uint64 // coherence management unit 크기 (cache block 개수)
-	fetchSingleCacheLine bool  // true이면 miss 시 64B(1 cacheline)만 fetch (HMG용)
+	engine               sim.Engine
+	freq                 sim.Freq
+	deviceID             int
+	addressToPortMapper  mem.AddressToPortMapper
+	wayAssociativity     int
+	log2BlockSize        uint64
+	log2PageSize         uint64
+	log2UnitSize         uint64 // coherence management unit 크기 (cache block 개수)
+	fetchSingleCacheLine bool   // true이면 miss 시 64B(1 cacheline)만 fetch (HMG용)
 
 	interleaving          bool
 	numInterleavingBlock  int
@@ -431,7 +431,7 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		maxInflightInvalidation:   b.maxInflightEviction,
 		maxInvEmitPerCycle:        b.maxInvEmitPerCycle,
 		maxInflightBypassRequest:  1024,
-		maxPeerInflightRequest:    256,                    // [ITER18 F5b]
+		maxPeerInflightRequest:    256,                        // [ITER18 F5b]
 		maxOutgoingRemoteInflight: b.maxInflightFetch * 3 / 4, // [ITER18 F2]
 	}
 }
@@ -558,34 +558,27 @@ func (b *Builder) createInternalBuffers(cache *Comp) {
 	// [수정] BottomSenderBuffer를 Local과 Remote로 분리
 	// [BSB-CLASS-SPLIT] Further split each side into Data + Inv class lanes
 	// to break the request-class head-of-line deadlock (see
-	// coherencedirectory.go comment). The two lanes PARTITION the original
-	// numReqPerCycle-deep capacity — bsbInvCap = numReqPerCycle/4 (floored at
-	// 1), bsbDataCap = numReqPerCycle - bsbInvCap (floored at 1) — so the
-	// per-side admission budget is NOT increased (16 -> 12 data + 4 inv).
-	// Inv-class trans are independently bounded by maxInflightInvalidation.
-	bsbInvCap := cache.numReqPerCycle / 4
-	if bsbInvCap < 1 {
-		bsbInvCap = 1
-	}
-	bsbDataCap := cache.numReqPerCycle - bsbInvCap
-	if bsbDataCap < 1 {
-		bsbDataCap = 1
-	}
+	// coherencedirectory.go comment).
+	// [SD-REC PARITY Fix1] Each lane keeps the FULL numReqPerCycle capacity,
+	// matching REC's [R4] split ("total push budget grows 2x — intentional").
+	// The previous PARTITION (data 12 + inv 4) gave CD/HMG smaller lanes
+	// than REC for the same fix; see superdirectory/builder.go for the
+	// measured stall_bottom_buf_full impact.
 	cache.localBottomSenderBufferData = sim.NewBuffer(
 		cache.Name()+".LocalBottomSenderBufferData",
-		bsbDataCap,
+		cache.numReqPerCycle,
 	)
 	cache.localBottomSenderBufferInv = sim.NewBuffer(
 		cache.Name()+".LocalBottomSenderBufferInv",
-		bsbInvCap,
+		cache.numReqPerCycle,
 	)
 	cache.remoteBottomSenderBufferData = sim.NewBuffer(
 		cache.Name()+".RemoteBottomSenderBufferData",
-		bsbDataCap,
+		cache.numReqPerCycle,
 	)
 	cache.remoteBottomSenderBufferInv = sim.NewBuffer(
 		cache.Name()+".RemoteBottomSenderBufferInv",
-		bsbInvCap,
+		cache.numReqPerCycle,
 	)
 
 	cache.invReqBuffer = sim.NewBuffer(

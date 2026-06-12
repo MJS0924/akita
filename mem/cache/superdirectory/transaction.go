@@ -37,14 +37,14 @@ type transaction struct {
 	fromLocal bool
 	toLocal   bool
 
-	bankID      int
-	bankList    []int
+	bankID       int
+	bankList     []int
 	banksChecked int // doWrite()가 호출된 횟수 (실제로 몇 개의 bank를 확인했는지)
-	read     *mem.ReadReq
-	write    *mem.WriteReq
-	flush    *cache.FlushReq
-	block    *internal.CohEntry
-	blockIdx int
+	read         *mem.ReadReq
+	write        *mem.WriteReq
+	flush        *cache.FlushReq
+	block        *internal.CohEntry
+	blockIdx     int
 	// EvictAndInsertNewEntry인 경우, entry 전체를 eviction
 	victim internal.CohEntry // bankID로 bank 정보 알 수 있음
 

@@ -180,6 +180,7 @@ type Comp struct {
 	stallTopPortBusy    uint64 // doInvalidation / response: topPort/RDMAInv can't send
 	stallInvEmitPeer    uint64 // [INV-FIDELITY C4] peer-lane InvReq head deferred by emit budget
 	invEmittedPeer      uint64 // [INV-FIDELITY C4] InvReqs emitted on the dir→peer-dir lane
+	remoteHeadDeferred  uint64 // [SD-REC PARITY Fix2] COMPLETION-VC skip-head deferrals
 	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
 
 	// Queueing-delay accumulators (Method E2). See REC Comp for naming.
@@ -230,6 +231,7 @@ func (c *Comp) ActionCounts() map[string]uint64 {
 		"stall_top_port_busy":                  c.stallTopPortBusy,
 		"stall_inv_emit_peer":                  c.stallInvEmitPeer,
 		"inv_emitted_peer":                     c.invEmittedPeer,
+		"remote_head_deferred":                 c.remoteHeadDeferred,
 		"total_dowrite_calls":                  c.totalDoWriteCalls,
 		"wait_dir_ns_bypass":                   uint64(c.waitDirSum_bypass * 1e9),
 		"wait_bottom_ns_bypass":                uint64(c.waitBottomSum_bypass * 1e9),

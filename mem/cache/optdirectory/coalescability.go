@@ -171,8 +171,8 @@ func (c *Comp) computeViewSnapshot(
 	regCardCount := [5]int{} // index 0 unused; [1]=card1, [2]=card2, [3]=card3, [4]=card4+
 	coalescablePrivateCount := 0
 	coalescableSharedCount := 0
-	sharedRegionCount := 0   // card>=2
-	strictSharedCount := 0   // strict=1 AND card>=2
+	sharedRegionCount := 0 // card>=2
+	strictSharedCount := 0 // strict=1 AND card>=2
 
 	for _, rd := range regions {
 		// per-block cardinality histogram (legacy JSON column)

@@ -279,13 +279,13 @@ type SuperDirectory interface {
 // CBFBankStats records per-bank false-positive accounting for the CBF.
 // Only coarse banks with an instantiated filter populate these counters.
 type CBFBankStats struct {
-	Queries         uint64
-	Positives       uint64
-	TruePositives   uint64
-	FalsePositives  uint64
-	TrueNegatives   uint64
-	FalseNegatives  uint64 // expected zero for a correctly-maintained CBF
-	NumEntries      uint64 // m for this bank's filter (0 when no CBF)
+	Queries        uint64
+	Positives      uint64
+	TruePositives  uint64
+	FalsePositives uint64
+	TrueNegatives  uint64
+	FalseNegatives uint64 // expected zero for a correctly-maintained CBF
+	NumEntries     uint64 // m for this bank's filter (0 when no CBF)
 	// Diagnostic: cumulative Insert/Evict call counts per bank. If
 	// Inserts > Evicts grows unboundedly the CBF saturates regardless of
 	// hashing — useful to localize unbalanced call sites.
@@ -328,9 +328,11 @@ type SuperDirectoryImpl struct {
 // Mehta L-CBF (m/n=4, k=3) configuration. Sized for coarse banks only,
 // assuming the BEC_FE geometry (8/16/32 sets × 8 ways = 64/128/256
 // coarse entries → 256/512/1024 sub-entries at log2NumSubEntry=2):
-//   Bank 0 (regionLen=14) -> 1024 counters (4-bit each = 512 B)
-//   Bank 1 (regionLen=12) -> 2048 counters (1 KB)
-//   Bank 2 (regionLen=10) -> 4096 counters (2 KB)
+//
+//	Bank 0 (regionLen=14) -> 1024 counters (4-bit each = 512 B)
+//	Bank 1 (regionLen=12) -> 2048 counters (1 KB)
+//	Bank 2 (regionLen=10) -> 4096 counters (2 KB)
+//
 // Banks 3 and 4 do not host a filter (always probed regardless).
 // CBF entries are sized as 4 × (subentry count per bank) — that is, 4 ×
 // numSets[i] × numWays × (1 << log2NumSubEntry). Defaulting to the first
@@ -420,13 +422,14 @@ func (d *SuperDirectoryImpl) TotalSize() uint64 {
 }
 
 // GetBank returns the CBF-positive coarse banks for reqAddr.
-//   Order: finest-first among CBF-enabled banks (e.g. 2, 1, 0).
-//   Banks without a CBF (numBanks-1, numBanks-2) are NOT included here
-//   because GetBank's contract is "banks the CBF predicts may hold data".
-//   The caller (selectBank) is responsible for appending the always-probed
-//   non-CBF banks to honor the requested lookup order.
-//   When disableCBF=true the legacy "all banks finest-first" behavior is
-//   preserved so RSB/disagreement logic continues to function.
+//
+//	Order: finest-first among CBF-enabled banks (e.g. 2, 1, 0).
+//	Banks without a CBF (numBanks-1, numBanks-2) are NOT included here
+//	because GetBank's contract is "banks the CBF predicts may hold data".
+//	The caller (selectBank) is responsible for appending the always-probed
+//	non-CBF banks to honor the requested lookup order.
+//	When disableCBF=true the legacy "all banks finest-first" behavior is
+//	preserved so RSB/disagreement logic continues to function.
 func (d *SuperDirectoryImpl) GetBank(reqAddr uint64) (bankID []int) {
 	if d.disableCBF {
 		for i := d.NumBanks - 1; i >= 0; i-- {

@@ -76,15 +76,15 @@ func newMshrStageForProcess() (*mshrStage, *Comp) {
 	remoteBuf := sim.NewBuffer("RemoteMSHR", 16)
 	dirStageMotion := sim.NewBuffer("DirMotion", 16)
 	comp := &Comp{
-		numBanks:                testNumBanks,
-		regionLen:               testRegionLen,
-		log2NumSubEntry:         2,
-		mshr:                    &softMockMSHR{},
-		directory:               &mockSuperDirectory{},
-		dirStageMotionBuffer:    dirStageMotion,
-		eventLogger:             logger,
-		localMshrStageBuffer:    localBuf,
-		remoteMshrStageBuffer:   remoteBuf,
+		numBanks:              testNumBanks,
+		regionLen:             testRegionLen,
+		log2NumSubEntry:       2,
+		mshr:                  &softMockMSHR{},
+		directory:             &mockSuperDirectory{},
+		dirStageMotionBuffer:  dirStageMotion,
+		eventLogger:           logger,
+		localMshrStageBuffer:  localBuf,
+		remoteMshrStageBuffer: remoteBuf,
 	}
 	return &mshrStage{cache: comp}, comp
 }

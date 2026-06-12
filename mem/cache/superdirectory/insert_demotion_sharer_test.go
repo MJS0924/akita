@@ -64,8 +64,9 @@ func popDemotedBlock(t *testing.T, s *mshrStage) *internal.CohEntry {
 }
 
 // Case 1: fromLocal=false with invalidationList=[A,B]
-//   trigger sub-entry → Sharer == [owner], IsValid=true
-//   non-trigger sub-entries → Sharer == [A,B], IsValid=true
+//
+//	trigger sub-entry → Sharer == [owner], IsValid=true
+//	non-trigger sub-entries → Sharer == [A,B], IsValid=true
 func TestInsertDemotion_Sharer_RemoteWithList(t *testing.T) {
 	s, _ := newTestMshrStage(false)
 
@@ -108,10 +109,11 @@ func TestInsertDemotion_Sharer_RemoteWithList(t *testing.T) {
 }
 
 // Case 2: fromLocal=true with invalidationList=[A,B]
-//   trigger sub-entry → IsValid=true (CBF patch §3.2 symmetrised this; the
-//     old IsValid=false produced 4-of-3 valid asymmetry that drove CBF
-//     Insert/Evict imbalance and ~100% FPR), Sharer nil/empty
-//   non-trigger sub-entries → Sharer == [A,B], IsValid=true
+//
+//	trigger sub-entry → IsValid=true (CBF patch §3.2 symmetrised this; the
+//	  old IsValid=false produced 4-of-3 valid asymmetry that drove CBF
+//	  Insert/Evict imbalance and ~100% FPR), Sharer nil/empty
+//	non-trigger sub-entries → Sharer == [A,B], IsValid=true
 func TestInsertDemotion_Sharer_LocalWithList(t *testing.T) {
 	s, _ := newTestMshrStage(false)
 
@@ -151,8 +153,9 @@ func TestInsertDemotion_Sharer_LocalWithList(t *testing.T) {
 }
 
 // Case 3: fromLocal=false with empty invalidationList
-//   trigger sub-entry → Sharer == [owner]
-//   non-trigger sub-entries → Sharer length 0, IsValid=true
+//
+//	trigger sub-entry → Sharer == [owner]
+//	non-trigger sub-entries → Sharer length 0, IsValid=true
 func TestInsertDemotion_Sharer_RemoteEmptyList(t *testing.T) {
 	s, _ := newTestMshrStage(false)
 
@@ -190,9 +193,10 @@ func TestInsertDemotion_Sharer_RemoteEmptyList(t *testing.T) {
 }
 
 // Case 4: invalidationList must not alias the produced Sharer slices.
-//   After insertDemotionEntry returns, mutating trans.invalidationList must
-//   leave every produced SubEntry.Sharer untouched. This guards the
-//   copiedSh := make+copy pattern at mshrstage.go:596-599.
+//
+//	After insertDemotionEntry returns, mutating trans.invalidationList must
+//	leave every produced SubEntry.Sharer untouched. This guards the
+//	copiedSh := make+copy pattern at mshrstage.go:596-599.
 func TestInsertDemotion_Sharer_NoAlias(t *testing.T) {
 	s, _ := newTestMshrStage(false)
 

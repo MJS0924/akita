@@ -85,7 +85,9 @@ func installEvictionTrans(
 		write:           write,
 		pendingEviction: []sim.RemotePort{sharer},
 	}
-	bs.inflightInvToOutside = append(bs.inflightInvToOutside, trans)
+	// [ORIGIN-SPLIT] register via the origin-routed helper (fromLocal=false
+	// here, so the trans lands in the Remote origin list).
+	bs.appendInflightInvToOutside(trans)
 
 	rsp := mem.InvRspBuilder{}.
 		WithRspTo(write.Meta().ID).
@@ -241,9 +243,9 @@ func TestUtilDemote_NoPromotionPathSideEffects(t *testing.T) {
 	}
 
 	// inflight cleared:
-	if len(bs.inflightInvToOutside) != 0 {
+	if bs.inflightInvToOutsideLen() != 0 {
 		t.Errorf("inflightInvToOutside should be drained, got len=%d",
-			len(bs.inflightInvToOutside))
+			bs.inflightInvToOutsideLen())
 	}
 	// no promotion-related routing:
 	if len(bs.sendToDirQue) != 0 {

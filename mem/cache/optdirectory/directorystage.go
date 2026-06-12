@@ -27,6 +27,19 @@ type directoryStage struct {
 	localBuf       sim.Buffer
 	remoteBuf      sim.Buffer
 
+	// [SD-REC PARITY Fix2 = REC ITER20 COMPLETION-VC] Skip-head side queue
+	// for the REMOTE dir plane only. A peer-incoming eviction/write-miss/
+	// inv-class trans stalled on REQUEST-path resources (remoteDirToBank
+	// buffers, MSHR, victim/block lock) used to strict-HoL-block every
+	// completion-bearing HIT behind it — the sole producer of the
+	// cross-GPU DataReadyRsp/WriteDoneRsp. Stalled, request-path-coupled
+	// heads are moved here so HITs behind them can reach
+	// remoteBottomSenderBufferData. Cap-neutral (items only ever MOVED
+	// from remoteBuf, bounded by its capacity); only address-DISJOINT
+	// heads (at coherence-unit granularity) are skipped so no same-unit
+	// operation is reordered.
+	remoteDeferredEvict []*transaction
+
 	returnFalse0 string
 	returnFalse1 string
 }
@@ -82,6 +95,9 @@ func (ds *directoryStage) Reset() {
 	ds.localBuf.Clear()
 	ds.remoteBuf.Clear()
 
+	// [COMPLETION-VC] drop deferred remote evictions on reset.
+	ds.remoteDeferredEvict = nil
+
 	ds.cache.localDirStageBuffer.Clear()
 	ds.cache.remoteDirStageBuffer.Clear()
 }
@@ -90,7 +106,11 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 	madeProgress := false
 	buf := ds.localBuf
 	if !isLocal {
-		buf = ds.remoteBuf
+		// [SD-REC PARITY Fix2 = REC ITER20 COMPLETION-VC] Remote plane uses
+		// the skip-head variant so a request-path-coupled eviction at the
+		// FIFO head cannot HoL-block a completion-bearing HIT behind it.
+		// Local plane keeps the original strict-FIFO semantics.
+		return ds.processRemoteTransaction()
 	}
 
 	for i := 0; i < ds.cache.numReqPerCycle; i++ {
@@ -136,6 +156,151 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 
 	if !madeProgress {
 		ds.returnFalse1 = "There is no transaction can be processed"
+	}
+
+	return madeProgress
+}
+
+// unitRegionID returns the address truncated to the coherence-unit span the
+// directory tracks (block + unit). Two addresses with different unit-region
+// IDs can never touch the same directory entry, so skipping past a deferred
+// item with a different ID is provably order-preserving.
+func (ds *directoryStage) unitRegionID(addr uint64) uint64 {
+	id, _ := getCacheLineID(addr, ds.cache.log2BlockSize+ds.cache.log2UnitSize)
+	return id
+}
+
+// deferredHasRegion reports whether any currently-deferred remote trans
+// targets the same coherence unit as addr. We must NOT skip a buffer item
+// past a deferred item that shares its unit, otherwise a later same-unit
+// request could be reordered ahead of an earlier eviction of that unit and
+// observe stale directory state.
+func (ds *directoryStage) deferredHasRegion(addr uint64) bool {
+	region := ds.unitRegionID(addr)
+	for _, t := range ds.remoteDeferredEvict {
+		if ds.unitRegionID(t.accessReq().GetAddress()) == region {
+			return true
+		}
+	}
+	return false
+}
+
+// isCompletionBearingHit is a SIDE-EFFECT-FREE classification of a remote
+// (peer-incoming) transaction, mirroring the read-only prefix of doWrite/
+// doWriteHit. It returns true when doWrite would resolve to the read-hit
+// fast-path (both Nothing and UpdateEntry branches push to BSBData here)
+// or the write-hit-full-permission fast-path — the cases that produce the
+// cross-GPU DataReadyRsp/WriteDoneRsp and stall only on their own forward
+// buffer, so skipping cannot help and the caller keeps strict ordering.
+// Everything else (miss, eviction, inv-class write-hit, MSHR-hit write) is
+// REQUEST-path-coupled and is what we defer. No directory state, MSHR, or
+// buffer is modified here.
+func (ds *directoryStage) isCompletionBearingHit(trans *transaction) bool {
+	req := trans.accessReq()
+	cachelineID, _ := getCacheLineID(
+		req.GetAddress(), ds.cache.log2BlockSize+ds.cache.log2UnitSize)
+
+	if mshrEntry := ds.cache.mshr.Query(req.GetPID(), cachelineID); mshrEntry != nil {
+		// Read MSHR-hit coalesces and never stalls; a write on an MSHR hit
+		// stalls without producing a completion.
+		return trans.write == nil
+	}
+
+	block := ds.cache.directory.Lookup(req.GetPID(), cachelineID)
+	if block == nil {
+		return false // miss -> doWriteMiss (request-path coupled)
+	}
+	if block.IsLocked || block.ReadCount > 0 {
+		return false
+	}
+
+	if trans.isReadTrans() {
+		// Both read-hit branches fast-path to BSBData in optdirectory.
+		return true
+	}
+
+	// Write-hit: only the full-permission branch (action Nothing) is a
+	// completion-bearing fast-path; otherwise it falls through to
+	// writeToBank (inv emission) -> defer-eligible.
+	return ds.writePermission(trans, block.Sharer)
+}
+
+// processRemoteTransaction is the skip-head variant of processTransaction
+// for the remote (peer-incoming) plane. Each Tick it first retries the
+// oldest deferred items in order, then scans remoteBuf; a request-path-
+// coupled head that stalls is moved into remoteDeferredEvict so a
+// completion-bearing HIT behind it can be reached. See remoteDeferredEvict
+// for the deadlock rationale and invariants.
+func (ds *directoryStage) processRemoteTransaction() bool {
+	madeProgress := false
+	buf := ds.remoteBuf
+
+	// 1. Retry deferred items first (oldest first, in order). Stop at the
+	//    first still-stalled item to preserve same-unit order among
+	//    deferred items.
+	for len(ds.remoteDeferredEvict) > 0 {
+		trans := ds.remoteDeferredEvict[0]
+		addr := trans.accessReq().GetAddress()
+		cacheLineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize)
+		if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
+			ds.cache.stallEvictingList++
+			break
+		}
+		if ds.doWrite(trans) {
+			ds.remoteDeferredEvict[0] = nil
+			ds.remoteDeferredEvict = ds.remoteDeferredEvict[1:]
+			madeProgress = true
+		} else {
+			break
+		}
+	}
+
+	// 2. Scan remoteBuf with skip-head over request-path-coupled stalls.
+	for i := 0; i < ds.cache.numReqPerCycle; i++ {
+		item := buf.Peek()
+		if item == nil {
+			break
+		}
+
+		trans := item.(dirPipelineItem).trans
+		addr := trans.accessReq().GetAddress()
+		cacheLineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize)
+
+		if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
+			ds.cache.stallEvictingList++
+			break
+		}
+
+		if ds.doWrite(trans) {
+			buf.Pop()
+			madeProgress = true
+			continue
+		}
+
+		// Head stalled. A completion-bearing HIT stalls only on its own
+		// forward buffer (skipping cannot help) -> keep strict order. A
+		// request-path-coupled item is deferred so a HIT behind it can
+		// run, but ONLY if address-disjoint from every deferred item and
+		// within the cap-neutral headroom.
+		if ds.isCompletionBearingHit(trans) {
+			break
+		}
+		if ds.deferredHasRegion(addr) {
+			break
+		}
+		if len(ds.remoteDeferredEvict) >= buf.Capacity() {
+			break
+		}
+
+		buf.Pop()
+		ds.remoteDeferredEvict = append(ds.remoteDeferredEvict, trans)
+		ds.cache.remoteHeadDeferred++
+		madeProgress = true
+		// continue scanning: the next head may be a completion-bearing HIT.
+	}
+
+	if !madeProgress {
+		ds.returnFalse1 = "There is no remote transaction can be processed"
 	}
 
 	return madeProgress

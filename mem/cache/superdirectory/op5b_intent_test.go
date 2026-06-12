@@ -21,6 +21,7 @@ import (
 //   - keeps entry.IsValid = true
 //   - keeps blk.IsValid = true
 //   - sets needToDemotion = false
+//
 // This matches REC paper §4.2 OP5b semantics for the writer-survives case.
 //
 // At a coarser bank (bankID < numBanks-1) with non-empty sharers,
@@ -28,6 +29,7 @@ import (
 //   - clears entry.Sharer entirely
 //   - sets entry.IsValid = false
 //   - sets needToDemotion = true
+//
 // This intentionally clobbers the writer's bit at the coarse-bank entry
 // because superdirectory will subsequently demote the entry to the
 // finer bank where the writer is recorded with full fidelity. The

@@ -17,7 +17,7 @@ type RegionSizeBuffer struct {
 // numEntries는 전체 카운터 배열의 크기(m)입니다.
 func NewRegionSizeBuffer(numEntries uint64, pageSize uint64, regionLen []int, disabled bool) *RegionSizeBuffer {
 	return &RegionSizeBuffer{
-		numEntries:   numEntries,
+		numEntries: numEntries,
 		// Empty slice (cap=numEntries). Previously initialized with length=
 		// numEntries which left numEntries dummy zero-valued entries
 		// (Addr=0, RegionID=0) — these spuriously matched Search queries to

@@ -45,8 +45,15 @@ type bottomSender struct {
 	localInflightBypassRequest []*transaction
 	remoteInflightRequest      []*transaction
 
-	inflightInvToOutside []*transaction
-	inflightInvToBottom  []*invTrans
+	// [SD-REC PARITY Fix4 = REC ORIGIN-SPLIT] inflightInvToOutside
+	// partitioned by ORIGIN (trans.fromLocal) so an own-origin inv storm
+	// (eviction/promotion-driven region unrolls) cannot monopolize the
+	// shared maxInflightInvalidation budget and starve peer-serve
+	// invalidations, and vice versa. Combined occupancy stays hard-bounded
+	// by maxInflightInvalidation (no net cap increase).
+	inflightInvToOutsideOwn    []*transaction
+	inflightInvToOutsideRemote []*transaction
+	inflightInvToBottom        []*invTrans
 
 	// Split pendingWriteAfterInv by trans.fromLocal direction so
 	// processPendingWriteAfterInv doesn't head-of-line stall when the
@@ -516,7 +523,7 @@ func (bs *bottomSender) sendInvalidationRequest(
 		return false
 	}
 
-	if bs.tooManyInflightInvalidation() {
+	if bs.tooManyInflightInvalidation(trans.fromLocal) {
 		bs.cache.stallInflightInv++
 		return false
 	}
@@ -574,10 +581,10 @@ func (bs *bottomSender) sendInvalidationRequest(
 
 	// 3. 무효화 대상이 있을 때만 Inflight 큐에 등록하고 메시지 생성
 	if hasValidTargets {
-		// (참고: superdirectory의 findTransactionByID는 반환값이 1개(int)이므로 i만 받습니다)
-		i := bs.findInvTransactionByID(trans.accessReq().Meta().ID, bs.inflightInvToOutside)
-		if i == -1 {
-			bs.inflightInvToOutside = append(bs.inflightInvToOutside, trans)
+		// [ORIGIN-SPLIT] duplicate guard across BOTH origin lists; register
+		// into the list matching trans.fromLocal.
+		if !bs.inflightInvToOutsideContains(trans.accessReq().Meta().ID) {
+			bs.appendInflightInvToOutside(trans)
 			progress = true
 		}
 
@@ -679,7 +686,7 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 	}
 
 	// 1. Inflight Invalidation 제한 검사
-	if bs.tooManyInflightInvalidation() {
+	if bs.tooManyInflightInvalidation(trans.fromLocal) {
 		bs.cache.stallInflightInv++
 		return false
 	}
@@ -697,8 +704,8 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 
 	progress := false
 
-	i := bs.findInvTransactionByID(trans.accessReq().Meta().ID, bs.inflightInvToOutside)
-	if i == -1 {
+	// [ORIGIN-SPLIT] duplicate guard across BOTH origin lists.
+	if !bs.inflightInvToOutsideContains(trans.accessReq().Meta().ID) {
 		// [핵심 변경 2] 자원이 꽉 차서 Demoted Entry 생성에 실패하면 즉시 조기 리턴.
 		// false를 반환하므로 processInputReq에서 Pop() 되지 않고, 다음 Tick에 재시도합니다.
 		// if !bs.insertDemotedEntry(trans) {
@@ -706,8 +713,9 @@ func (bs *bottomSender) sendInvalidationRequestByWrite(
 		// }
 
 		// (이전 답변의 좀비 트랜잭션 방지 로직: 타겟이 있을 때만 Inflight 큐에 넣음)
+		// [ORIGIN-SPLIT] register into the list matching trans.fromLocal.
 		if len(validTargets) > 0 {
-			bs.inflightInvToOutside = append(bs.inflightInvToOutside, trans)
+			bs.appendInflightInvToOutside(trans)
 		}
 		progress = true
 	}
@@ -1201,12 +1209,13 @@ func (bs *bottomSender) processInvalidationRsp() bool {
 func (bs *bottomSender) processInvRsp(rsp *mem.InvRsp) bool {
 	// fmt.Printf("[%s.BS]\tF.0. Process InvRsp: rspTo %s, SrcRDMA %s\n", bs.cache.Name(), rsp.RespondTo, rsp.SrcRDMA)
 
-	i := bs.findInvTransactionByID(rsp.RespondTo, bs.inflightInvToOutside)
+	// [ORIGIN-SPLIT] search BOTH origin lists for the matching inv-inflight.
+	list, i := bs.findInflightInvToOutsideByID(rsp.RespondTo)
 	if i == -1 {
 		// fmt.Printf("[%s]\tF. Cannot find transaction for InvRsp with RspTo %s\n", bs.cache.Name(), rsp.RespondTo)
 		return true
 	}
-	trans := bs.inflightInvToOutside[i]
+	trans := (*list)[i]
 
 	for j, sh := range trans.pendingEviction {
 		// fmt.Printf("[%s]\tF.1.0. Check pending eviction: %s\n", bs.cache.Name(), sh)
@@ -1226,7 +1235,7 @@ func (bs *bottomSender) processInvRsp(rsp *mem.InvRsp) bool {
 
 	// [수정] 대기 목록이 비워지면 안전한 헬퍼 함수를 사용하여 Inflight에서 트랜잭션 제거
 	if len(trans.pendingEviction) == 0 {
-		bs.removeInflightInvToOutside(i)
+		bs.removeInflightInvToOutsideFrom(list, i)
 		// fmt.Printf("[%s]\tF.2. Remove inflight invalidation to outside\n", bs.cache.Name())
 
 		// superdirectory 고유 로직 유지: eviction에 의한 invalidation은 사용량을 보고 demotion 여부 결정
@@ -1499,8 +1508,24 @@ func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
 	return false
 }
 
-func (bs *bottomSender) tooManyInflightInvalidation() bool {
-	return len(bs.inflightInvToOutside) >= bs.maxInflightInvalidation
+// tooManyInflightInvalidation gates an outbound invalidation admit by ORIGIN
+// against the shared maxInflightInvalidation budget, using the same
+// asymmetric soft-cap pattern as tooManyInflightRequest: own-origin
+// (fromLocal=true) is held to max - max/4 so a local eviction/promotion
+// inv-storm always leaves the reserve free for peer-serve (fromLocal=false)
+// invalidations, which may use the full cap. The total occupancy (both
+// lists) is still hard-bounded by maxInflightInvalidation.
+// [SD-REC PARITY Fix4 = REC ORIGIN-SPLIT]
+func (bs *bottomSender) tooManyInflightInvalidation(fromLocal bool) bool {
+	total := bs.inflightInvToOutsideLen()
+	if total >= bs.maxInflightInvalidation {
+		return true
+	}
+	if fromLocal {
+		localLimit := bs.maxInflightInvalidation - bs.maxInflightInvalidation/4
+		return len(bs.inflightInvToOutsideOwn) >= localLimit
+	}
+	return false
 }
 
 func (bs *bottomSender) tooManyInflightInvalidationToBottom() bool {
@@ -1519,7 +1544,9 @@ func (bs *bottomSender) Reset() {
 	bs.remoteInflightRequest = nil
 
 	bs.inflightInvToBottom = nil
-	bs.inflightInvToOutside = nil
+	// [ORIGIN-SPLIT] clear both inv-inflight origin lists.
+	bs.inflightInvToOutsideOwn = nil
+	bs.inflightInvToOutsideRemote = nil
 	bs.pendingLocalWriteAfterInv = nil
 	bs.pendingRemoteWriteAfterInv = nil
 	// [ITER18 F4/D7] clear typed sub-queues + peer counter (F5b).
@@ -1622,16 +1649,55 @@ func (bs *bottomSender) removeInflightBypassRequest(i int) {
 	bs.localInflightBypassRequest = bs.localInflightBypassRequest[:len(bs.localInflightBypassRequest)-1]
 }
 
-// [추가] 외부 무효화 리스트에서 트랜잭션을 안전하게 삭제하는 헬퍼 함수
-func (bs *bottomSender) removeInflightInvToOutside(i int) {
-	if i < 0 || i >= len(bs.inflightInvToOutside) {
+// [SD-REC PARITY Fix4 = REC ORIGIN-SPLIT] helpers over the two ORIGIN
+// inv-inflight lists.
+
+// inflightInvToOutsideLen reports the combined depth of the two ORIGIN
+// inv-inflight lists.
+func (bs *bottomSender) inflightInvToOutsideLen() int {
+	return len(bs.inflightInvToOutsideOwn) + len(bs.inflightInvToOutsideRemote)
+}
+
+// inflightInvToOutsideContains reports whether either ORIGIN list already
+// holds an inv-inflight transaction with the given access-req ID (the
+// duplicate guard the append sites used to express via
+// findInvTransactionByID == -1).
+func (bs *bottomSender) inflightInvToOutsideContains(ID string) bool {
+	if bs.findInvTransactionByID(ID, bs.inflightInvToOutsideOwn) != -1 {
+		return true
+	}
+	return bs.findInvTransactionByID(ID, bs.inflightInvToOutsideRemote) != -1
+}
+
+// appendInflightInvToOutside registers an inv-inflight transaction into the
+// list matching its ORIGIN (trans.fromLocal).
+func (bs *bottomSender) appendInflightInvToOutside(trans *transaction) {
+	if trans.fromLocal {
+		bs.inflightInvToOutsideOwn = append(bs.inflightInvToOutsideOwn, trans)
+	} else {
+		bs.inflightInvToOutsideRemote = append(bs.inflightInvToOutsideRemote, trans)
+	}
+}
+
+// findInflightInvToOutsideByID searches BOTH ORIGIN lists for a transaction
+// matching the response's RespondTo ID, returning the owning slice pointer
+// and the index, or (nil, -1) if not found.
+func (bs *bottomSender) findInflightInvToOutsideByID(ID string) (*[]*transaction, int) {
+	if i := bs.findInvTransactionByID(ID, bs.inflightInvToOutsideOwn); i != -1 {
+		return &bs.inflightInvToOutsideOwn, i
+	}
+	if i := bs.findInvTransactionByID(ID, bs.inflightInvToOutsideRemote); i != -1 {
+		return &bs.inflightInvToOutsideRemote, i
+	}
+	return nil, -1
+}
+
+// removeInflightInvToOutsideFrom removes index i from the given ORIGIN list.
+func (bs *bottomSender) removeInflightInvToOutsideFrom(list *[]*transaction, i int) {
+	if i < 0 || i >= len(*list) {
 		panic(fmt.Sprintf("Trying to remove inflightInvToOutside at out of bounds index %d", i))
 	}
-
-	// 뒤의 원소들을 앞으로 당김
-	copy(bs.inflightInvToOutside[i:], bs.inflightInvToOutside[i+1:])
-	// 마지막 원소 포인터 명시적 해제 (메모리 누수 방지)
-	bs.inflightInvToOutside[len(bs.inflightInvToOutside)-1] = nil
-	// 슬라이스 길이 축소
-	bs.inflightInvToOutside = bs.inflightInvToOutside[:len(bs.inflightInvToOutside)-1]
+	copy((*list)[i:], (*list)[i+1:])
+	(*list)[len(*list)-1] = nil
+	*list = (*list)[:len(*list)-1]
 }

@@ -62,7 +62,7 @@ func (f *flusher) existInflightTransaction() bool {
 		return true
 	}
 
-	if len(f.cache.bottomSender.inflightInvToOutside) > 0 {
+	if f.cache.bottomSender.inflightInvToOutsideLen() > 0 {
 		return true
 	}
 
@@ -269,7 +269,20 @@ func (f *flusher) flushCompleted() bool {
 	// [수정] 양방향 Inflight Request 리스트 확인
 	if len(f.cache.bottomSender.localInflightRequest) > 0 ||
 		len(f.cache.bottomSender.remoteInflightRequest) > 0 ||
-		len(f.cache.bottomSender.inflightInvToOutside) > 0 {
+		f.cache.bottomSender.inflightInvToOutsideLen() > 0 ||
+		len(f.cache.bottomSender.inflightInvToBottom) > 0 {
+		return false
+	}
+
+	// [SD-REC PARITY Fix3 = REC ITER19b R3] Egress typed queues must all
+	// drain before declaring flush done. Each queue can hold messages that
+	// haven't moved to the port yet; a flush completion that misses them
+	// would silently drop them at the kernel boundary.
+	if len(f.cache.bottomSender.sendToBottomQue) > 0 ||
+		len(f.cache.bottomSender.remoteSendToBottomQue) > 0 ||
+		len(f.cache.bottomSender.invRemoteSendToBottomQue) > 0 ||
+		len(f.cache.bottomSender.sendToRDMAInvQue) > 0 ||
+		len(f.cache.bottomSender.sendToRDMAInvRspQue) > 0 {
 		return false
 	}
 

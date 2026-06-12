@@ -23,9 +23,9 @@ func (m *mockSuperDirectory) InsertBloomfilter(regionID int, addr uint64) {
 	m.insertedRegion = append(m.insertedRegion, regionID)
 	m.insertedAddr = append(m.insertedAddr, addr)
 }
-func (m *mockSuperDirectory) Visit(_ int, _ *internal.CohEntry)            {}
-func (m *mockSuperDirectory) EvictBloomfilter(_ int, _ uint64)             {}
-func (m *mockSuperDirectory) Reset()                                       {}
+func (m *mockSuperDirectory) Visit(_ int, _ *internal.CohEntry) {}
+func (m *mockSuperDirectory) EvictBloomfilter(_ int, _ uint64)  {}
+func (m *mockSuperDirectory) Reset()                            {}
 func (m *mockSuperDirectory) Lookup(_ int, _ vm.PID, _ uint64) (*internal.CohEntry, int) {
 	panic("not implemented")
 }
@@ -42,12 +42,12 @@ func (m *mockSuperDirectory) FindVictimPreferPromotable(_ int, _ vm.PID, _ uint6
 func (m *mockSuperDirectory) FindVictimPreferStrictlyPromotable(_ int, _ vm.PID, _ uint64) (*internal.CohEntry, bool) {
 	panic("not implemented")
 }
-func (m *mockSuperDirectory) TotalSize() uint64  { panic("not implemented") }
-func (m *mockSuperDirectory) WayAssociativity() int { panic("not implemented") }
-func (m *mockSuperDirectory) GetRegionLen(_ int) int { panic("not implemented") }
+func (m *mockSuperDirectory) TotalSize() uint64                       { panic("not implemented") }
+func (m *mockSuperDirectory) WayAssociativity() int                   { panic("not implemented") }
+func (m *mockSuperDirectory) GetRegionLen(_ int) int                  { panic("not implemented") }
 func (m *mockSuperDirectory) SampleCBFForAllBanks(_ vm.PID, _ uint64) {}
-func (m *mockSuperDirectory) CBFStats() []internal.CBFBankStats        { return nil }
-func (m *mockSuperDirectory) HasCBF(_ int) bool                        { return false }
+func (m *mockSuperDirectory) CBFStats() []internal.CBFBankStats       { return nil }
+func (m *mockSuperDirectory) HasCBF(_ int) bool                       { return false }
 
 // ─── mock MSHR ────────────────────────────────────────────────────────────────
 
@@ -57,7 +57,7 @@ func (m *mockMSHR) IsFull() bool { return false }
 func (m *mockMSHR) Add(_ vm.PID, _ uint64, _ uint64, _ int) *internal.MSHREntry {
 	return internal.NewMSHREntry()
 }
-func (m *mockMSHR) Query(_ vm.PID, _ uint64) *internal.MSHREntry          { return nil }
+func (m *mockMSHR) Query(_ vm.PID, _ uint64) *internal.MSHREntry { return nil }
 func (m *mockMSHR) QueryWithMask(_ vm.PID, _ uint64, _ uint64) []*internal.MSHREntry {
 	return nil
 }

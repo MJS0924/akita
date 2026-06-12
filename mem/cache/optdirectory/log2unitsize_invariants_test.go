@@ -320,7 +320,7 @@ func TestSendToBottom_InvEgressDrainsBeforeRemoteFetch(t *testing.T) {
 
 	// The fetch lost the CanSend race and must register a port-busy stall.
 	if c.stallBottomPortBusy == 0 {
-		t.Fatalf("stallBottomPortBusy should have been incremented "+
+		t.Fatalf("stallBottomPortBusy should have been incremented " +
 			"for the blocked remote-fetch")
 	}
 }
@@ -354,7 +354,7 @@ func newWriteReq(addr uint64, pid vm.PID) *mem.WriteReq {
 type fakePort struct {
 	sim.HookableBase
 	name       string
-	sendBudget int     // CanSend returns true while > 0; Send decrements it
+	sendBudget int // CanSend returns true while > 0; Send decrements it
 	sent       []sim.Msg
 }
 
@@ -373,13 +373,13 @@ func (p *fakePort) Send(msg sim.Msg) *sim.SendError {
 }
 
 // Stubs — never reached by the tests in this file.
-func (p *fakePort) SetConnection(sim.Connection)         {}
-func (p *fakePort) Component() sim.Component             { return nil }
-func (p *fakePort) Deliver(sim.Msg) *sim.SendError       { return nil }
-func (p *fakePort) NotifyAvailable()                     {}
-func (p *fakePort) RetrieveOutgoing() sim.Msg            { return nil }
-func (p *fakePort) PeekOutgoing() sim.Msg                { return nil }
-func (p *fakePort) RetrieveIncoming() sim.Msg            { return nil }
-func (p *fakePort) PeekIncoming() sim.Msg                { return nil }
-func (p *fakePort) GetIncomingBuf() sim.Buffer           { return nil }
-func (p *fakePort) GetOutgoingBuf() sim.Buffer           { return nil }
+func (p *fakePort) SetConnection(sim.Connection)   {}
+func (p *fakePort) Component() sim.Component       { return nil }
+func (p *fakePort) Deliver(sim.Msg) *sim.SendError { return nil }
+func (p *fakePort) NotifyAvailable()               {}
+func (p *fakePort) RetrieveOutgoing() sim.Msg      { return nil }
+func (p *fakePort) PeekOutgoing() sim.Msg          { return nil }
+func (p *fakePort) RetrieveIncoming() sim.Msg      { return nil }
+func (p *fakePort) PeekIncoming() sim.Msg          { return nil }
+func (p *fakePort) GetIncomingBuf() sim.Buffer     { return nil }
+func (p *fakePort) GetOutgoingBuf() sim.Buffer     { return nil }

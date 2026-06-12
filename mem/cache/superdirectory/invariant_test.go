@@ -267,7 +267,7 @@ func TestInvariant_BankList_RedirectsOnMSHRConflict(t *testing.T) {
 	ds.returnFalse = &ds.returnFalse0
 
 	trans := &transaction{
-		bankID:   2,         // starting bank (its mask=10 misses the 4KB-apart entry)
+		bankID:   2, // starting bank (its mask=10 misses the 4KB-apart entry)
 		bankList: []int{3, 4},
 		read:     mem.ReadReqBuilder{}.WithAddress(testAddr).WithByteSize(64).WithPID(vm.PID(1)).Build(),
 		write:    nil,

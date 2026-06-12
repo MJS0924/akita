@@ -29,6 +29,22 @@ type directoryStage struct {
 	motionPipeline []pipelining.Pipeline
 	motionBuf      []sim.Buffer
 
+	// [SD-REC PARITY Fix2 = REC ITER20 COMPLETION-VC] Skip-head side queue
+	// for the REMOTE dir plane only. processTransaction(isLocal=false)
+	// used to break on any stalled per-bank head: a peer-incoming
+	// eviction/write-miss/inv-class trans stalled on REQUEST-path
+	// resources (remoteDirToBankBuffers, MSHR, victim/sub-entry lock)
+	// then strict-HoL-blocked every completion-bearing HIT behind it in
+	// the same bank — the sole producer of the cross-GPU DataReadyRsp/
+	// WriteDoneRsp that frees the peer's eviction caps. Stalled,
+	// request-path-coupled heads are moved here so HITs behind them can
+	// reach remoteBottomSenderBufferData. Cap-neutral: items are only
+	// ever MOVED from a remoteBuf (never duplicated) and the queue is
+	// bounded by the combined remoteBuf capacity; only address-DISJOINT
+	// heads (at the coarsest region span) are skipped so no same-region
+	// operation is reordered.
+	remoteDeferredEvict []*transaction
+
 	returnFalse0 string
 	returnFalse1 string
 	returnFalse  *string
@@ -211,6 +227,9 @@ func (ds *directoryStage) Reset() {
 	ds.cache.localDirStageBuffer.Clear()
 	ds.cache.remoteDirStageBuffer.Clear()
 
+	// [COMPLETION-VC] drop deferred remote evictions on reset.
+	ds.remoteDeferredEvict = nil
+
 	if ds.cache.dirStageMotionBuffer != nil {
 		ds.cache.dirStageMotionBuffer.Clear()
 	}
@@ -221,8 +240,12 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 	buf := ds.localBuf
 	ds.returnFalse = &ds.returnFalse0
 	if !isLocal {
-		buf = ds.remoteBuf
-		ds.returnFalse = &ds.returnFalse1
+		// [SD-REC PARITY Fix2 = REC ITER20 COMPLETION-VC] Remote plane uses
+		// the skip-head variant so a request-path-coupled eviction at a
+		// bank's FIFO head cannot HoL-block a completion-bearing HIT behind
+		// it. Local plane keeps the original strict-FIFO semantics (no
+		// cross-GPU completion cycle on the local plane).
+		return ds.processRemoteTransaction()
 	}
 	*ds.returnFalse = ""
 
@@ -250,6 +273,192 @@ func (ds *directoryStage) processTransaction(isLocal bool) bool {
 			} else {
 				break // 처리가 막히면 해당 Bank의 루프 중단
 			}
+		}
+	}
+
+	if madeProgress {
+		*ds.returnFalse = ""
+	}
+	return madeProgress
+}
+
+// coarsestRegionID returns the address truncated to the COARSEST region
+// span any bank tracks (max regionLen + sub-entry span). Used as the
+// address-disjointness key for the COMPLETION-VC skip: two addresses with
+// different coarsest-region IDs can never touch the same directory entry
+// in ANY bank (including after a bankList redirect), so skipping past a
+// deferred item with a different ID is provably order-preserving.
+func (ds *directoryStage) coarsestRegionID(addr uint64) uint64 {
+	maxRegionLen := 0
+	for _, rl := range ds.cache.regionLen {
+		if rl > maxRegionLen {
+			maxRegionLen = rl
+		}
+	}
+	span := uint64(maxRegionLen + ds.cache.log2NumSubEntry)
+	id, _ := getCacheLineID(addr, span)
+	return id
+}
+
+// deferredHasRegion reports whether any currently-deferred remote trans
+// targets the same coarsest region as addr. We must NOT skip a buffer item
+// past a deferred item that shares its region, otherwise a later
+// same-region request could be reordered ahead of an earlier eviction of
+// that region and observe stale directory state.
+func (ds *directoryStage) deferredHasRegion(addr uint64) bool {
+	region := ds.coarsestRegionID(addr)
+	for _, t := range ds.remoteDeferredEvict {
+		if ds.coarsestRegionID(t.accessReq().GetAddress()) == region {
+			return true
+		}
+	}
+	return false
+}
+
+// remoteDeferredCap bounds the side queue at the combined capacity of the
+// per-bank remote post-pipeline buffers (cap-neutrality: the queue can
+// never hold more than the buffers it drains from could hold).
+func (ds *directoryStage) remoteDeferredCap() int {
+	cap := 0
+	for _, b := range ds.remoteBuf {
+		cap += b.Capacity()
+	}
+	return cap
+}
+
+// isCompletionBearingHit is a SIDE-EFFECT-FREE classification of a remote
+// (peer-incoming) transaction, mirroring the read-only prefix of doWrite/
+// doWriteHit for trans.bankID. It returns true when doWrite would resolve
+// to the read-hit (already-sharer) or write-hit-full-permission fast-path —
+// the cases that push to remoteBottomSenderBufferData and ultimately
+// produce the cross-GPU DataReadyRsp/WriteDoneRsp. Such a transaction
+// stalls only on its own forward buffer, so skipping it cannot help and
+// the caller keeps strict ordering for it. Everything else (miss,
+// eviction, inv-class write-hit, UpdateEntry via writeToBank, bankList
+// redirect, MSHR conflicts) is REQUEST-path-coupled and is what we defer.
+// No directory state, MSHR, or buffer is modified here.
+func (ds *directoryStage) isCompletionBearingHit(trans *transaction) bool {
+	bankID := trans.bankID
+	regionLen := ds.cache.regionLen[bankID]
+	req := trans.accessReq()
+	cachelineID, _ := getCacheLineID(req.GetAddress(), uint64(regionLen))
+
+	// Mirror doWrite's cross-granularity MSHR check (read-only).
+	var mshrEntry *internal.MSHREntry
+	for _, e := range ds.cache.mshr.QueryWithMask(
+		req.GetPID(), req.GetAddress(), uint64(regionLen)) {
+		if e.RegionLen < uint64(regionLen) {
+			return false // stalls on a finer in-flight entry: request-path
+		}
+		if mshrEntry == nil {
+			mshrEntry = e
+		}
+	}
+	if mshrEntry != nil {
+		// Read MSHR-hit coalesces and never stalls; a write on an MSHR hit
+		// stalls without producing a completion.
+		return trans.write == nil
+	}
+
+	block, index := ds.cache.directory.Lookup(bankID, req.GetPID(), cachelineID)
+	if block == nil || !block.SubEntry[index].IsValid {
+		return false // miss or redirect path: request-path coupled
+	}
+
+	subEntry := block.SubEntry[index]
+	if subEntry.IsLocked || subEntry.ReadCount > 0 {
+		return false
+	}
+
+	if trans.isReadTrans() && !trans.read.FetchForWriteMiss {
+		// Only the already-sharer branch fast-paths to BSBData; the
+		// new-sharer (UpdateEntry) branch goes through writeToBank.
+		return ds.readPermission(trans, subEntry.Sharer)
+	}
+
+	// Write-hit: only the full-permission branch (action Nothing) is a
+	// completion-bearing fast-path; otherwise it falls through to
+	// writeToBank (inv emission) -> defer-eligible.
+	return ds.writePermission(trans, subEntry.Sharer)
+}
+
+// processRemoteTransaction is the skip-head variant of processTransaction
+// for the remote (peer-incoming) plane. Each Tick it first retries the
+// oldest deferred items in order, then scans each bank's remoteBuf; a
+// request-path-coupled head that stalls is moved into remoteDeferredEvict
+// so a completion-bearing HIT behind it can be reached. See
+// remoteDeferredEvict for the deadlock rationale and invariants.
+func (ds *directoryStage) processRemoteTransaction() bool {
+	madeProgress := false
+	buf := ds.remoteBuf
+	ds.returnFalse = &ds.returnFalse1
+	*ds.returnFalse = ""
+
+	// 1. Retry deferred items first (oldest first, in order). Stop at the
+	//    first still-stalled item to preserve same-region order among
+	//    deferred items.
+	for len(ds.remoteDeferredEvict) > 0 {
+		trans := ds.remoteDeferredEvict[0]
+		addr := trans.accessReq().GetAddress()
+		cacheLineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize)
+		if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
+			ds.cache.stallEvictingList++
+			break
+		}
+		if ds.doWrite(trans, false) {
+			ds.remoteDeferredEvict[0] = nil
+			ds.remoteDeferredEvict = ds.remoteDeferredEvict[1:]
+			madeProgress = true
+		} else {
+			break
+		}
+	}
+
+	// 2. Scan each bank's remoteBuf with skip-head over request-path-
+	//    coupled stalls.
+	for bankID := range buf {
+		for i := 0; i < ds.cache.numReqPerCycle; i++ {
+			*ds.returnFalse += "."
+			item := buf[bankID].Peek()
+			if item == nil {
+				break
+			}
+
+			trans := item.(dirPipelineItem).trans
+			addr := trans.accessReq().GetAddress()
+			cacheLineID, _ := getCacheLineID(addr, ds.cache.log2BlockSize)
+
+			if _, evicting := ds.cache.evictingList[cacheLineID]; evicting {
+				ds.cache.stallEvictingList++
+				break
+			}
+
+			if ds.doWrite(trans, false) {
+				buf[bankID].Pop()
+				madeProgress = true
+				continue
+			}
+
+			// Head stalled. A completion-bearing HIT stalls only on its own
+			// forward buffer (skipping cannot help) -> keep strict order.
+			// A request-path-coupled item is deferred so a HIT behind it
+			// can run, but ONLY if address-disjoint from every deferred
+			// item and within the cap-neutral headroom.
+			if ds.isCompletionBearingHit(trans) {
+				break
+			}
+			if ds.deferredHasRegion(addr) {
+				break
+			}
+			if len(ds.remoteDeferredEvict) >= ds.remoteDeferredCap() {
+				break
+			}
+
+			buf[bankID].Pop()
+			ds.remoteDeferredEvict = append(ds.remoteDeferredEvict, trans)
+			ds.cache.incEvent("RemoteHeadDeferred")
+			madeProgress = true
+			// continue scanning: the next head may be a completion-bearing HIT.
 		}
 	}
 
@@ -1437,20 +1646,22 @@ type bankSelection struct {
 // GetBank returns banks finest-first ([0]=finest, [last]=coarsest).
 //
 // MSHR-aware redirect (single source of truth for in-flight motion):
-//   When any granularity's MSHR entry overlaps addr (probed with the coarsest
-//   regionLen so every granularity is visible), the routing decision is the
-//   entry's RegionID — overriding BF and RSB. Rationale: mshrStage atomically
-//   registers an MSHR entry at the motion's target bank the moment promotion
-//   or demotion is enqueued, even though the directory entry transition spans
-//   multiple cycles. Without this redirect, a new access during the motion
-//   window can land at a different bank and create a cross-granularity
-//   parallel entry — the exact invariant violation that surfaces as the
-//   "Hit about demotion" warning and the "finer MSHR overlaps coarser"
-//   stall. With the redirect, the new access joins the bank that already
-//   owns the in-flight entry; it either resolves as an MSHR hit when the
-//   motion completes, or stalls at that bank's doWrite check until then.
-//   No deadlock: motion completion always calls mshr.Remove, releasing
-//   the redirect; the redirected access holds no resources while waiting.
+//
+//	When any granularity's MSHR entry overlaps addr (probed with the coarsest
+//	regionLen so every granularity is visible), the routing decision is the
+//	entry's RegionID — overriding BF and RSB. Rationale: mshrStage atomically
+//	registers an MSHR entry at the motion's target bank the moment promotion
+//	or demotion is enqueued, even though the directory entry transition spans
+//	multiple cycles. Without this redirect, a new access during the motion
+//	window can land at a different bank and create a cross-granularity
+//	parallel entry — the exact invariant violation that surfaces as the
+//	"Hit about demotion" warning and the "finer MSHR overlaps coarser"
+//	stall. With the redirect, the new access joins the bank that already
+//	owns the in-flight entry; it either resolves as an MSHR hit when the
+//	motion completes, or stalls at that bank's doWrite check until then.
+//	No deadlock: motion completion always calls mshr.Remove, releasing
+//	the redirect; the redirected access holds no resources while waiting.
+//
 // aliasingMotionTarget returns the in-flight motion MSHR entry whose
 // target block at its RegionID would alias to (have the same Tag as)
 // addr's block at that bank — i.e., a future allocation for addr at the
@@ -1529,8 +1740,9 @@ func (ds *directoryStage) selectBank(pid vm.PID, addr uint64) bankSelection {
 }
 
 // lookupOrder builds the full per-access bank probe order:
-//   1) CBF-positive coarse banks (finest-first among CBF banks).
-//   2) The two finest non-CBF banks (numBanks-1 then numBanks-2).
+//  1. CBF-positive coarse banks (finest-first among CBF banks).
+//  2. The two finest non-CBF banks (numBanks-1 then numBanks-2).
+//
 // This is the user-visible ordering "CBF 양성 bank > Bank 4 > Bank 3".
 // When CBF is globally disabled, GetBank already returns finest-first across
 // every bank, so we just pass that through.

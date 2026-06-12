@@ -24,7 +24,7 @@ type testComp struct {
 	name string
 }
 
-func (c *testComp) Name() string              { return c.name }
+func (c *testComp) Name() string               { return c.name }
 func (c *testComp) InvokeHook(ctx sim.HookCtx) { c.HookableBase.InvokeHook(ctx) }
 
 func newTestComp(name string) *testComp {
