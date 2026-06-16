@@ -183,6 +183,21 @@ type Comp struct {
 	remoteHeadDeferred  uint64 // [SD-REC PARITY Fix2] COMPLETION-VC skip-head deferrals
 	totalDoWriteCalls   uint64 // every entry into doWrite (success+retry)
 
+	// [CD8 RESPONSE-TRACE] per-egress-site response stall counters, split from
+	// the lumped stallTopPortBusy. They reveal WHICH response lane cannot get a
+	// send credit at the deadlock. stallRemoteRspRDMABusy + stallRDMADataRspBusy
+	// both stall on RDMAPort, which is ALSO the inbound peer-REQUEST port: if
+	// these two rise together, RDMAPort is the response-starvation site (REC uses
+	// a dedicated RDMADataRspPort). stallInvRspOutBusy = InvRsp (slot-freeing)
+	// egress on its own dedicated port. stallInflightInvOwn/Remote split the
+	// inflightInvToOutside (256) cap stall by origin.
+	stallRemoteRspRDMABusy uint64 // sendRemoteRspToTop: RDMAPort.CanSend() false (write-evict WriteDoneRsp/DataReadyRsp)
+	stallTopRspBusy        uint64 // sendToTopRspQue → topPort full (local L1 rsp)
+	stallRDMADataRspBusy   uint64 // sendToRDMADataRspQue → RDMAPort full (peer data/write rsp)
+	stallInvRspOutBusy     uint64 // sendToRDMAInvRspQue → RDMAInvRspOutPort full (InvRsp)
+	stallInflightInvOwn    uint64 // cap stall, fromLocal=true
+	stallInflightInvRemote uint64 // cap stall, fromLocal=false (peer-serve)
+
 	// Queueing-delay accumulators (Method E2). See REC Comp for naming.
 	waitDirSum_bypass    sim.VTimeInSec
 	waitBottomSum_bypass sim.VTimeInSec
@@ -229,6 +244,12 @@ func (c *Comp) ActionCounts() map[string]uint64 {
 		"stall_inflight_inv":                   c.stallInflightInv,
 		"stall_bottom_port_busy":               c.stallBottomPortBusy,
 		"stall_top_port_busy":                  c.stallTopPortBusy,
+		"stall_remote_rsp_rdma_busy":           c.stallRemoteRspRDMABusy,
+		"stall_top_rsp_busy":                   c.stallTopRspBusy,
+		"stall_rdma_data_rsp_busy":             c.stallRDMADataRspBusy,
+		"stall_inv_rsp_out_busy":               c.stallInvRspOutBusy,
+		"stall_inflight_inv_own":               c.stallInflightInvOwn,
+		"stall_inflight_inv_remote":            c.stallInflightInvRemote,
 		"stall_inv_emit_peer":                  c.stallInvEmitPeer,
 		"inv_emitted_peer":                     c.invEmittedPeer,
 		"remote_head_deferred":                 c.remoteHeadDeferred,

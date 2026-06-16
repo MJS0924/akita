@@ -132,6 +132,12 @@ type Comp struct {
 	// the serve point (stuck upstream).
 	peerReadServedCount    uint64
 	peerReadServeFailCount uint64
+	// [PACKET-LOSS PROBE] WriteDoneRsp egress whose Send() error was previously
+	// IGNORED (bankstage/mshrstage). The transaction is already removed when the
+	// send is attempted, so a failed send LOSES the ack with no requeue. Non-zero
+	// ⇒ a lost write-completion. Pure observability (still no requeue).
+	peerWriteAckSendFail  uint64 // remoteTopPort.Send(WriteDoneRsp) returned an error
+	localWriteAckSendFail uint64 // topPort.Send(WriteDoneRsp) returned an error
 	stallMSHRTotalFull     uint64 // IsFull로 reject된 횟수 (모두에게 적용)
 	stallMSHRLocalCap      uint64 // local cap으로 reject된 횟수
 	stallMSHRRemoteCap     uint64 // [ORIGIN-SPLIT] remote(peer-serve) cap으로 reject된 횟수
@@ -401,7 +407,13 @@ func (c *Comp) enqueueInvDirtyFlush(block *internal.Block) bool {
 		evictingDirtyMask: dirtyMask,
 	}
 
-	if c.writeBufferBufferCanPush(true) {
+	// [CD8-DEADLOCK FIX] Admit to the dedicated acyclic LOCAL-DRAM reserve FIRST;
+	// only then the shared lanes (which a cross-GPU write-through pile can clog).
+	// The reserve guarantees this InvRsp-enabling writeback always has admit
+	// capacity, breaking the credit cycle without touching write ordering.
+	if c.writeBuffer.invDirtyFlushReserveCanPush() {
+		c.writeBuffer.invDirtyFlushReservePush(flushTrans)
+	} else if c.writeBufferBufferCanPush(true) {
 		c.writeBufferBufferPush(flushTrans, true)
 	} else if c.writeBuffer.deferFlushCanPush(true) {
 		c.writeBuffer.deferFlushPush(flushTrans)

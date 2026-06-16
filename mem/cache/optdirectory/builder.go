@@ -292,6 +292,13 @@ func (b Builder) Build(name string) *Comp {
 	middleware := &middleware{Comp: cache}
 	cache.AddMiddleware(middleware)
 
+	// [DEADLOCK DUMP] Print stuck invalidation addresses + awaited peers to
+	// stdout when the engine halts. RTM-independent (works after the monitor
+	// stops). Mirrors writebackcoh's stop-hook dump.
+	if se, ok := b.engine.(*sim.SerialEngine); ok {
+		se.RegisterStopHook(cache.DumpDeadlockState)
+	}
+
 	return cache
 }
 

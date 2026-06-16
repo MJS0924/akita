@@ -38,6 +38,11 @@ type Builder struct {
 	maxInflightEviction      int
 	maxOutgoingRemotePending int
 
+	// [CD8-DEADLOCK FIX] when false, the invDirtyFlushReserve is disabled
+	// (capacity 0) → original behavior (the CD_8 16KB cross-GPU deadlock
+	// reproduces). Default true (fixed). Toggled by the -cd8-deadlock-fix flag.
+	cd8DeadlockFix bool
+
 	cohDirLatency int
 	dirLatency    int
 	bankLatency   int
@@ -64,7 +69,15 @@ func MakeBuilder() Builder {
 		maxInflightFetch:        128,
 		maxInflightEviction:     128,
 		bankLatency:             10,
+		cd8DeadlockFix:          true, // [CD8-DEADLOCK FIX] default on (fixed)
 	}
+}
+
+// WithCD8DeadlockFix toggles the invDirtyFlushReserve. false reproduces the
+// original CD_8 16KB cross-GPU writeback deadlock; true (default) fixes it.
+func (b Builder) WithCD8DeadlockFix(on bool) Builder {
+	b.cd8DeadlockFix = on
+	return b
 }
 
 func (b Builder) WithDeviceID(id int) Builder {
@@ -400,6 +413,16 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		// [ORIGIN-SPLIT] deferFlushCanPush splits this into two halves
 		// (maxDeferredFlush/2 each), no net increase.
 		maxDeferredFlush: b.numReqPerCycle * 2,
+		// [CD8-DEADLOCK FIX] Dedicated reserve for invalidation-driven dirty
+		// victim writebacks (LOCAL DRAM, acyclic). Bounded by the local inflight
+		// ceiling so it can never grow unbounded; guarantees InvRsp emission
+		// forward progress when cross-GPU write-throughs clog the shared lanes.
+		maxInvDirtyFlushReserve: b.maxInflightEviction,
+	}
+	if !b.cd8DeadlockFix {
+		// [CD8-DEADLOCK FIX] flag off → disable the reserve → original behavior
+		// (the CD_8 16KB cross-GPU writeback deadlock reproduces).
+		cache.writeBuffer.maxInvDirtyFlushReserve = 0
 	}
 }
 

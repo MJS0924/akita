@@ -596,10 +596,14 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		Build()
 	if !trans.fromLocal {
 		done.Meta().Src = s.cache.remoteTopPort.AsRemote()
-		s.cache.remoteTopPort.Send(done)
+		if err := s.cache.remoteTopPort.Send(done); err != nil {
+			s.cache.peerWriteAckSendFail++ // [PACKET-LOSS PROBE] ack lost (no requeue)
+		}
 		s.cache.peerWriteAckSent++ // [ITER20 DIAG A]
 	} else {
-		s.cache.topPort.Send(done)
+		if err := s.cache.topPort.Send(done); err != nil {
+			s.cache.localWriteAckSendFail++ // [PACKET-LOSS PROBE] ack lost (no requeue)
+		}
 	}
 	// fmt.Printf("[%s]\tSend Write Done Response %x to %s for reqID %s\n", s.cache.name, write.Address, write.Src, write.ID)
 

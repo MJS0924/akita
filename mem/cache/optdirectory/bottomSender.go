@@ -147,13 +147,25 @@ func (bs *bottomSender) Tick() bool {
 
 	madeProgress := false
 
+	// [CD8-DEADLOCK FIX = REC ITER6 RESPONSE PRIORITY] Drain/send ALL responses
+	// BEFORE processing/sending new requests. A response must never be starved
+	// by request resource occupancy: the InvRsp that retires an
+	// inflightInvToOutside slot, and the Data/WriteDoneRsp that frees the peer
+	// L2 eviction credit, must always make progress regardless of request
+	// congestion — this breaks the cross-GPU closed wait cycle. CD previously
+	// processed requests first (processBypassReq) and sent responses LAST
+	// (sendToTop/sendRemoteRspToTop after sendToBottom), so under request
+	// saturation the slot/credit-freeing responses were starved → the CD_8 16KB
+	// cross-GPU deadlock. Now mirrors REC's bottomSender.Tick ordering.
 	temp := false
-	// [추가] Bypass 버퍼를 가장 먼저(또는 병렬로) 확인하여 빠른 처리 보장
-	temp = bs.processBypassReq()
+
+	// === RESPONSE PHASE: drain/send all responses first ===
+	temp = bs.sendBypassRspToTop()
 	madeProgress = madeProgress || temp
-	if bs.cache.printReturn {
-		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.0: %v\n", bs.cache.deviceID, temp)
-	}
+	temp = bs.sendRemoteRspToTop()
+	madeProgress = madeProgress || temp
+	temp = bs.sendToTop()
+	madeProgress = madeProgress || temp
 
 	temp = bs.processReturnRsp()
 	madeProgress = madeProgress || temp
@@ -161,19 +173,29 @@ func (bs *bottomSender) Tick() bool {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.1: %v\n", bs.cache.deviceID, temp)
 	}
 
+	temp = bs.processInvalidationRsp()
+	madeProgress = madeProgress || temp
+	if bs.cache.printReturn {
+		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.3: %v\n", bs.cache.deviceID, temp)
+	}
+
+	// === REQUEST PHASE: process new requests after responses ===
+	// processInputReq (peer-driven) before processBypassReq (local L1), mirroring
+	// REC's ITER14 ordering so peer-incoming trans make progress before local
+	// bypass eats sendToBottomQue capacity.
 	temp = bs.processInputReq()
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.2: %v\n", bs.cache.deviceID, temp)
 	}
 
-	temp = bs.processInvalidationReq()
+	temp = bs.processBypassReq()
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
-		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.3: %v\n", bs.cache.deviceID, temp)
+		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.0: %v\n", bs.cache.deviceID, temp)
 	}
 
-	temp = bs.processInvalidationRsp()
+	temp = bs.processInvalidationReq()
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.3: %v\n", bs.cache.deviceID, temp)
@@ -186,20 +208,6 @@ func (bs *bottomSender) Tick() bool {
 	madeProgress = madeProgress || temp
 	if bs.cache.printReturn {
 		fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.4: %v\n", bs.cache.deviceID, temp)
-	}
-
-	// [추가] 일반 응답보다 Bypass 응답을 최우선으로 전송 (우선순위 라우팅)
-	temp = bs.sendBypassRspToTop()
-	madeProgress = madeProgress || temp
-
-	// [FIX] Dst에 "RDMA"가 없는 remote 응답(write eviction 등)을 RDMAPort로 전송
-	temp = bs.sendRemoteRspToTop()
-	madeProgress = madeProgress || temp
-
-	temp = bs.sendToTop()
-	madeProgress = madeProgress || temp
-	if bs.cache.printReturn {
-		// fmt.Printf("[DEBUG CohDir %d]\treturn 1.3.5: %v\n", bs.cache.deviceID, temp)
 	}
 
 	return madeProgress
@@ -526,6 +534,13 @@ func (bs *bottomSender) sendInvalidationRequest(trans *transaction, isLocal bool
 
 	if bs.tooManyInflightInvalidation(trans.fromLocal) {
 		bs.cache.stallInflightInv++
+		// [CD8 RESPONSE-TRACE] which origin saturated the 256-slot cap; freed
+		// ONLY by an InvRsp (processInvRsp → removeInflightInvToOutsideFrom).
+		if trans.fromLocal {
+			bs.cache.stallInflightInvOwn++
+		} else {
+			bs.cache.stallInflightInvRemote++
+		}
 		return false
 	}
 
@@ -1057,7 +1072,9 @@ func (bs *bottomSender) sendRemoteRspToTop() bool {
 		return false
 	}
 	if !bs.cache.RDMAPort.CanSend() {
-		bs.cache.stallTopPortBusy++
+		// [CD8 RESPONSE-TRACE] write-evict WriteDoneRsp/DataReadyRsp blocked
+		// because RDMAPort (shared with inbound peer requests) can't send.
+		bs.cache.stallRemoteRspRDMABusy++
 		return false
 	}
 	msg := bs.sendToRemoteTopQue[0]
@@ -1074,10 +1091,10 @@ func (bs *bottomSender) sendRemoteRspToTop() bool {
 // [ITER18 F4/D7] Drain each typed sub-queue INDEPENDENTLY (mirrors REC iter17).
 func (bs *bottomSender) sendToTop() bool {
 	progress := false
-	if bs.drainOneTypedQueue(&bs.sendToTopRspQue, bs.cache.topPort) {
+	if bs.drainOneTypedQueue(&bs.sendToTopRspQue, bs.cache.topPort, &bs.cache.stallTopRspBusy) {
 		progress = true
 	}
-	if bs.drainOneTypedQueue(&bs.sendToRDMADataRspQue, bs.cache.RDMAPort) {
+	if bs.drainOneTypedQueue(&bs.sendToRDMADataRspQue, bs.cache.RDMAPort, &bs.cache.stallRDMADataRspBusy) {
 		progress = true
 	}
 	// [INV-FIDELITY C4] peer-lane InvReq drain honors maxInvEmitPerCycle.
@@ -1087,18 +1104,20 @@ func (bs *bottomSender) sendToTop() bool {
 	// S1 (ported from SD): drain outbound InvRsp via the dedicated egress
 	// port. Split from sendToRDMAInvQue removes HoL stall under outbound
 	// InvReq bursts and complies with RDMA's contract.
-	if bs.drainOneTypedQueue(&bs.sendToRDMAInvRspQue, bs.cache.RDMAInvRspOutPort) {
+	if bs.drainOneTypedQueue(&bs.sendToRDMAInvRspQue, bs.cache.RDMAInvRspOutPort, &bs.cache.stallInvRspOutBusy) {
 		progress = true
 	}
 	return progress
 }
 
-func (bs *bottomSender) drainOneTypedQueue(q *[]sim.Msg, port sim.Port) bool {
+// [CD8 RESPONSE-TRACE] stall *uint64 names the specific egress lane that could
+// not get a send credit, so a deadlock dump shows which response is starved.
+func (bs *bottomSender) drainOneTypedQueue(q *[]sim.Msg, port sim.Port, stall *uint64) bool {
 	if len(*q) == 0 {
 		return false
 	}
 	if !port.CanSend() {
-		bs.cache.stallTopPortBusy++
+		(*stall)++
 		return false
 	}
 	msg := (*q)[0]

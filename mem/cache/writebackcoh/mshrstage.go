@@ -143,10 +143,14 @@ func (s *mshrStage) respondWrite(write *mem.WriteReq, fromLocal bool) {
 		Build()
 	if !fromLocal {
 		writeDoneRsp.Src = s.cache.remoteTopPort.AsRemote()
-		s.cache.remoteTopPort.Send(writeDoneRsp)
+		if err := s.cache.remoteTopPort.Send(writeDoneRsp); err != nil {
+			s.cache.peerWriteAckSendFail++ // [PACKET-LOSS PROBE] ack lost (no requeue)
+		}
 		s.cache.peerWriteAckSent++ // [ITER20 DIAG A]
 	} else {
-		s.cache.topPort.Send(writeDoneRsp)
+		if err := s.cache.topPort.Send(writeDoneRsp); err != nil {
+			s.cache.localWriteAckSendFail++ // [PACKET-LOSS PROBE] ack lost (no requeue)
+		}
 	}
 	// fmt.Printf("[%s]\tSend Write Done Response %x to %s for reqID %s\n", s.cache.name, write.Address, write.Src, write.ID)
 

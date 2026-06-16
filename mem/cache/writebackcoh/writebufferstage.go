@@ -72,6 +72,19 @@ type writeBufferStage struct {
 	inflightFetch              []*transaction
 	inflightEviction           []*transaction
 
+	// [CD8-DEADLOCK FIX] Dedicated bounded admit reserve for INVALIDATION-DRIVEN
+	// dirty victim writebacks (enqueueInvDirtyFlush). These drain to LOCAL DRAM
+	// ONLY (acyclic: invBuf-head ← here ← bottomPort ← local DRAM, no cross-GPU /
+	// CohDir dependency), so a fixed reserve here can NEVER participate in a
+	// credit cycle. It exists solely so a saturated own-origin remote
+	// write-through pile (numRemoteInflEvictOwn at cap) clogging the shared
+	// writeBufferBuffer/deferredFlushOwn admit lanes can no longer block the
+	// InvRsp emission gated at directorystage.go:791. tryWriteOne(isLocal=true)
+	// drains this FIRST, ahead of pendingLocalEvictions. Bounded => no unbounded
+	// memory. Preserves write-completion ordering (the deferral is untouched).
+	invDirtyFlushReserve    []*transaction
+	maxInvDirtyFlushReserve int
+
 	// [RESPONSE-DECOUPLE] Bounded reordering buffer for displacement-flush
 	// transactions whose response (WriteDoneRsp/DataReadyRsp) has already been
 	// emitted but whose victim flush could not yet enter writeBufferBuffer
@@ -268,6 +281,18 @@ func (wb *writeBufferStage) deferFlushPush(trans *transaction) {
 	} else {
 		wb.deferredFlushPeer = append(wb.deferredFlushPeer, trans)
 	}
+}
+
+// [CD8-DEADLOCK FIX] invDirtyFlushReserve admit helpers. The reserve holds
+// invalidation-driven dirty victim writebacks (LOCAL-DRAM destination, acyclic);
+// tryWriteOne(isLocal=true) drains it FIRST so a saturated remote write-through
+// pile can never block InvRsp emission. Bounded by maxInvDirtyFlushReserve.
+func (wb *writeBufferStage) invDirtyFlushReserveCanPush() bool {
+	return len(wb.invDirtyFlushReserve) < wb.maxInvDirtyFlushReserve
+}
+
+func (wb *writeBufferStage) invDirtyFlushReservePush(trans *transaction) {
+	wb.invDirtyFlushReserve = append(wb.invDirtyFlushReserve, trans)
 }
 
 // drainDeferredFlush re-injects the head deferred flush into the normal
@@ -879,6 +904,13 @@ func (wb *writeBufferStage) processWriteBufferFlush(
 // head-of-line-block the peer-serve flush whose drain emits the freeing ACK.
 func (wb *writeBufferStage) tryWriteOne(isLocal bool) bool {
 	if isLocal {
+		// [CD8-DEADLOCK FIX] Drain the invalidation-driven dirty-flush reserve
+		// (LOCAL DRAM destination, acyclic) FIRST, ahead of pendingLocalEvictions,
+		// so an InvRsp-enabling writeback always makes forward progress even when
+		// the shared admit lanes are clogged by cross-GPU write-throughs.
+		if wb.tryWriteOneFrom(&wb.invDirtyFlushReserve, true) {
+			return true
+		}
 		return wb.tryWriteOneFrom(&wb.pendingLocalEvictions, true)
 	}
 	// Remote-destination: drain Peer origin first, then Own.
@@ -1409,6 +1441,7 @@ func (wb *writeBufferStage) Reset() {
 	wb.pendingLocalEvictions = nil
 	wb.pendingRemoteEvictionsOwn = nil
 	wb.pendingRemoteEvictionsPeer = nil
+	wb.invDirtyFlushReserve = nil // [CD8-DEADLOCK FIX]
 	wb.inflightFetch = nil
 	wb.inflightEviction = nil
 	// [RESPONSE-DECOUPLE] [ORIGIN-SPLIT] reset both deferred-flush origin halves.

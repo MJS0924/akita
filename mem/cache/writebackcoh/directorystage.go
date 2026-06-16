@@ -789,6 +789,7 @@ func (ds *directoryStage) doInvalidation(trans *transaction) bool {
 	needDirtyFlush := !deferred && mshrEntry == nil && block != nil &&
 		block.IsValid && block.IsDirty
 	if needDirtyFlush &&
+		!ds.cache.writeBuffer.invDirtyFlushReserveCanPush() && // [CD8-DEADLOCK FIX]
 		!ds.cache.writeBufferBufferCanPush(true) &&
 		!ds.cache.writeBuffer.deferFlushCanPush(true) {
 		ds.cache.incEvent("InvDirtyWritebackStall")
