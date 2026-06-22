@@ -85,6 +85,24 @@ type writeBufferStage struct {
 	invDirtyFlushReserve    []*transaction
 	maxInvDirtyFlushReserve int
 
+	// [SD-ACK-RESERVE] Dedicated bounded placement reserve for the
+	// displacement victim of an INCOMING PEER WRITE (fromLocal=false,
+	// writeToHomeNode). finalizeWriteHit/finalizeBankWriteFetched emit the
+	// peer WriteDoneRsp the instant that victim is PLACED (RESPONSE-DECOUPLE),
+	// not drained — but the ack is gated on placing it into
+	// writeBufferBufferRemote (cap=numReqPerCycle) OR deferredFlushPeer
+	// (cap=numReqPerCycle), both tiny and shared with bulk peer-bypass work.
+	// Under a fine-granularity (e.g. SD 9-bank) invalidation flood both fill,
+	// so the ack is never emitted, so the remote sender's numRemoteInflEvictOwn
+	// credit stays pinned -> 4-GPU symmetric cross-GPU eviction-credit deadlock.
+	// This reserve is a THIRD placement lane consumed ONLY by that peer-ack
+	// victim (own/bulk work can never occupy it), so the ack can ALWAYS leave,
+	// freeing the remote credit and unjamming the cycle. The parked victim
+	// drains via tryWriteOne (routed by its own destination). Bounded => no
+	// unbounded memory. Disabled (cap 0) unless -sd-ack-reserve is set.
+	ackDisplaceReserve    []*transaction
+	maxAckDisplaceReserve int
+
 	// [RESPONSE-DECOUPLE] Bounded reordering buffer for displacement-flush
 	// transactions whose response (WriteDoneRsp/DataReadyRsp) has already been
 	// emitted but whose victim flush could not yet enter writeBufferBuffer
@@ -293,6 +311,20 @@ func (wb *writeBufferStage) invDirtyFlushReserveCanPush() bool {
 
 func (wb *writeBufferStage) invDirtyFlushReservePush(trans *transaction) {
 	wb.invDirtyFlushReserve = append(wb.invDirtyFlushReserve, trans)
+}
+
+// [SD-ACK-RESERVE] ackDisplaceReserve helpers. The reserve holds the
+// displacement victim of an incoming peer write so its WriteDoneRsp can always
+// be emitted. CanPush is gated by maxAckDisplaceReserve (0 => disabled). Push
+// is only ever called for a peer-incoming (fromLocal=false) victim that could
+// not enter writeBufferBufferRemote/deferredFlushPeer.
+func (wb *writeBufferStage) ackDisplaceReserveCanPush() bool {
+	return wb.maxAckDisplaceReserve > 0 &&
+		len(wb.ackDisplaceReserve) < wb.maxAckDisplaceReserve
+}
+
+func (wb *writeBufferStage) ackDisplaceReservePush(trans *transaction) {
+	wb.ackDisplaceReserve = append(wb.ackDisplaceReserve, trans)
 }
 
 // drainDeferredFlush re-injects the head deferred flush into the normal
@@ -903,6 +935,16 @@ func (wb *writeBufferStage) processWriteBufferFlush(
 // Peer-FIRST in write() so a pile of own remote evictions cannot
 // head-of-line-block the peer-serve flush whose drain emits the freeing ACK.
 func (wb *writeBufferStage) tryWriteOne(isLocal bool) bool {
+	// [SD-ACK-RESERVE] Drain the peer-ack displacement-victim reserve FIRST,
+	// in whichever destination lane (local DRAM vs remote RDMA) the head belongs
+	// to. The ack for each already left when the victim was placed; draining
+	// here frees the reserve slot and writes the victim back.
+	if len(wb.ackDisplaceReserve) > 0 &&
+		wb.cache.toLocal(wb.ackDisplaceReserve[0].evictingAddr) == isLocal {
+		if wb.tryWriteOneFrom(&wb.ackDisplaceReserve, isLocal) {
+			return true
+		}
+	}
 	if isLocal {
 		// [CD8-DEADLOCK FIX] Drain the invalidation-driven dirty-flush reserve
 		// (LOCAL DRAM destination, acyclic) FIRST, ahead of pendingLocalEvictions,
@@ -1442,6 +1484,7 @@ func (wb *writeBufferStage) Reset() {
 	wb.pendingRemoteEvictionsOwn = nil
 	wb.pendingRemoteEvictionsPeer = nil
 	wb.invDirtyFlushReserve = nil // [CD8-DEADLOCK FIX]
+	wb.ackDisplaceReserve = nil   // [SD-ACK-RESERVE]
 	wb.inflightFetch = nil
 	wb.inflightEviction = nil
 	// [RESPONSE-DECOUPLE] [ORIGIN-SPLIT] reset both deferred-flush origin halves.

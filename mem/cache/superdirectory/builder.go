@@ -42,12 +42,13 @@ type Builder struct {
 	numBanks            int
 	numSetsPerBank      []int // optional explicit per-bank set counts
 	byteSize            uint64
-	numMSHREntry        int
-	numReqPerCycle      int
-	writeBufferCapacity int
-	maxInflightFetch    int
-	maxInflightEviction int
-	maxInvEmitPerCycle  int
+	numMSHREntry               int
+	numReqPerCycle             int
+	writeBufferCapacity        int
+	maxInflightFetch           int
+	maxInflightEviction        int
+	maxInvEmitPerCycle         int
+	maxPeerServeReserveRequest int // [SD-PEER-SERVE-RESERVE] 0 = disabled
 
 	cohDirLatency int
 	dirLatency    int
@@ -243,6 +244,14 @@ func (b Builder) WithWriteBufferSize(n int) Builder {
 // cache can issue at the same time.
 func (b Builder) WithMaxInflightFetch(n int) Builder {
 	b.maxInflightFetch = n
+	return b
+}
+
+// WithSDPeerServeReserve sets the [SD-PEER-SERVE-RESERVE] bounded headroom by
+// which the peer-serve origin may exceed the shared inflight budget (0 =
+// disabled, the default). Fixes the SD 9-bank capacity-cycle deadlock.
+func (b Builder) WithSDPeerServeReserve(n int) Builder {
+	b.maxPeerServeReserveRequest = n
 	return b
 }
 
@@ -499,6 +508,8 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		maxInflightBypassRequest:  1024,
 		maxPeerInflightRequest:    256,                        // [ITER18 F5b]
 		maxOutgoingRemoteInflight: b.maxInflightFetch * 3 / 4, // [ITER18 F2] 3/4 of total cap
+		// [SD-PEER-SERVE-RESERVE] 0 = disabled (byte-identical to original).
+		maxPeerServeReserveRequest: b.maxPeerServeReserveRequest,
 	}
 }
 

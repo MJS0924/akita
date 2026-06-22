@@ -43,6 +43,13 @@ type Builder struct {
 	// reproduces). Default true (fixed). Toggled by the -cd8-deadlock-fix flag.
 	cd8DeadlockFix bool
 
+	// [SD-ACK-RESERVE] when ackReserveFix is false the ackDisplaceReserve is
+	// disabled (capacity 0) → original behavior (the SD 9-bank cross-GPU
+	// eviction-credit deadlock reproduces). Default OFF. Toggled by the
+	// -sd-ack-reserve flag. The reserve capacity, when enabled, is tied to the
+	// inflight-eviction window (maxInflightEviction), mirroring the cd8 reserve.
+	ackReserveFix bool
+
 	cohDirLatency int
 	dirLatency    int
 	bankLatency   int
@@ -69,7 +76,8 @@ func MakeBuilder() Builder {
 		maxInflightFetch:        128,
 		maxInflightEviction:     128,
 		bankLatency:             10,
-		cd8DeadlockFix:          true, // [CD8-DEADLOCK FIX] default on (fixed)
+		cd8DeadlockFix:          true,  // [CD8-DEADLOCK FIX] default on (fixed)
+		ackReserveFix:           false, // [SD-ACK-RESERVE] default OFF
 	}
 }
 
@@ -77,6 +85,14 @@ func MakeBuilder() Builder {
 // original CD_8 16KB cross-GPU writeback deadlock; true (default) fixes it.
 func (b Builder) WithCD8DeadlockFix(on bool) Builder {
 	b.cd8DeadlockFix = on
+	return b
+}
+
+// WithAckReserveFix toggles the [SD-ACK-RESERVE] displacement reserve. false
+// (default) reproduces the SD 9-bank cross-GPU eviction-credit deadlock; true
+// enables the dedicated peer-ack victim placement lane that frees remote credit.
+func (b Builder) WithAckReserveFix(on bool) Builder {
+	b.ackReserveFix = on
 	return b
 }
 
@@ -418,11 +434,20 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		// ceiling so it can never grow unbounded; guarantees InvRsp emission
 		// forward progress when cross-GPU write-throughs clog the shared lanes.
 		maxInvDirtyFlushReserve: b.maxInflightEviction,
+		// [SD-ACK-RESERVE] peer-ack victim placement reserve; bounded by the
+		// inflight-eviction window (mirrors the cd8 reserve), drained by
+		// tryWriteOne routed by victim destination. Effective only when enabled.
+		maxAckDisplaceReserve: b.maxInflightEviction,
 	}
 	if !b.cd8DeadlockFix {
 		// [CD8-DEADLOCK FIX] flag off → disable the reserve → original behavior
 		// (the CD_8 16KB cross-GPU writeback deadlock reproduces).
 		cache.writeBuffer.maxInvDirtyFlushReserve = 0
+	}
+	if !b.ackReserveFix {
+		// [SD-ACK-RESERVE] flag off → disable the reserve → original behavior
+		// (the SD 9-bank cross-GPU eviction-credit deadlock reproduces).
+		cache.writeBuffer.maxAckDisplaceReserve = 0
 	}
 }
 

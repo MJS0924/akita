@@ -553,7 +553,12 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 	// not been emitted yet, so "ack emitted ⇒ victim placed" atomicity holds).
 	if trans.writeToHomeNode &&
 		!s.cache.writeBufferBufferCanPush(trans.fromLocal) &&
-		!s.cache.writeBuffer.deferFlushCanPush(trans.fromLocal) {
+		!s.cache.writeBuffer.deferFlushCanPush(trans.fromLocal) &&
+		// [SD-ACK-RESERVE] for a peer-incoming (fromLocal=false) ack-producing
+		// victim, the dedicated reserve is a THIRD placement option so the
+		// WriteDoneRsp is never starved by bulk peer-bypass work (own writes
+		// are unaffected: !trans.fromLocal is false, leaving the gate as-is).
+		!(!trans.fromLocal && s.cache.writeBuffer.ackDisplaceReserveCanPush()) {
 		return false
 	}
 
@@ -626,8 +631,14 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		// Pointer only — evictingData/Addr/... are already captured on trans.
 		if s.cache.writeBufferBufferCanPush(trans.fromLocal) {
 			s.cache.writeBufferBufferPush(trans, trans.fromLocal)
-		} else {
+		} else if s.cache.writeBuffer.deferFlushCanPush(trans.fromLocal) {
 			s.cache.writeBuffer.deferFlushPush(trans)
+		} else {
+			// [SD-ACK-RESERVE] Reached ONLY for a peer-incoming (fromLocal=false)
+			// ack victim when writeBufferBufferRemote + deferredFlushPeer are both
+			// full; the gate above guaranteed the reserve has room. (Own writes
+			// can never reach here: their gate returns false when both are full.)
+			s.cache.writeBuffer.ackDisplaceReservePush(trans)
 		}
 
 		if s.cache.debugProcess && trans.action == bankWritePrefetched {
@@ -702,7 +713,12 @@ func (s *bankStage) finalizeBankWriteFetched(
 	// writeBufferBuffer now, or the bounded deferral list.
 	if trans.writeToHomeNode &&
 		!s.cache.writeBufferBufferCanPush(trans.fromLocal) &&
-		!s.cache.writeBuffer.deferFlushCanPush(trans.fromLocal) {
+		!s.cache.writeBuffer.deferFlushCanPush(trans.fromLocal) &&
+		// [SD-ACK-RESERVE] for a peer-incoming (fromLocal=false) ack-producing
+		// victim, the dedicated reserve is a THIRD placement option so the
+		// WriteDoneRsp is never starved by bulk peer-bypass work (own writes
+		// are unaffected: !trans.fromLocal is false, leaving the gate as-is).
+		!(!trans.fromLocal && s.cache.writeBuffer.ackDisplaceReserveCanPush()) {
 		return false
 	}
 
@@ -731,8 +747,14 @@ func (s *bankStage) finalizeBankWriteFetched(
 		// above); place the victim now or park it in the bounded deferral list.
 		if s.cache.writeBufferBufferCanPush(trans.fromLocal) {
 			s.cache.writeBufferBufferPush(trans, trans.fromLocal)
-		} else {
+		} else if s.cache.writeBuffer.deferFlushCanPush(trans.fromLocal) {
 			s.cache.writeBuffer.deferFlushPush(trans)
+		} else {
+			// [SD-ACK-RESERVE] Reached ONLY for a peer-incoming (fromLocal=false)
+			// ack victim when writeBufferBufferRemote + deferredFlushPeer are both
+			// full; the gate above guaranteed the reserve has room. (Own writes
+			// can never reach here: their gate returns false when both are full.)
+			s.cache.writeBuffer.ackDisplaceReservePush(trans)
 		}
 	}
 

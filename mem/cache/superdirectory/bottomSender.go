@@ -41,6 +41,15 @@ type bottomSender struct {
 	numPeerInflightRequest    int
 	maxOutgoingRemoteInflight int
 
+	// [SD-PEER-SERVE-RESERVE] Bounded headroom (slots) by which the peer-serve
+	// ORIGIN (fromLocal=false — the ack-producing pendingRemoteWriteAfterInv
+	// re-issue drain) may exceed the shared maxInflightRequest budget, while
+	// own-origin is held strictly below it. Breaks the SD 9-bank capacity-cycle
+	// deadlock where own+peer co-saturate the shared budget so the freeing
+	// WriteDoneRsp can never be produced. Bounded: total <= maxInflightRequest +
+	// maxPeerServeReserveRequest. 0 == disabled (byte-identical to original cap).
+	maxPeerServeReserveRequest int
+
 	localInflightRequest       []*transaction
 	localInflightBypassRequest []*transaction
 	remoteInflightRequest      []*transaction
@@ -1491,6 +1500,29 @@ func (bs *bottomSender) tooManyInflightRequest(isLocal bool) bool {
 	// Asymmetric soft cap (original): remote can use the full
 	// maxInflightRequest budget; local is bounded at 3/4.
 	total := len(bs.localInflightRequest) + len(bs.remoteInflightRequest)
+
+	// [SD-PEER-SERVE-RESERVE] When enabled (reserve > 0): own-origin is held
+	// strictly below the base budget (cannot consume the reserve), and the
+	// peer-serve origin (the ack-producing pendingRemoteWriteAfterInv drain) may
+	// exceed the base budget by up to `reserve` slots. This is the ONLY thing
+	// that un-freezes the symmetric capacity-cycle: at the frozen state own and
+	// peer JOINTLY co-saturate the shared budget (own sits below its own soft
+	// cap), so a static repartition frees nothing — the freeing path needs a
+	// little headroom ABOVE the shared cap. Bounded: total <= base + reserve;
+	// each served peer-write emits a WriteDoneRsp that frees its slot, so the
+	// headroom stays transient. reserve==0 (flag off) skips this block entirely
+	// => byte-identical to the original behavior below.
+	if bs.maxPeerServeReserveRequest > 0 {
+		if isLocal {
+			if len(bs.localInflightRequest) >=
+				bs.maxInflightRequest-bs.maxPeerServeReserveRequest {
+				return true
+			}
+			return total >= bs.maxInflightRequest
+		}
+		return total >= bs.maxInflightRequest+bs.maxPeerServeReserveRequest
+	}
+
 	if total >= bs.maxInflightRequest {
 		return true
 	}
