@@ -3,6 +3,7 @@ package writearound
 import (
 	"github.com/sarchlab/akita/v4/mem/cache"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/pipelining"
 	"github.com/sarchlab/akita/v4/sim"
 )
@@ -87,17 +88,13 @@ func (d *directory) processMSHRHit(
 ) bool {
 	mshrEntry.Requests = append(mshrEntry.Requests, trans)
 
-	// if trans.read != nil {
-	// 	tracing.AddTaskStep(trans.id, d.cache, "read-mshr-hit")
-	// 	// if d.cache.name == "GPU[1].SA[0].L1VCache[0]" {
-	// 	// 	fmt.Printf("\t\t\t\t\t\t\tRead MSHR hit\n")
-	// 	// }
-	// } else {
-	// 	tracing.AddTaskStep(trans.id, d.cache, "write-mshr-hit")
-	// 	// if d.cache.name == "GPU[1].SA[0].L1VCache[0]" {
-	// 	// 	fmt.Printf("\t\t\t\t\t\t\tWrite MSHR hit\n")
-	// 	// }
-	// }
+	if trans.read != nil {
+		d.cache.stampPreCoalesce(trans, mempath.EvL1ReadMSHRHit)
+		// tracing.AddTaskStep(trans.id, d.cache, "read-mshr-hit")
+	} else {
+		d.cache.stampPreCoalesce(trans, mempath.EvL1WriteMSHRHit)
+		// tracing.AddTaskStep(trans.id, d.cache, "write-mshr-hit")
+	}
 
 	d.buf.Pop()
 
@@ -123,6 +120,7 @@ func (d *directory) processReadHit(
 	d.cache.directory.Visit(block)
 	bankBuf.Push(trans)
 
+	d.cache.stampPreCoalesce(trans, mempath.EvL1ReadHit)
 	d.buf.Pop()
 	// tracing.AddTaskStep(trans.id, d.cache, "read-hit")
 	// if d.cache.name == "GPU[1].SA[0].L1VCache[0]" {
@@ -151,6 +149,7 @@ func (d *directory) processReadMiss(trans *transaction) bool {
 		return false
 	}
 
+	d.cache.stampPreCoalesce(trans, mempath.EvL1ReadMiss)
 	d.buf.Pop()
 	// tracing.AddTaskStep(trans.id, d.cache, "read-miss")
 
@@ -192,6 +191,7 @@ func (d *directory) processWrite(trans *transaction) bool {
 
 func (d *directory) writeMiss(trans *transaction) bool {
 	if ok := d.writeBottom(trans); ok {
+		d.cache.stampPreCoalesce(trans, mempath.EvL1WriteMiss)
 		// tracing.AddTaskStep(trans.id, d.cache, "write-miss")
 		d.buf.Pop()
 
@@ -215,6 +215,8 @@ func (d *directory) writeBottom(trans *transaction) bool {
 		WithDirtyMask(write.DirtyMask).
 		WithReqFrom(d.cache.name).
 		Build()
+
+	writeToBottom.PathProbe = representativeProbe(trans)
 
 	err := d.cache.bottomPort.Send(writeToBottom)
 	if err != nil {
@@ -260,6 +262,7 @@ func (d *directory) processWriteHit(
 	trans.block = block
 	bankBuf.Push(trans)
 
+	d.cache.stampPreCoalesce(trans, mempath.EvL1WriteHit)
 	// tracing.AddTaskStep(trans.id, d.cache, "write-hit")
 	d.buf.Pop()
 
@@ -285,6 +288,8 @@ func (d *directory) fetchFromBottom(
 		WithByteSize(blockSize).
 		WithReqFrom(d.cache.name).
 		Build()
+
+	readToBottom.PathProbe = representativeProbe(trans)
 
 	err := d.cache.bottomPort.Send(readToBottom)
 	if err != nil {

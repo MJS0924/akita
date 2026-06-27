@@ -485,6 +485,7 @@ func (s *bankStage) finalizeReadHit(trans *transaction) bool {
 	// 	fmt.Printf("[%s]\tSend data ready response: Addr %x\n", s.cache.name, addr)
 	// }
 
+	s.cache.stampProbe(trans, l2ServedEvent(trans.fromLocal))
 	var error *sim.SendError
 	dataReady := mem.DataReadyRspBuilder{}.
 		WithSrc(s.cache.topPort.AsRemote()).
@@ -493,6 +494,7 @@ func (s *bankStage) finalizeReadHit(trans *transaction) bool {
 		WithData(data).
 		WithOrigin(read).
 		Build()
+	dataReady.PathProbe = read.PathProbe
 
 	if !trans.fromLocal {
 		dataReady.Src = s.cache.remoteTopPort.AsRemote()
@@ -592,6 +594,7 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 
 	s.decInflight(trans.fromLocal)
 
+	s.cache.stampProbe(trans, l2ServedEvent(trans.fromLocal))
 	done := mem.WriteDoneRspBuilder{}.
 		WithSrc(s.cache.topPort.AsRemote()).
 		WithDst(write.Meta().Src).
@@ -599,6 +602,7 @@ func (s *bankStage) finalizeWriteHit(trans *transaction) bool {
 		WithRspTo(write.Meta().ID).
 		WithOrigin(write).
 		Build()
+	done.PathProbe = write.PathProbe
 	if !trans.fromLocal {
 		done.Meta().Src = s.cache.remoteTopPort.AsRemote()
 		if err := s.cache.remoteTopPort.Send(done); err != nil {

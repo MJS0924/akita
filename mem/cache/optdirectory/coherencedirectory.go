@@ -11,6 +11,7 @@ import (
 
 	"github.com/sarchlab/akita/v4/mem/cache/optdirectory/internal"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 
 	"github.com/sarchlab/akita/v4/sim"
 )
@@ -420,6 +421,10 @@ func (c *Comp) cloneReq(origin mem.AccessReq) mem.AccessReq {
 			WithByteSize(origin.AccessByteSize).
 			Build()
 		read.SetSrcRDMA(origin.SrcRDMA)
+		read.PathProbe = origin.PathProbe
+		if mempath.Enabled {
+			read.PathProbe.Stamp(c.name, mempath.EvDirFwdLocal, c.Engine.CurrentTime())
+		}
 		return read
 	case *mem.WriteReq:
 		write := mem.WriteReqBuilder{}.
@@ -434,6 +439,10 @@ func (c *Comp) cloneReq(origin mem.AccessReq) mem.AccessReq {
 			// WithInfo((*(c.dirtyMask))[c.deviceID-1][origin.GetPID()][origin.GetVAddr()>>c.log2PageSize]).
 			Build()
 		write.SetSrcRDMA(origin.SrcRDMA)
+		write.PathProbe = origin.PathProbe
+		if mempath.Enabled {
+			write.PathProbe.Stamp(c.name, mempath.EvDirFwdLocal, c.Engine.CurrentTime())
+		}
 		return write
 	default:
 		log.Panicf("cannot clone request of type %s",
@@ -452,6 +461,7 @@ func (c *Comp) cloneRsp(origin mem.AccessRsp, rspTo string, addr uint64) mem.Acc
 			WithData(origin.Data).
 			WithOrigin(origin.Origin).
 			Build()
+		rsp.PathProbe = origin.PathProbe
 		return rsp
 	case *mem.WriteDoneRsp:
 		rsp := mem.WriteDoneRspBuilder{}.
@@ -460,6 +470,7 @@ func (c *Comp) cloneRsp(origin mem.AccessRsp, rspTo string, addr uint64) mem.Acc
 			WithRspTo(rspTo).
 			WithOrigin(origin.Origin).
 			Build()
+		rsp.PathProbe = origin.PathProbe
 		return rsp
 	default:
 		log.Panicf("cannot clone request of type %s",

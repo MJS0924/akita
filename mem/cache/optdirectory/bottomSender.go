@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -745,6 +746,9 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 	msg.Src = bs.cache.topPort.AsRemote()
 	msg.Dst = trans.accessReq().Meta().Src
 	msg.WaitFor = trans.ack
+	if mempath.Enabled {
+		msg.PathProbe = trans.accessReq().GetPathProbe()
+	}
 
 	// [수정] Bypass 트랜잭션이거나 Bypass 액션인 경우 우회 큐로 삽입
 	if isBypass || trans.action == BypassingDirectory {
@@ -826,6 +830,9 @@ func (bs *bottomSender) processWriteDoneRsp(msg *mem.WriteDoneRsp, port sim.Port
 	msg.Src = bs.cache.topPort.AsRemote()
 	msg.Dst = trans.accessReq().Meta().Src
 	msg.WaitFor = trans.ack
+	if mempath.Enabled {
+		msg.PathProbe = trans.accessReq().GetPathProbe()
+	}
 
 	// [수정] Bypass 트랜잭션이거나 Bypass 액션인 경우 우회 큐로 삽입
 	if isBypass || trans.action == BypassingDirectory {

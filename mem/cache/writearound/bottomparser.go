@@ -3,6 +3,7 @@ package writearound
 import (
 	"github.com/sarchlab/akita/v4/mem/cache"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -34,8 +35,17 @@ func (p *bottomParser) processDoneRsp(done *mem.WriteDoneRsp) bool {
 		return true
 	}
 
+	if mempath.Enabled && trans.writeToBottom != nil {
+		trans.writeToBottom.PathProbe.Stamp(
+			p.cache.name, mempath.EvL1RspIn, p.cache.CurrentTime())
+	}
+
 	for _, t := range trans.preCoalesceTransactions {
 		t.done = true
+	}
+
+	if trans.writeToBottom != nil {
+		inheritFanout(trans, trans.writeToBottom.PathProbe)
 	}
 
 	// if p.cache.name == "GPU[1].SA[0].L1VCache[0]" {
@@ -61,6 +71,10 @@ func (p *bottomParser) processDataReady(dr *mem.DataReadyRsp) bool {
 	bankBuf := p.getBankBuf(trans.block)
 	if !bankBuf.CanPush() {
 		return false
+	}
+
+	if mempath.Enabled {
+		dr.PathProbe.Stamp(p.cache.name, mempath.EvL1RspIn, p.cache.CurrentTime())
 	}
 
 	pid := trans.readToBottom.PID
@@ -114,6 +128,11 @@ func (p *bottomParser) finalizeMSHRTrans(
 	mshrEntry *cache.MSHREntry,
 	data []byte,
 ) {
+	var descentProbe *mempath.Probe
+	if mshrEntry.ReadReq != nil {
+		descentProbe = mshrEntry.ReadReq.PathProbe
+	}
+
 	for _, t := range mshrEntry.Requests {
 		trans := t.(*transaction)
 		if trans.read != nil {
@@ -128,6 +147,8 @@ func (p *bottomParser) finalizeMSHRTrans(
 				preCTrans.done = true
 			}
 		}
+
+		inheritFanout(trans, descentProbe)
 
 		p.removeTransaction(trans)
 

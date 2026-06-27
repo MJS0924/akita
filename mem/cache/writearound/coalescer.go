@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
@@ -25,7 +26,14 @@ func (c *coalescer) Tick() bool {
 		return false
 	}
 
-	return c.processReq(req.(mem.AccessReq))
+	ar := req.(mem.AccessReq)
+	ok := c.processReq(ar)
+	if ok && mempath.Enabled {
+		// processReq returns true only when it commits (retrieves) this
+		// request, so this stamps L1 ingress exactly once per request.
+		ar.GetPathProbe().Stamp(c.cache.name, mempath.EvL1In, c.cache.CurrentTime())
+	}
+	return ok
 }
 
 func (c *coalescer) processReq(req mem.AccessReq) bool {

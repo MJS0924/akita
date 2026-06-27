@@ -42,6 +42,7 @@ func (s *respondStage) respondReadTrans(trans *transaction) bool {
 		WithData(trans.data).
 		WithOrigin(read).
 		Build()
+	dr.PathProbe = read.PathProbe
 
 	err := s.cache.topPort.Send(dr)
 	if err != nil {
@@ -71,6 +72,7 @@ func (s *respondStage) respondWriteTrans(trans *transaction) bool {
 		WithRspTo(write.ID).
 		WithOrigin(write).
 		Build()
+	done.PathProbe = write.PathProbe
 
 	err := s.cache.topPort.Send(done)
 	if err != nil {

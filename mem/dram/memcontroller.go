@@ -7,6 +7,7 @@ import (
 	"github.com/sarchlab/akita/v4/mem/dram/internal/signal"
 	"github.com/sarchlab/akita/v4/mem/dram/internal/trans"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -191,9 +192,13 @@ func (m *middleware) finalizeWriteTrans(
 		WithRspTo(t.Write.ID).
 		WithOrigin(t.Write).
 		Build()
+	writeDone.PathProbe = t.Write.PathProbe
 
 	sendErr := m.topPort.Send(writeDone)
 	if sendErr == nil {
+		if mempath.Enabled {
+			t.Write.PathProbe.Stamp(m.Comp.Name(), mempath.EvDRAM, m.Comp.CurrentTime())
+		}
 		m.inflightTransactions = append(
 			m.inflightTransactions[:i],
 			m.inflightTransactions[i+1:]...)
@@ -222,9 +227,13 @@ func (m *middleware) finalizeReadTrans(
 		WithRspTo(t.Read.ID).
 		WithOrigin(t.Read).
 		Build()
+	dataReady.PathProbe = t.Read.PathProbe
 
 	sendErr := m.topPort.Send(dataReady)
 	if sendErr == nil {
+		if mempath.Enabled {
+			t.Read.PathProbe.Stamp(m.Comp.Name(), mempath.EvDRAM, m.Comp.CurrentTime())
+		}
 		m.inflightTransactions = append(
 			m.inflightTransactions[:i],
 			m.inflightTransactions[i+1:]...)

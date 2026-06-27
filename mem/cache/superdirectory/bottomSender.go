@@ -7,6 +7,7 @@ import (
 
 	"github.com/sarchlab/akita/v4/mem/cache/superdirectory/internal"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -1027,6 +1028,9 @@ func (bs *bottomSender) processDataReadyRsp(msg *mem.DataReadyRsp, port sim.Port
 	msg.Src = bs.cache.topPort.AsRemote()
 	msg.Dst = trans.accessReq().Meta().Src
 	msg.WaitFor = trans.ack // [추가] 병합 처리를 위한 Ack 개수 전달
+	if mempath.Enabled {
+		msg.PathProbe = trans.accessReq().GetPathProbe()
+	}
 
 	// [핵심 변경 2] 직접 Send() 하지 않고, 용도에 맞는 전송 큐에 삽입 (블로킹 방지)
 	if isBypass || trans.action == BypassingDirectory {
@@ -1121,6 +1125,9 @@ func (bs *bottomSender) processWriteDoneRsp(msg *mem.WriteDoneRsp, port sim.Port
 	msg.Src = bs.cache.topPort.AsRemote()
 	msg.Dst = trans.accessReq().Meta().Src
 	msg.WaitFor = trans.ack
+	if mempath.Enabled {
+		msg.PathProbe = trans.accessReq().GetPathProbe()
+	}
 
 	// [핵심 2] 포트(topPort)에 직접 Send하지 않고 용도에 맞는 전송 큐에 삽입 (블로킹 방지)
 	if isBypass || trans.action == BypassingDirectory {

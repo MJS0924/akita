@@ -3,6 +3,7 @@ package mem
 import (
 	"reflect"
 
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
 )
@@ -32,6 +33,9 @@ type AccessReq interface {
 
 	GetNiceness() bool
 	SetNiceness(b bool)
+
+	GetPathProbe() *mempath.Probe
+	SetPathProbe(*mempath.Probe)
 }
 
 // A AccessRsp is a respond in the memory system.
@@ -59,6 +63,10 @@ type ReadReq struct {
 	NoNeedToReply     bool // 응답이 필요없는 request인 경우 (prefetch?)
 	Niceness          bool // 우선순위가 낮아져도 되는 request
 	FetchForWriteMiss bool
+
+	// PathProbe is the optional memory-latency path tracer (nil unless
+	// -mem-latency-trace is on). Pure observation; never affects timing.
+	PathProbe *mempath.Probe
 }
 
 // Meta returns the message meta.
@@ -140,6 +148,14 @@ func (r *ReadReq) GetNiceness() bool {
 
 func (r *ReadReq) SetNiceness(b bool) {
 	r.Niceness = b
+}
+
+func (r *ReadReq) GetPathProbe() *mempath.Probe {
+	return r.PathProbe
+}
+
+func (r *ReadReq) SetPathProbe(p *mempath.Probe) {
+	r.PathProbe = p
 }
 
 // ReadReqBuilder can build read requests.
@@ -257,6 +273,10 @@ type WriteReq struct {
 
 	NoNeedToReply bool
 	Niceness      bool
+
+	// PathProbe is the optional memory-latency path tracer (nil unless
+	// -mem-latency-trace is on). Pure observation; never affects timing.
+	PathProbe *mempath.Probe
 }
 
 // Meta returns the meta data attached to a request.
@@ -337,6 +357,14 @@ func (r *WriteReq) GetNiceness() bool {
 
 func (r *WriteReq) SetNiceness(b bool) {
 	r.Niceness = b
+}
+
+func (r *WriteReq) GetPathProbe() *mempath.Probe {
+	return r.PathProbe
+}
+
+func (r *WriteReq) SetPathProbe(p *mempath.Probe) {
+	r.PathProbe = p
 }
 
 // WriteReqBuilder can build read requests.
@@ -448,6 +476,10 @@ type DataReadyRsp struct {
 	Data      []byte
 	Origin    AccessReq
 	WaitFor   uint64
+
+	// PathProbe is the optional memory-latency path tracer (nil unless
+	// -mem-latency-trace is on). Pure observation; never affects timing.
+	PathProbe *mempath.Probe
 }
 
 // Meta returns the meta data attached to each message.
@@ -538,6 +570,10 @@ type WriteDoneRsp struct {
 	RespondTo string
 	Origin    AccessReq
 	WaitFor   uint64
+
+	// PathProbe is the optional memory-latency path tracer (nil unless
+	// -mem-latency-trace is on). Pure observation; never affects timing.
+	PathProbe *mempath.Probe
 }
 
 // Meta returns the meta data associated with the message.

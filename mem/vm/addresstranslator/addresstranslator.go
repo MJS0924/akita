@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/mem/vm"
 	"github.com/sarchlab/akita/v4/sim"
 )
@@ -158,6 +159,8 @@ func (m *middleware) parseTranslation() bool {
 		reqFromTop,
 		transaction.translationRsp.Page)
 
+	m.attachProbe(translatedReq)
+
 	err := m.bottomPort.Send(translatedReq)
 	if err != nil {
 		return false
@@ -227,6 +230,7 @@ func (m *middleware) respond() bool {
 		if reqInBottom {
 			reqToBottomCombo = m.findReqToBottomByID(rsp.RespondTo)
 			reqFromTop = reqToBottomCombo.reqFromTop
+			m.recordProbe(rsp.PathProbe)
 			drToTop := mem.DataReadyRspBuilder{}.
 				WithSrc(m.topPort.AsRemote()).
 				WithDst(reqFromTop.Meta().Src).
@@ -247,6 +251,7 @@ func (m *middleware) respond() bool {
 		if reqInBottom {
 			reqToBottomCombo = m.findReqToBottomByID(rsp.RespondTo)
 			reqFromTop = reqToBottomCombo.reqFromTop
+			m.recordProbe(rsp.PathProbe)
 			rspToTop = mem.WriteDoneRspBuilder{}.
 				WithSrc(m.topPort.AsRemote()).
 				WithDst(reqFromTop.Meta().Src).
@@ -343,6 +348,43 @@ func (m *middleware) createTranslatedWriteReq(
 	clone.CanWaitForCoalesce = req.CanWaitForCoalesce
 
 	return clone
+}
+
+// attachProbe allocates a mem-latency path probe and attaches it to the
+// translated request leaving the AT's bottom port. No-op (and zero
+// allocation) when the tracer is disabled. Pure observation; never affects
+// timing.
+func (m *middleware) attachProbe(req mem.AccessReq) {
+	if !mempath.Enabled {
+		return
+	}
+
+	p := &mempath.Probe{
+		OriginDevice: m.deviceID,
+		OriginUnit:   m.name,
+	}
+	p.Stamp(m.name, mempath.EvATReqOut, m.Comp.CurrentTime())
+
+	switch r := req.(type) {
+	case *mem.ReadReq:
+		r.PathProbe = p
+	case *mem.WriteReq:
+		r.PathProbe = p
+	}
+}
+
+// recordProbe finalizes a completed probe carried back on the bottom-port
+// response, classifies where the access was served, and hands it to the
+// global collector. No-op when the probe is nil (tracer off) or no sink is
+// registered.
+func (m *middleware) recordProbe(p *mempath.Probe) {
+	if p == nil || mempath.Collect == nil {
+		return
+	}
+
+	p.Stamp(m.name, mempath.EvATRspIn, m.Comp.CurrentTime())
+	p.HitClass = mempath.Classify(p)
+	mempath.Collect(p, p.TotalLatency())
 }
 
 func (m *middleware) addrToPageID(addr uint64) uint64 {

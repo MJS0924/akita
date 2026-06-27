@@ -43,6 +43,15 @@ type Builder struct {
 	// reproduces). Default true (fixed). Toggled by the -cd8-deadlock-fix flag.
 	cd8DeadlockFix bool
 
+	// [L2-PEER-EVICT-HEADROOM] when false (default) the peer-serve eviction
+	// inflight credit + admit lane keep their small caps (maxInflightEviction/4=32
+	// and 256) that DEADLOCK under a 4-GPU symmetric cross-GPU write flood — every
+	// L2 pins all peer-evict credits awaiting acks that never return (symmetric).
+	// When true, the peer-serve (ack-producing, deadlock-breaking) path is given
+	// large headroom so it never deadlocks. Toggled by -l2-peer-evict-headroom.
+	// OFF == byte-identical to original.
+	l2PeerEvictHeadroom bool
+
 	// [SD-ACK-RESERVE] when ackReserveFix is false the ackDisplaceReserve is
 	// disabled (capacity 0) → original behavior (the SD 9-bank cross-GPU
 	// eviction-credit deadlock reproduces). Default OFF. Toggled by the
@@ -85,6 +94,15 @@ func MakeBuilder() Builder {
 // original CD_8 16KB cross-GPU writeback deadlock; true (default) fixes it.
 func (b Builder) WithCD8DeadlockFix(on bool) Builder {
 	b.cd8DeadlockFix = on
+	return b
+}
+
+// WithL2PeerEvictHeadroom toggles the peer-serve eviction credit headroom.
+// false (default) reproduces the 4-GPU symmetric peer-eviction credit deadlock
+// (minerva large-batch gradient flood); true raises the peer-serve caps so the
+// ack-producing serve path always has headroom and never deadlocks.
+func (b Builder) WithL2PeerEvictHeadroom(on bool) Builder {
+	b.l2PeerEvictHeadroom = on
 	return b
 }
 
@@ -408,11 +426,27 @@ func (b *Builder) createInternalStages(cache *Comp) {
 	b.buildBankStages(cache)
 	cache.mshrStage = &mshrStage{cache: cache}
 	cache.flusher = &flusher{cache: cache}
+
+	// [L2-PEER-EVICT-HEADROOM] The peer-serve eviction inflight credit
+	// (maxRemoteInflEvictPeer) and peer admit lane (maxPeerIncomingPending,
+	// writeBufferPeerCapacity) default to small caps that deadlock under a
+	// 4-GPU symmetric cross-GPU write flood (see field doc). When the headroom
+	// toggle is on, raise the peer-serve caps so the ack-producing serve path
+	// always has headroom. OFF reproduces the original (byte-identical) caps.
+	peerInflEvictCap := b.maxInflightEviction / 4
+	peerIncomingCap := b.maxPeerIncomingPending
+	peerBufCap := b.writeBufferPeerCapacity
+	if b.l2PeerEvictHeadroom {
+		peerInflEvictCap = 4096
+		peerIncomingCap = 4096
+		peerBufCap = 4096
+	}
+
 	cache.writeBuffer = &writeBufferStage{
 		cache:                    cache,
 		writeBufferCapacity:      b.writeBufferCapacity,
-		writeBufferPeerCapacity:  b.writeBufferPeerCapacity,
-		maxPeerIncomingPending:   b.maxPeerIncomingPending,
+		writeBufferPeerCapacity:  peerBufCap,
+		maxPeerIncomingPending:   peerIncomingCap,
 		maxInflightFetch:         b.maxInflightFetch,
 		maxInflightEviction:      b.maxInflightEviction,
 		maxOutgoingRemotePending: b.maxOutgoingRemotePending,
@@ -423,7 +457,7 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		// The peer (peer-serve) reserve guarantees own work can never starve
 		// the serve-flush whose drain emits the freeing ACK.
 		maxRemoteInflEvictOwn:  b.maxInflightEviction - b.maxInflightEviction/4,
-		maxRemoteInflEvictPeer: b.maxInflightEviction / 4,
+		maxRemoteInflEvictPeer: peerInflEvictCap, // [L2-PEER-EVICT-HEADROOM] 32 default, 4096 when headroom on
 		// [RESPONSE-DECOUPLE] reordering buffer for already-acked displacement
 		// flushes; bounded by in-flight completions, holds pointers only.
 		// [ORIGIN-SPLIT] deferFlushCanPush splits this into two halves

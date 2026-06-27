@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -181,6 +182,8 @@ func (p *topParser) dispatchRemoteAccess() bool {
 		log.Panic("unexpected type in pendingRemoteAccess")
 	}
 
+	p.cache.stampProbe(trans, mempath.EvL2In)
+
 	p.cache.remoteDirStageBuffer.Push(trans)
 	p.cache.inFlightTransactions = append(p.cache.inFlightTransactions, trans)
 	tracing.TraceReqReceive(pending.req, p.cache)
@@ -273,6 +276,8 @@ func (p *topParser) dispatchLocalAccess() bool {
 	default:
 		log.Panic("unexpected type in pendingLocalAccess")
 	}
+
+	p.cache.stampProbe(trans, mempath.EvL2In)
 
 	if p.cache.debugProcess && trans.accessReq() != nil && trans.accessReq().GetAddress() == p.cache.debugAddress0 {
 		fmt.Printf("[%s] [topparser]\tReceived req - 0: addr %x\n", p.cache.name, trans.accessReq().GetAddress())

@@ -5,6 +5,7 @@ import (
 
 	"github.com/sarchlab/akita/v4/mem/cache/writebackcoh/internal"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/tracing"
 )
 
@@ -114,6 +115,9 @@ func (s *mshrStage) respondRead(
 		fmt.Printf("[%s] [mshrStage]\tSend read rsp - 4: addr %x\n", s.cache.name, read.Address)
 	}
 
+	if mempath.Enabled {
+		read.PathProbe.Stamp(s.cache.name, mempath.EvL2Fill, s.cache.CurrentTime())
+	}
 	_, offset := getCacheLineID(read.Address, s.cache.log2BlockSize)
 	dataReady := mem.DataReadyRspBuilder{}.
 		WithSrc(s.cache.topPort.AsRemote()).
@@ -122,6 +126,7 @@ func (s *mshrStage) respondRead(
 		WithData(data[offset : offset+read.AccessByteSize]).
 		WithOrigin(read).
 		Build()
+	dataReady.PathProbe = read.PathProbe
 	if !fromLocal {
 		dataReady.Src = s.cache.remoteTopPort.AsRemote()
 		s.cache.remoteTopPort.Send(dataReady)
@@ -135,12 +140,16 @@ func (s *mshrStage) respondRead(
 }
 
 func (s *mshrStage) respondWrite(write *mem.WriteReq, fromLocal bool) {
+	if mempath.Enabled {
+		write.PathProbe.Stamp(s.cache.name, mempath.EvL2Fill, s.cache.CurrentTime())
+	}
 	writeDoneRsp := mem.WriteDoneRspBuilder{}.
 		WithSrc(s.cache.topPort.AsRemote()).
 		WithDst(write.Src).
 		WithRspTo(write.ID).
 		WithOrigin(write).
 		Build()
+	writeDoneRsp.PathProbe = write.PathProbe
 	if !fromLocal {
 		writeDoneRsp.Src = s.cache.remoteTopPort.AsRemote()
 		if err := s.cache.remoteTopPort.Send(writeDoneRsp); err != nil {

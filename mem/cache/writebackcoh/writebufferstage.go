@@ -7,6 +7,7 @@ import (
 
 	"github.com/sarchlab/akita/v4/mem/cache/writebackcoh/internal"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/mem/mempath"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/tracing"
 )
@@ -637,6 +638,15 @@ func (wb *writeBufferStage) fetchFromBottom(
 		read.VAddr = trans.accessReq().GetVAddr()
 	}
 
+	if mempath.Enabled {
+		// The demand fetch carries the original request's probe so the
+		// DRAM/RDMA descent stamps accrue on the one shared object and are
+		// reflected back on the fill. Eviction/writeback fetches have no
+		// access request and stay nil.
+		read.PathProbe = trans.probe()
+		trans.probe().Stamp(wb.cache.name, mempath.EvL2Miss, wb.cache.CurrentTime())
+	}
+
 	egress.Send(read)
 
 	trans.fetchReadReq = read
@@ -1135,6 +1145,20 @@ func (wb *writeBufferStage) processDataReadyRsp(
 	trans.mshrEntry.Data = dataReady.Data
 	// trans.responsing = true
 	wb.combineData(trans.mshrEntry)
+
+	if mempath.Enabled {
+		// L2 ingress of the fill (DRAM/RDMA -> L2). Combined with the later
+		// L2.fill stamp (mshrStage) this isolates the L2 fill-processing
+		// latency from the return-link latency.
+		dataReady.PathProbe.Stamp(wb.cache.name, mempath.EvL2RspIn, wb.cache.CurrentTime())
+		// The fill carries the fetch initiator's probe (with the DRAM/RDMA
+		// descent stamps). Propagate the served location to every
+		// MSHR-coalesced secondary so each is classified correctly; the
+		// initiator's own probe (== dataReady.PathProbe) self-skips.
+		for _, t := range trans.mshrEntry.Requests {
+			mempath.InheritPath(t.(*transaction).probe(), dataReady.PathProbe)
+		}
+	}
 
 	if trans.fromLocal {
 		wb.cache.mshrLocalRemoved++
