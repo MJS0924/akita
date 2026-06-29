@@ -33,8 +33,14 @@ type Builder struct {
 	numReqPerCycle      int
 	writeBufferCapacity int
 	maxInflightFetch    int
-	maxInflightEviction int
-	maxInvEmitPerCycle  int
+	// maxOutgoingRemoteInflight: cross-GPU outgoing fetch sub-cap.
+	// -1 = auto (maxInflightFetch*3/4, the historical [ITER18 F2] value);
+	// 0 = disabled (remote uses the full maxInflightFetch budget, matching
+	// SuperDirectory/REC); >0 = explicit cap. Set via -equal-dir-cap for
+	// fair CD/HMG-vs-SD/REC comparison.
+	maxOutgoingRemoteInflight int
+	maxInflightEviction       int
+	maxInvEmitPerCycle        int
 
 	useFIFO bool // FIFO replacement instead of LRU
 
@@ -65,7 +71,8 @@ func MakeBuilder() Builder {
 		numMSHREntry:        16,
 		numReqPerCycle:      1,
 		writeBufferCapacity: 1024,
-		maxInflightFetch:    128,
+		maxInflightFetch:          128,
+		maxOutgoingRemoteInflight: -1, // -1 = auto (maxInflightFetch*3/4)
 		// Phase F equivalent: cap raised from 128 (which deadlocked on
 		// matrixtranspose CD_8) to 256 — 2× headroom, while keeping inv
 		// cost modeling realistic. Combined with the dedicated inv
@@ -180,6 +187,14 @@ func (b Builder) WithWriteBufferSize(n int) Builder {
 // cache can issue at the same time.
 func (b Builder) WithMaxInflightFetch(n int) Builder {
 	b.maxInflightFetch = n
+	return b
+}
+
+// WithMaxOutgoingRemoteInflight sets the cross-GPU outgoing fetch sub-cap.
+// -1 = auto (maxInflightFetch*3/4); 0 = disabled (full budget, SD/REC parity);
+// >0 = explicit cap.
+func (b Builder) WithMaxOutgoingRemoteInflight(n int) Builder {
+	b.maxOutgoingRemoteInflight = n
 	return b
 }
 
@@ -431,6 +446,12 @@ func (b *Builder) createInternalStages(cache *Comp) {
 	b.buildBankStages(cache)
 	cache.mshrStage = &mshrStage{cache: cache}
 	cache.flusher = &flusher{cache: cache}
+	// Resolve the cross-GPU outgoing fetch sub-cap: -1 => auto (3/4 of the
+	// total inflight budget); 0 => disabled (full budget); >0 => explicit.
+	outRemote := b.maxInflightFetch * 3 / 4 // [ITER18 F2] auto
+	if b.maxOutgoingRemoteInflight >= 0 {
+		outRemote = b.maxOutgoingRemoteInflight
+	}
 	cache.bottomSender = &bottomSender{
 		cache:                     cache,
 		writeBufferCapacity:       b.writeBufferCapacity,
@@ -438,8 +459,8 @@ func (b *Builder) createInternalStages(cache *Comp) {
 		maxInflightInvalidation:   b.maxInflightEviction,
 		maxInvEmitPerCycle:        b.maxInvEmitPerCycle,
 		maxInflightBypassRequest:  1024,
-		maxPeerInflightRequest:    256,                        // [ITER18 F5b]
-		maxOutgoingRemoteInflight: b.maxInflightFetch * 3 / 4, // [ITER18 F2]
+		maxPeerInflightRequest:    256, // [ITER18 F5b]
+		maxOutgoingRemoteInflight: outRemote,
 	}
 }
 
